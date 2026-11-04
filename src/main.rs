@@ -39,6 +39,15 @@ enum Cmd {
         #[arg(long)]
         from: String,
     },
+    /// Start the dashboard (the main entry point): http://127.0.0.1:7700 by default.
+    Serve {
+        /// Override `[server].bind`.
+        #[arg(long)]
+        bind: Option<String>,
+        /// Do not open the browser.
+        #[arg(long)]
+        no_open: bool,
+    },
     /// List runs.
     Runs,
     /// Check runtimes, authentication and tools.
@@ -68,6 +77,12 @@ async fn main() -> Result<()> {
             if !report.ok() {
                 std::process::exit(1);
             }
+        }
+        Cmd::Serve { bind, no_open } => {
+            let bind = bind.unwrap_or_else(|| config.server.bind.clone());
+            let open_browser = config.server.open_browser && !no_open;
+            let engine = Engine::new(home, config);
+            lyra::web::serve(engine, &bind, open_browser).await?;
         }
         Cmd::Runs => {
             let engine = Engine::new(home, config);
