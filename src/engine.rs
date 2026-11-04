@@ -143,6 +143,12 @@ impl Engine {
 
     /// Retry from `from`: archive outputs of stages >= from, restore the checkpoint, invalidate, run.
     pub fn retry(self: &Arc<Self>, id: &str, from: StageId) -> Result<()> {
+        self.retry_with_policy_ack(id, from, false)
+    }
+
+    /// Retry while optionally acknowledging the policy discovered during intake.
+    /// False preserves an earlier acknowledgment; it never revokes one.
+    pub fn retry_with_policy_ack(self: &Arc<Self>, id: &str, from: StageId, acknowledge_policy: bool) -> Result<()> {
         let _admission = self.admission.try_lock().map_err(|_| anyhow::anyhow!("another run is being admitted"))?;
         self.ensure_writer()?;
         if self.active.lock().unwrap().contains_key(id) {
@@ -155,6 +161,14 @@ impl Engine {
         let mut state = RunState::load(&rd.root).with_context(|| format!("loading run {id}"))?;
         if !state.status.is_terminal() {
             bail!("run {id} is not in a terminal state");
+        }
+        if let Some(earlier) = StageId::ALL
+            .iter()
+            .copied()
+            .take_while(|stage| *stage < from)
+            .find(|stage| state.stage_status(*stage) != StageStatus::Done)
+        {
+            bail!("cannot retry from {from}: earlier stage {earlier} has not completed successfully; retry from {earlier} or an earlier stage");
         }
         if from == StageId::Intake {
             // Intake recreates the worktree; nothing to restore.
@@ -175,6 +189,7 @@ impl Engine {
         let n = state.attempts.len() as u32 + 1;
         rd.archive_from(from, n)?;
         state.invalidate_from(from);
+        state.request.policy_acknowledged |= acknowledge_policy;
         state.save(&rd.root)?;
         let sink = self.sink_for(id)?;
         sink.emit(EventKind::RetryRequested { from });
@@ -567,9 +582,48 @@ mod tests {
         };
         let mut st = RunState::new("retry".into(), req, "claude".into());
         st.status = Status::Failed;
+        for stage in StageId::ALL.into_iter().take_while(|stage| *stage < StageId::Fix) {
+            st.set_stage_status(stage, StageStatus::Done);
+        }
         st.save(&rd.root).unwrap();
-        assert!(engine.retry("retry", StageId::Fix).is_err());
+        assert!(engine.retry("retry", StageId::Fix).unwrap_err().to_string().contains("checkpoint"));
         assert_eq!(engine.get("retry").unwrap().status, Status::Failed);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_cannot_skip_unresolved_rca() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        git::run(repo.path(), &["init", "-q", "-b", "main"]).unwrap();
+        git::run(repo.path(), &["config", "user.name", "Fixture"]).unwrap();
+        git::run(repo.path(), &["config", "user.email", "fixture@example.com"]).unwrap();
+        std::fs::write(repo.path().join("source.rs"), "fn example() {}\n").unwrap();
+        let base = git::commit_all(repo.path(), "fixture").unwrap();
+        let engine = Engine::new(home.path().into(), Config::default());
+        let rd = engine.run_dir("unresolved").unwrap();
+        rd.create().unwrap();
+        git::worktree_add(repo.path(), &rd.worktree(), "lyra/unresolved", &base).unwrap();
+        let mut state = RunState::new("unresolved".into(), request(repo.path()), "claude".into());
+        state.base_commit = Some(base.clone());
+        state.checkpoints.insert(StageId::Repro, base.clone());
+        for stage in [StageId::Intake, StageId::Context, StageId::Repro] {
+            state.set_stage_status(stage, StageStatus::Done);
+        }
+        state.stage = StageId::Rca;
+        state.set_stage_status(StageId::Rca, StageStatus::Stopped);
+        state.status = Status::Stopped;
+        state.save(&rd.root).unwrap();
+        rd.write("40-fix/notes.md", "preserve previous attempt").unwrap();
+        let error = engine
+            .retry_with_policy_ack("unresolved", StageId::Fix, true)
+            .expect_err("retry must not skip unresolved RCA");
+        assert!(error.to_string().contains("rca"), "{error:#}");
+        assert_eq!(engine.get("unresolved").unwrap().status, Status::Stopped);
+        assert!(!engine.get("unresolved").unwrap().request.policy_acknowledged);
+        assert_eq!(rd.read("40-fix/notes.md").unwrap(), "preserve previous attempt");
+        assert_eq!(git::head(&rd.worktree()).unwrap(), base);
+        assert!(!engine.is_busy());
+        git::worktree_remove(repo.path(), &rd.worktree()).unwrap();
     }
 
     fn request(repo: &Path) -> RunRequest {
@@ -599,6 +653,53 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_saves_policy_acknowledgment_and_preserves_existing_choice() {
+        for (previous, acknowledge, expected) in [(false, false, false), (false, true, true), (true, false, true)] {
+            let home = tempfile::tempdir().unwrap();
+            let repo = tempfile::tempdir().unwrap();
+            git::run(repo.path(), &["init", "-q", "-b", "main"]).unwrap();
+            git::run(repo.path(), &["config", "user.name", "Fixture"]).unwrap();
+            git::run(repo.path(), &["config", "user.email", "fixture@example.com"]).unwrap();
+            std::fs::write(repo.path().join("source.rs"), "fn example() {}\n").unwrap();
+            let candidate = git::commit_all(repo.path(), "fixture").unwrap();
+            let engine = Engine::new(home.path().into(), Config::default());
+            let rd = engine.run_dir("policy").unwrap();
+            rd.create().unwrap();
+            git::worktree_add(repo.path(), &rd.worktree(), "lyra/policy", &candidate).unwrap();
+            let mut state = RunState::new("policy".into(), request(repo.path()), "claude".into());
+            state.request.policy_acknowledged = previous;
+            state.has_policy = true;
+            state.status = Status::Stopped;
+            state.stage = StageId::Pr;
+            state.base_commit = Some(candidate.clone());
+            state.checkpoints.insert(StageId::Fix, candidate.clone());
+            state.verified_commit = Some(candidate);
+            state.stop_reason = Some(crate::error::StopReason::PolicyNotAcknowledged);
+            for stage in StageId::ALL.into_iter().take_while(|stage| *stage < StageId::Pr) {
+                state.set_stage_status(stage, StageStatus::Done);
+            }
+            state.save(&rd.root).unwrap();
+            engine.retry_with_policy_ack("policy", StageId::Pr, acknowledge).unwrap();
+            // The current-thread driver has not run yet; admission already persisted the choice.
+            assert_eq!(engine.get("policy").unwrap().request.policy_acknowledged, expected);
+            wait_idle(&engine).await;
+            let state = engine.get("policy").unwrap();
+            assert_eq!(state.request.policy_acknowledged, expected);
+            if expected {
+                // No GitHub origin is configured: reaching this guard proves the policy gate
+                // was passed without calling gh or a provider in this offline fixture.
+                assert_eq!(state.status, Status::Failed);
+                assert!(state.last_error.unwrap().message.contains("origin is not a GitHub repository"));
+                assert_ne!(state.stop_reason, Some(crate::error::StopReason::PolicyNotAcknowledged));
+            } else {
+                assert_eq!(state.status, Status::Stopped);
+                assert_eq!(state.stop_reason, Some(crate::error::StopReason::PolicyNotAcknowledged));
+            }
+            git::worktree_remove(repo.path(), &rd.worktree()).unwrap();
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

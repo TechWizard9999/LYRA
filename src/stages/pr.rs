@@ -77,8 +77,10 @@ fn pr(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
         ));
     };
 
-    git::push(&wt, "origin", &format!("{verified}:refs/heads/{branch}"))
-        .map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
+    // A ready-for-review PR must not receive a push before we discover its state.
+    // Keep the check after pushing too: the remote must still point at this exact SHA.
+    let existing = github::find_prs_for_branch(&target, &head_owner, &branch).map_err(gh_err)?;
+    push_after_draft_check(&existing, || git::push(&wt, "origin", &format!("{verified}:refs/heads/{branch}")))?;
     ctx.events.info(format!("pushed {} to origin/{branch}", git::short(&verified)));
 
     let existing = github::find_pr(&target, &head_owner, &branch, &base).map_err(gh_err)?;
@@ -129,6 +131,19 @@ fn pr(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
     Ok(StageOutcome::Completed)
 }
 
+fn push_after_draft_check(
+    existing: &[github::PrInfo],
+    push: impl FnOnce() -> anyhow::Result<()>,
+) -> Result<(), StageError> {
+    if let Some(pr) = existing.iter().find(|pr| !pr.is_draft) {
+        return Err(StageError::new(
+            ErrorKind::Guard,
+            format!("existing PR {} is not a draft; refusing to push to its branch", pr.url),
+        ));
+    }
+    push().map_err(|error| StageError::from_anyhow(ErrorKind::Git, error))
+}
+
 /// `Fix #<n>: <title>`, at most 70 characters.
 pub fn pr_title(n: u64, title: &str) -> String {
     let t = format!("Fix #{n}: {}", neutralize_mentions(title.trim()));
@@ -164,6 +179,46 @@ fn issue_reference(slug: Option<&str>, number: u64) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ready_pull_request_is_rejected_before_any_push() {
+        let mut pr = github::PrInfo {
+            number: 1,
+            url: "https://github.com/o/r/pull/1".into(),
+            head_sha: "old".into(),
+            head_owner: "o".into(),
+            is_draft: false,
+        };
+        let pushed = std::cell::Cell::new(false);
+        let result = push_after_draft_check(std::slice::from_ref(&pr), || {
+            pushed.set(true);
+            Ok(())
+        });
+        assert!(result.unwrap_err().message.contains("not a draft"));
+        assert!(!pushed.get());
+        pr.is_draft = true;
+        push_after_draft_check(std::slice::from_ref(&pr), || {
+            pushed.set(true);
+            Ok(())
+        })
+        .unwrap();
+        assert!(pushed.get());
+        pushed.set(false);
+        let mut ready_on_another_base = pr.clone();
+        ready_on_another_base.is_draft = false;
+        assert!(push_after_draft_check(&[pr, ready_on_another_base], || {
+            pushed.set(true);
+            Ok(())
+        })
+        .is_err());
+        assert!(!pushed.get());
+        push_after_draft_check(&[], || {
+            pushed.set(true);
+            Ok(())
+        })
+        .unwrap();
+        assert!(pushed.get());
+    }
 
     #[test]
     fn title_is_truncated() {

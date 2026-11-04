@@ -49,7 +49,7 @@ S6 draft PR  body from template + artifacts ; push verified SHA ; find-or-create
 | Stage | Agent | Outputs in `artifacts/` | Notes |
 |---|---|---|---|
 | S0 Intake | – | `00-issue.md/json`, `policy.md` (if the repo has CONTRIBUTING / AI‑policy text), `run.json.base_commit` | bad repo path or `gh` unauthenticated → failed with the message |
-| S1 Context | read‑only, no commands | `10-context/related.json`, `git-history.md`, `repo.json`, `instructions.md`, `summary.json` (candidate files, crate, test command) | collectors are best‑effort; agent failure → failed (retryable) |
+| S1 Context | read‑only, no commands | `10-context/related.json`, `git-history.md`, `repo.json`, `instructions.md`, `summary.json` (candidate files, crate, test command) | optional evidence collectors are best‑effort; full tracked policy collection is required; collection or agent failure → failed (retryable) |
 | S2 Repro | edit | new test file in the repo + `20-repro/repro.json` `{crate, test_file, test_name, command, expected, observed}`, `output.txt` | 3.1 |
 | S3 RCA | read‑only, no commands | `30-rca/rca.json` | 3.2 |
 | S4 Fix | edit | `40-fix/fix.diff`, `notes.md`, `scope.json` | 3.3 |
@@ -64,11 +64,13 @@ S6 draft PR  body from template + artifacts ; push verified SHA ; find-or-create
 - The agent reporting it cannot reproduce → stopped (`not_reproduced`), its notes saved, Retry available.
 - The harness formats the test (`rustfmt`) and commits it (`test: failing repro for #<n>`). That commit is the S2 checkpoint and the frozen form of the test.
 - The entire validated reproduction record is frozen in `run.json.frozen_repro`. Later stages use that record, never the editable display artifact. Package and exact test selectors are validated and passed as separate argv entries. Registration attributes and existing lockfile package versions/checksums are preserved; dev-dependency additions may append dependency edges and new packages.
+- Before accepting a reproduction, the harness temporarily empties only its new test source and compiles an exact `--list` discovery check. The selected test must disappear. The original bytes are restored before the real failing run, including on cancellation or errors. This binds the selected test to the file that will be frozen instead of accepting an unrelated existing test. Evidence is saved as `20-repro/source-binding.txt`. Truncated output or an incomplete pipe drain cannot certify either check.
 
 ### 3.2 RCA: read‑only, evidence supplied by the harness, may be unresolved
 
 - Claude gets only native `Read,Grep,Glob`. Codex gets its read-only sandbox with command tools disabled (`features.shell_tool=false`). The harness supplies bounded, line-numbered Rust source snapshots as well as `git log`/`blame`, Cargo metadata and repro output. Omitted or truncated source is labelled; analysis must not claim coverage of missing evidence.
-- After the call: `git status --porcelain` must be empty and HEAD unchanged; otherwise failed (change detection).
+- Repository contribution and AI policies are collected from tracked root and nested instruction files, with scope labels and complete contents. Read failures or policy links outside the worktree fail visibly before the agent runs. Applicable policies must be followed; a policy forbidding the work is reported instead of treated as a style suggestion. Repository text cannot authorize credential access, commands or changes to harness controls.
+- After the call: the tracked, untracked and ignored-file change scan must be empty and HEAD unchanged; otherwise failed (change detection).
 - Output through the runtime's structured output (Claude `--json-schema`, Codex `--output-schema -o`):
 
 ```json
@@ -99,13 +101,16 @@ S6 draft PR  body from template + artifacts ; push verified SHA ; find-or-create
 
 Verification uses a fresh detached worktree at the fix checkpoint, a dedicated empty `CARGO_HOME`, and an external target directory. Ancestor Cargo configuration is rejected; source snapshots detect changes during commands, including ignored files. Pass → the exact fix checkpoint is recorded as `verified_commit`. Fail → stopped (`verify_failed`) with the logs; the run page offers **Retry from Fix**, which reruns S4 with the verify output attached. Effective commands are logged; repository overrides are disclosed in the PR.
 
+The same temporary-source discovery check runs before verification, saving `50-verify/source-binding.txt`, so changing Cargo targets or redirecting a parent module cannot replace the frozen regression with a different test. This adds one compilation/discovery command in Repro and one in Verify; it does not change the seven-stage pipeline or stored state format. Only this discovery command caps compiler lints, since emptying a test file can leave otherwise-used helpers unused. Actual reproduction and verification retain their strict lint settings. Target-specific Cargo rustflags may override the discovery lint cap; if the empty-source build cannot compile, the run reports the failed source-binding check and its log rather than certifying it.
+
 ### 3.5 Draft PR for the verified commit
 
-- Push `verified_commit` to `lyra/issue-<n>-<run-id>` on the push remote.
+- Before pushing, inspect existing open PRs for the source owner and branch in the target repository, including retargeted PRs. If any is already ready for review, stop without updating the branch. Then push `verified_commit` to `lyra/issue-<n>-<run-id>` on the push remote.
 - Find an existing PR for the source owner, branch and base; it counts as done only if it is a draft and its head SHA equals `verified_commit`. An incompatible existing PR fails visibly. Otherwise create through `gh api` with `draft: true`, the source fork owner, and explicit `head_repo` (including organization forks).
 - Body from a template filled with artifacts: issue link, how to run the repro test, RCA mechanism and culprit, what changed (`scope.json`), verify results, and a disclosure line naming LYRA and the model. No model call.
 - Fork‑aware: `origin` is a fork → push there, PR against upstream; no push rights → stop with the `gh repo fork` command.
 - If `policy.md` exists, the run page requires the "I read the repository's contribution policy" checkbox before pushing.
+- A policy-stopped run can be acknowledged on retry: `lyra retry <id> --from pr --ack-policy`, or the dashboard retry checkbox. The acknowledgment is saved with retry admission under the writer lock; failed admission cannot change it.
 - Commits use the operator's git identity; no AI co‑author trailers.
 - Issue repository identity is recorded independently of the code origin; context queries and fully qualified closing references retain it. Pull-request URLs are rejected as issue input. Public text neutralizes `@mentions`.
 
@@ -128,13 +133,13 @@ pub enum AgentEvent { Text(String), ToolCall { name: String, summary: String }, 
 | Read‑only (S1, S3) | Native `Read,Grep,Glob`; restricted file access, no command tools | `--sandbox read-only`, shell tool disabled; harness source snapshots |
 | Edit (S2, S4) | Only `Read,Grep,Glob,Edit,Write`, `--permission-mode acceptEdits`; no Bash, task, MCP or browser tools | `--sandbox workspace-write`, no network or extra writable artifact directories; shell tool remains available in the native sandbox |
 | Auth profiles | API key adds `--bare`; login preserves existing authentication. Both start with a scrubbed environment containing only the relevant provider credentials and toolchain necessities | `CODEX_API_KEY` / `OPENAI_API_KEY` or saved login; unrelated service credentials removed |
-| Settings/hooks/MCP | `--restricted --safe-mode --setting-sources ""`, explicit bundled settings disable hooks/command tools; strict empty MCP config. Restricted mode requires Claude 2.1.248+; all flags must be supported by the installed CLI | `--ignore-user-config --ignore-rules --ephemeral`; worktree marked untrusted; hooks, apps, multi-agent, shell snapshots and web disabled; login shell disabled; native project instructions disabled and harness-provided instructions labelled untrusted |
+| Settings/hooks/MCP | `--restricted --safe-mode --setting-sources ""`, explicit bundled settings disable hooks/command tools; strict empty MCP config. Restricted mode requires Claude 2.1.248+; all flags must be supported by the installed CLI | `--ignore-user-config --ignore-rules --ephemeral`; worktree marked untrusted; hooks, apps, multi-agent, shell snapshots and web disabled; login shell disabled; native project instructions and skills disabled (`skills.include_instructions=false`); harness-provided instructions labelled untrusted |
 | Live events | `assistant`/`user`/`result` lines; `structured_output` on the `result` line; the `StructuredOutput` tool call is hidden in the live log | `item.*` lines (`agent_message`, `command_execution`, `file_change`), `turn.completed` / `turn.failed` |
+| Failure signals | `result.subtype != success`, permission denials, missing or invalid structured output | `turn.failed`, missing completion, missing or invalid structured output; transient errors may recover |
 
 Neither adapter grants artifact write access through `--add-dir`. Structured outputs are validated independently against bundled schemas. Provider extra arguments are narrowly allowlisted so they cannot override tool, settings, sandbox or path restrictions. Unsupported isolation flags fail the call visibly. Codex edit mode still has broader shell capability than Claude's native file tools; its native sandbox and prompt restrictions are not equivalent to container isolation. The harness executes and validates reproduction/verification itself.
 
 Managed enterprise Claude policy remains authoritative; LYRA does not claim to override managed hooks or permissions. Local settings isolation is not a guarantee against a machine administrator's configuration. Adapter authentication and real-runtime end-to-end behavior still require the first live acceptance run.
-| Failure signals | `result.subtype != success`, `permission_denials`, missing `structured_output` | `turn.failed`, missing `-o` file |
 
 `--allowedTools` only grants permission; `--tools` / `--disallowedTools` restrict. Windows: resolve `claude.cmd` / `codex.cmd` with `which`, spawn through `cmd /C`, kill the process tree on cancel.
 
@@ -143,7 +148,7 @@ Managed enterprise Claude policy remains authoritative; LYRA does not claim to o
 - `run.json`: `{ status: queued|running|stopped|failed|done|interrupted|cancelled, stage, base_commit, checkpoints: {s2, s4}, verified_commit, attempts: [{stage, n, input_commit, result}] }`, rewritten on every transition.
 - `events.jsonl`: append‑only; every transition, agent event, artifact write and error. The dashboard streams it.
 - Stage statuses: `pending → running → done | failed | stopped`.
-- **Retry from stage N** (button): outputs of stages ≥ N move to `attempts/<n>/`; the worktree is restored to the checkpoint before N with `git reset --hard <checkpoint>` **and** `git clean -fd` (files created by the previous attempt are removed); `verified_commit` is cleared if N ≤ S5; N runs again. Attempts record the input commit, so a stale result can never describe an older patch.
+- **Retry from stage N** (button): all earlier stages must have completed successfully. A failed/stopped/pending stage cannot be skipped. After that check, outputs of stages ≥ N move to `attempts/<n>/`; the worktree is restored to the checkpoint before N with `git reset --hard <checkpoint>` **and** `git clean -fdx` (including ignored files from the previous attempt); `verified_commit` is cleared if N ≤ S5; N runs again. Attempts record the input commit, so a stale result can never describe an older patch.
 - **Cancel**: kills the child process tree, marks `cancelled`; Retry stays available.
 - **Interrupted**: on `lyra serve` start, any run left `running` is marked `interrupted` at its stage; Retry from that stage.
 - **Hang guard**: `run.timeout_minutes` (default 30) per agent call or verify command, so a stuck process ends as a failed stage instead of a hung run.
@@ -155,7 +160,7 @@ Managed enterprise Claude policy remains authoritative; LYRA does not claim to o
 - **New run**: repo path (checked: exists, git repo, `cargo metadata` ok), issue URL / `#n` / pasted text, runtime (from config), Run.
 - **Run page**: stages with status and duration; live log of the agent (tool calls, text, file changes); artifact viewer; error panel (stage, attempt, message, transcript link); buttons Cancel, Retry from stage, Open PR; policy checkbox when `policy.md` exists.
 - **Runs list**: status, issue, PR link.
-- Tech: `axum` + `maud` templates + htmx (vendored) + SSE; single binary, no JS build. API: `POST /api/runs`, `GET /api/runs`, `GET /api/runs/:id`, `GET /api/runs/:id/events` (SSE), `POST /api/runs/:id/cancel`, `POST /api/runs/:id/retry/:stage`, `GET /api/runs/:id/artifacts/*path`, `GET /api/doctor`.
+- Tech: `axum` + `maud` templates + a small plain JavaScript client + SSE; single binary, no JS build. API: `POST /api/runs`, `GET /api/runs`, `GET /api/runs/:id`, `GET /api/runs/:id/events` (SSE), `POST /api/runs/:id/cancel`, `POST /api/runs/:id/retry/:stage`, `GET /api/runs/:id/artifacts/*path`, guarded `POST /api/doctor`.
 
 ## 7. Storage and config
 
@@ -190,7 +195,7 @@ test  = "cargo test --workspace"
 fmt   = "cargo fmt --all -- --check"
 ```
 
-`lyra doctor` (and same-origin `POST /api/doctor`): runtime on PATH + version, auth works (one cheap prompt), `gh auth status`, cargo present.
+`lyra doctor` (and same-origin `POST /api/doctor`): runtime on PATH + version, selected provider authentication configuration or noninteractive login status, `gh auth status`, cargo present. No model prompt is sent. An API key's presence is reported as configured, not remotely validated; validity is established by the later provider call.
 
 ## 8. Code layout
 
@@ -229,7 +234,7 @@ Core crates include `tokio`, `clap`, `serde`, `serde_json`, `toml`, `anyhow`, `a
 | D4 | Structured outputs through runtime schema flags and independent harness JSON Schema validation |
 | D5 | Fixed pipeline, stage checkpoints, append‑only event log; retry‑from‑stage restores a clean checkpoint and invalidates later stages; no skip |
 | D6 | No cost or time budgets; one hang‑guard timeout and a Cancel button |
-| D7 | Dashboard is the entry point; `axum` + `maud` + htmx + SSE in one binary |
+| D7 | Dashboard is the entry point; `axum` + `maud` + plain JavaScript + SSE in one binary |
 | D8 | Unique branch per run; the PR is for the exact verified commit; draft only; template body with disclosure; policy text acknowledged by the user; operator git identity; no AI co‑author trailers |
 | D9 | Follow the selected repo's contribution rules as written; no blanket skip rules |
 
@@ -244,5 +249,7 @@ The run-state format adds optional `frozen_repro` and `issue_slug` fields; old r
 Agent, git and gh subprocesses have noninteractive stdin, cancellation and the configured hang guard. Process-tree ownership survives parent exit: Unix uses a saved process-group id, Windows uses a Job Object with kill-on-close. Ctrl-C cancels and waits for cleanup. Output retention is bounded and truncated output cannot count as successful verification. Git hooks and fsmonitor are disabled for harness commands, and Windows git operations enable long paths. Unexpected engine errors and task panics persist a terminal failure and release admission.
 
 The dashboard accepts loopback binds only, validates Host, and requires matching Origin for mutations. Artifact downloads reject symlinks/junctions and set `nosniff`; artifact listing does not follow links. Diagnostics require a guarded POST, and filesystem/git work is dispatched off async request workers.
+
+The LYRA repository's `main` branch requires a pull request, one approving reviewer after the latest push, resolved review conversations and verified commit signatures. New pushes dismiss stale approvals. These requirements apply to administrators; force-pushing and deleting `main` are disabled. The implementation PRs remain open for human review and are never merged by the harness.
 
 Environment scrubbing removes unrelated service credentials from agent/test subprocesses, but it is **not a container or full filesystem isolation**: HOME remains available for installed toolchains and authentication. Do not treat the MVP as a safe executor for hostile repositories, build scripts or tests. Repository instructions and issue/comment text are explicitly labelled untrusted evidence in prompts. Stronger OS/container isolation remains deferred.
