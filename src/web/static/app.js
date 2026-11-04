@@ -1,10 +1,29 @@
 // LYRA run page: live log over SSE. No framework; served from /static/app.js.
 (function () {
   "use strict";
+  document.querySelectorAll('form[method="post"]').forEach(function (form) {
+    form.addEventListener("submit", function (event) {
+      if (form.dataset.submitting) { event.preventDefault(); return; }
+      form.dataset.submitting = "true";
+      document.querySelectorAll('button[type="submit"]').forEach(function (button) {
+        if (!button.disabled) { button.dataset.submitting = "true"; button.disabled = true; }
+      });
+    });
+  });
+  // Restore controls when a browser returns to this page from its back/forward cache.
+  window.addEventListener("pageshow", function () {
+    document.querySelectorAll('[data-submitting]').forEach(function (element) {
+      delete element.dataset.submitting;
+      if (element.tagName === "BUTTON") element.disabled = false;
+    });
+  });
   var log = document.getElementById("log");
   if (!log || !window.EventSource) return;
   var runId = log.dataset.run;
   var renderedSeq = parseInt(log.dataset.seq || "0", 10);
+  var seenSeq = 0;
+  var renderedTerminal = log.dataset.terminal === "true";
+  var reloading = false;
   var LABELS = { intake: "S0 Intake", context: "S1 Context", repro: "S2 Repro", rca: "S3 RCA", fix: "S4 Fix", verify: "S5 Verify", pr: "S6 Draft PR" };
   var TERMINAL = { run_finished: 1, run_stopped: 1, stage_failed: 1, run_cancelled: 1, run_interrupted: 1 };
 
@@ -49,9 +68,17 @@
   }
 
   var es = new EventSource("/api/runs/" + encodeURIComponent(runId) + "/events?since=0");
+  function reload() {
+    es.close();
+    if (reloading) return;
+    reloading = true;
+    setTimeout(function () { location.reload(); }, 400);
+  }
   es.addEventListener("run", function (msg) {
     var e;
     try { e = JSON.parse(msg.data); } catch (_) { return; }
+    if (!Number.isSafeInteger(e.seq) || e.seq <= seenSeq) return;
+    seenSeq = e.seq;
     var d = describe(e);
     if (d) {
       var stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
@@ -64,6 +91,12 @@
     if (e.seq <= renderedSeq) return; // replayed history: the page already reflects it
     if (e.kind === "stage_started") setStage(e.stage, "running", "running");
     if (e.kind === "stage_completed") setStage(e.stage, "done", "done");
-    if (TERMINAL[e.kind]) { es.close(); setTimeout(function () { location.reload(); }, 400); }
+    if (e.kind === "retry_requested" && renderedTerminal) reload();
+    if (TERMINAL[e.kind]) reload();
+  });
+  es.addEventListener("end", function () {
+    es.close();
+    // Covers a completion racing page rendering, even if its event was replayed.
+    if (!renderedTerminal) reload();
   });
 })();

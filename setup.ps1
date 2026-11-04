@@ -13,8 +13,17 @@ Write-Host "== Checking tools"
 if (Test-Tool 'cargo') { Ok ("cargo: " + (cargo --version)) } else { Bad 'cargo not found: install Rust from https://rustup.rs' }
 if (Test-Tool 'git') { Ok ("git: " + (git --version)) } else { Bad 'git not found: install Git for Windows' }
 if (Test-Tool 'gh') {
-    gh auth status *> $null
-    if ($LASTEXITCODE -eq 0) { Ok 'gh: authenticated' } else { Bad 'gh is installed but not authenticated: run `gh auth login`' }
+    # In Windows PowerShell 5.1 redirected native stderr is an ErrorRecord.
+    # Authentication failures are a diagnostic, not a terminating script error.
+    $savedPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        gh auth status *> $null
+        $authExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedPreference
+    }
+    if ($authExitCode -eq 0) { Ok 'gh: authenticated' } else { Bad 'gh is installed but not authenticated: run `gh auth login`' }
 } else {
     Bad 'gh (GitHub CLI) not found: install from https://cli.github.com and run `gh auth login`'
 }
@@ -29,53 +38,19 @@ if (-not (Test-Tool 'cargo')) {
     exit 1
 }
 
-Write-Host "`n== Building (cargo build --release)"
-cargo build --release
+Write-Host "`n== Building (cargo build --release --locked)"
+cargo build --release --locked
 if ($LASTEXITCODE -ne 0) {
     Write-Host "`nBuild failed. If the error mentions link.exe, install Visual Studio Build Tools or use the GNU toolchain (see SETUP.md)." -ForegroundColor Red
     exit 1
 }
 
-Write-Host "`n== Configuration"
 $lyraHome = if ($env:LYRA_HOME -and $env:LYRA_HOME.Trim()) { $env:LYRA_HOME } else { Join-Path $HOME '.lyra' }
 $configPath = Join-Path $lyraHome 'config.toml'
-if (Test-Path $configPath) {
-    Ok "keeping existing $configPath"
-} else {
-    New-Item -ItemType Directory -Force -Path $lyraHome | Out-Null
-    # Same text as DEFAULT_CONFIG_TOML in src/config.rs.
-    $defaultConfig = @'
-# LYRA configuration (see docs/PLAN.md {SECT}7)
-
-[run]
-provider = "claude"            # "claude" | "codex"
-timeout_minutes = 30           # hang guard per agent call / verify command
-
-[server]
-bind = "127.0.0.1:7700"
-open_browser = true
-
-[providers.claude]
-kind = "claude"
-auth = "api_key"               # "api_key" (needs ANTHROPIC_API_KEY) | "login" (uses `claude` login)
-model = "opus"
-
-[providers.codex]
-kind = "codex"
-# model = "gpt-5.5-codex"
-
-[verify]                       # <repo>/lyra.toml can override these
-build = "cargo build --workspace"
-test  = "cargo test --workspace"
-fmt   = "cargo fmt --all -- --check"
-'@
-    $defaultConfig = $defaultConfig.Replace('{SECT}', [string][char]0x00A7)  # keeps this file ASCII-only for PowerShell 5.1
-    [System.IO.File]::WriteAllText($configPath, ($defaultConfig -replace "`r`n", "`n") + "`n", (New-Object System.Text.UTF8Encoding $false))
-    Ok "wrote $configPath"
-}
 
 Write-Host "`n== lyra doctor"
 $lyra = Join-Path $PSScriptRoot 'target\release\lyra.exe'
+# The binary owns the default config and creates it only when missing.
 & $lyra doctor
 $doctorOk = ($LASTEXITCODE -eq 0)
 

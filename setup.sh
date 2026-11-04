@@ -28,50 +28,18 @@ if ! have cargo; then
   echo; echo "Cannot build without cargo. Fix the items above and run ./setup.sh again."; exit 1
 fi
 
-echo; echo "== Building (cargo build --release)"
-if ! cargo build --release; then
+echo; echo "== Building (cargo build --release --locked)"
+if ! cargo build --release --locked; then
   echo; echo "Build failed; see SETUP.md (Troubleshooting)."; exit 1
 fi
 
-echo; echo "== Configuration"
 if [ -n "${LYRA_HOME:-}" ]; then lyra_home="$LYRA_HOME"; else lyra_home="$HOME/.lyra"; fi
 config="$lyra_home/config.toml"
-if [ -f "$config" ]; then
-  ok "keeping existing $config"
-else
-  mkdir -p "$lyra_home"
-  # Same text as DEFAULT_CONFIG_TOML in src/config.rs.
-  cat > "$config" <<'EOF'
-# LYRA configuration (see docs/PLAN.md §7)
-
-[run]
-provider = "claude"            # "claude" | "codex"
-timeout_minutes = 30           # hang guard per agent call / verify command
-
-[server]
-bind = "127.0.0.1:7700"
-open_browser = true
-
-[providers.claude]
-kind = "claude"
-auth = "api_key"               # "api_key" (needs ANTHROPIC_API_KEY) | "login" (uses `claude` login)
-model = "opus"
-
-[providers.codex]
-kind = "codex"
-# model = "gpt-5.5-codex"
-
-[verify]                       # <repo>/lyra.toml can override these
-build = "cargo build --workspace"
-test  = "cargo test --workspace"
-fmt   = "cargo fmt --all -- --check"
-EOF
-  ok "wrote $config"
-fi
 
 echo; echo "== lyra doctor"
 lyra="$(pwd)/target/release/lyra"
 doctor_ok=1
+# The binary owns the default config and creates it only when missing.
 "$lyra" doctor || doctor_ok=0
 
 echo; echo "== Next steps"

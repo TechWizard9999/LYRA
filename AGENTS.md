@@ -22,7 +22,7 @@ LYRA is a Rust harness around a coding-agent CLI (Claude Code or Codex). Given a
 | `src/proc.rs` | subprocesses: hang-guard timeout, cancellation, process-tree kill, Windows `.cmd` shims |
 | `src/git.rs`, `src/github.rs` | git worktrees/checkpoints; `gh` calls |
 | `src/artifacts.rs` | run directory layout and artifact I/O |
-| `src/doctor.rs` | environment checks (`lyra doctor`, `GET /api/doctor`) |
+| `src/doctor.rs` | environment checks (`lyra doctor`, guarded `POST /api/doctor`) |
 | `src/web/` | dashboard: `server.rs` (router, pages), `api.rs` (JSON API), `sse.rs` (event stream), `views.rs` (maud), `static/` (CSS, JS) |
 | `src/prompts/*.md`, `src/schemas/*.json` | prompt templates (minijinja) and structured-output schemas |
 

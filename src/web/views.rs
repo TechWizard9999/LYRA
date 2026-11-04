@@ -39,6 +39,7 @@ pub fn layout(title: &str, body: Markup) -> Markup {
                     span.tagline { "issue → failing test → fix → draft PR" }
                 }
                 main { (body) }
+                script src="/static/app.js" defer {}
             }
         }
     }
@@ -121,7 +122,7 @@ fn runs_table(runs: &[RunState]) -> Markup {
                             td { (r.request.issue) }
                             td { (r.provider) }
                             td.muted { (short_ts(&r.created)) }
-                            td { @if let Some(u) = &r.pr_url { a href=(u) target="_blank" rel="noopener" { "PR" } } }
+                            td { @if let Some(u) = r.pr_url.as_deref().and_then(https_pr_url) { a href=(u) target="_blank" rel="noopener" { "PR" } } }
                         }
                     }
                 }
@@ -158,7 +159,7 @@ pub fn run_page(v: &RunView) -> Markup {
                     dt { "Runtime" } dd { (r.provider) }
                     @if let Some(b) = &r.branch { dt { "Branch" } dd { code { (b) } } }
                     @if let Some(c) = &r.verified_commit { dt { "Verified" } dd { code { (short_sha(c)) } } }
-                    @if let Some(u) = &r.pr_url { dt { "Draft PR" } dd { a href=(u) target="_blank" rel="noopener" { (u) } } }
+                    @if let Some(u) = r.pr_url.as_deref().and_then(https_pr_url) { dt { "Draft PR" } dd { a href=(u) target="_blank" rel="noopener" { (u) } } }
                     dt { "Created" } dd.muted { (short_ts(&r.created)) }
                 }
             }
@@ -204,7 +205,7 @@ pub fn run_page(v: &RunView) -> Markup {
                         }
                     }
                 }
-                @if let Some(u) = &r.pr_url {
+                @if let Some(u) = r.pr_url.as_deref().and_then(https_pr_url) {
                     a.button.primary href=(u) target="_blank" rel="noopener" { "Open PR" }
                 }
             }
@@ -218,7 +219,7 @@ pub fn run_page(v: &RunView) -> Markup {
             }
             section.card {
                 h2 { "Live log" }
-                div #log data-run=(r.id) data-seq=(v.last_seq) {}
+                div #log data-run=(r.id) data-seq=(v.last_seq) data-terminal=(terminal) {}
             }
             section.card {
                 h2 { "Artifacts" }
@@ -232,9 +233,13 @@ pub fn run_page(v: &RunView) -> Markup {
                     }
                 }
             }
-            script src="/static/app.js" {}
         },
     )
+}
+
+fn https_pr_url(value: &str) -> Option<&str> {
+    let uri: axum::http::Uri = value.parse().ok()?;
+    (uri.scheme_str() == Some("https") && uri.authority().is_some()).then_some(value)
 }
 
 fn badge(status: &str) -> Markup {
@@ -246,7 +251,7 @@ fn issue_link(r: &RunState) -> Markup {
     let url = if issue.starts_with("http://") || issue.starts_with("https://") {
         Some(issue.clone())
     } else {
-        match (&r.repo_slug, r.issue_number) {
+        match (r.issue_slug.as_ref().or(r.repo_slug.as_ref()), r.issue_number) {
             (Some(slug), Some(n)) => Some(format!("https://github.com/{slug}/issues/{n}")),
             _ => None,
         }
@@ -471,5 +476,48 @@ mod tests {
         assert_eq!(fmt_ms(61_000), "1m 01s");
         assert_eq!(parse_ts("2026-11-04T10:15:02.5Z").unwrap() - parse_ts("2026-11-03T10:15:00Z").unwrap(), 86_402);
         assert_eq!(url_path("a b/c#d.txt"), "a%20b/c%23d.txt");
+    }
+
+    #[test]
+    fn pr_links_require_https_and_scripts_are_loaded_once_on_every_page() {
+        for bad in
+            ["javascript:alert(1)", "data:text/html,bad", "http://github.com/o/r/pull/1", "//evil.example/x", "https:"]
+        {
+            let mut r = run();
+            r.pr_url = Some(bad.into());
+            let html =
+                run_page(&RunView { run: &r, artifacts: &[], policy: None, last_seq: 0, flash: None }).into_string();
+            assert!(!html.contains("Open PR"), "{bad}");
+            assert!(!html.contains(&format!("href=\"{bad}\"")), "{bad}");
+            assert_eq!(html.matches("src=\"/static/app.js\"").count(), 1);
+            let html = runs_table(&[r]).into_string();
+            assert!(!html.contains("target=\"_blank\""), "{bad}");
+        }
+        assert!(https_pr_url("https://github.com/o/r/pull/1").is_some());
+        let form = NewRunForm::default();
+        let html = home(&HomeView {
+            runs: &[],
+            providers: vec![],
+            default_provider: "claude",
+            form: &form,
+            error: None,
+            busy: false,
+        })
+        .into_string();
+        assert_eq!(html.matches("src=\"/static/app.js\"").count(), 1);
+    }
+
+    #[test]
+    fn shorthand_issue_links_use_the_issue_repository_when_working_in_a_fork() {
+        let mut r = run();
+        r.request.issue = "#7".into();
+        r.issue_number = Some(7);
+        r.repo_slug = Some("contributor/demo".into());
+        r.issue_slug = Some("upstream/demo".into());
+        let html = issue_link(&r).into_string();
+        assert!(html.contains("https://github.com/upstream/demo/issues/7"));
+        assert!(!html.contains("https://github.com/contributor/demo/issues/7"));
+        r.issue_slug = None;
+        assert!(issue_link(&r).into_string().contains("https://github.com/contributor/demo/issues/7"));
     }
 }

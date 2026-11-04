@@ -2,6 +2,8 @@
 
 This walks you from a fresh clone to a first run. The short version is `./setup.ps1` (Windows) or `./setup.sh` (Linux / macOS); both are safe to run again.
 
+If Windows execution policy blocks the script, run `powershell -ExecutionPolicy Bypass -File .\setup.ps1`. This sets the policy for that process without changing the machine's policy. The setup script builds with the checked-in lockfile and lets `lyra doctor` create the default config; existing configuration is preserved.
+
 ## Prerequisites
 
 | Tool | Why | Install / check |
@@ -16,16 +18,16 @@ At least one runtime:
 
 - **Claude Code**: `npm i -g @anthropic-ai/claude-code`.
   - `auth = "api_key"` (default): set `ANTHROPIC_API_KEY`. LYRA runs `claude --bare`, so your personal settings, hooks and MCP servers are not loaded.
-  - `auth = "login"`: run `claude` once and log in. LYRA then passes `--setting-sources user --disallowedTools "mcp__*"` so the target repo's project settings and MCP servers are not loaded.
+  - `auth = "login"`: run `claude` once and log in. LYRA preserves that login while using restricted/safe mode, disabling hooks and MCP servers, and ignoring user/project customization. Agents get file tools; the harness runs build and test commands.
 - **Codex CLI**: `npm i -g @openai/codex`, then `codex login`, or set `CODEX_API_KEY`. Select it with `[run] provider = "codex"` or per run in the dashboard.
 
 ## Build
 
 ```sh
-cargo build --release
+cargo build --release --locked
 ```
 
-The binary is `target/release/lyra` (`target\release\lyra.exe` on Windows). Put it on your `PATH` or call it by path. `cargo install --path .` also works.
+The binary is `target/release/lyra` (`target\release\lyra.exe` on Windows). Put it on your `PATH` or call it by path. `cargo install --path . --locked` also works.
 
 ## Configure
 
@@ -37,7 +39,7 @@ LYRA reads `~/.lyra/config.toml`. Set `LYRA_HOME` to use another directory (conf
 lyra doctor
 ```
 
-It checks that the configured runtime is on `PATH` and authenticated, that `gh auth status` succeeds, and that `cargo` is present. Fix every line marked `!!` before the first run. The same report is available at `GET /api/doctor`.
+It checks that the configured runtime is on `PATH` and authenticated, that `gh auth status` succeeds, and that `cargo` is present. Fix every line marked `!!` before the first run. The same report is available at `POST /api/doctor` with a matching Origin header, for example `curl -X POST -H "Origin: http://127.0.0.1:7700" http://127.0.0.1:7700/api/doctor`.
 
 ## First run
 
@@ -49,6 +51,8 @@ It checks that the configured runtime is on `PATH` and authenticated, that `gh a
 
 The same from a terminal: `lyra run --repo /path/to/repo --issue <url>` prints the events and exits with 0 (done), 3 (stopped), 4 (stage failed) or 5 (cancelled / interrupted).
 
+Use one writer process per `LYRA_HOME`: stop the dashboard before running CLI `run` or `retry`. A writer lock prevents a second process from interrupting or changing a live run. Read-only commands such as `lyra runs` can still inspect saved runs.
+
 ## Troubleshooting
 
 - **`link.exe` not found** (Windows, MSVC toolchain without Build Tools): install Visual Studio Build Tools, or switch to the GNU toolchain (`rustup default stable-x86_64-pc-windows-gnu`) with WinLibs gcc on `PATH`.
@@ -59,4 +63,5 @@ The same from a terminal: `lyra run --repo /path/to/repo --issue <url>` prints t
 - **A stage fails with a timeout**: an agent call or verify command ran longer than `run.timeout_minutes` (default 30). Large workspaces may need more; raise it and press **Retry from <stage>**. It is a hang guard, not a budget.
 - **"a run is already active"**: one run at a time. Wait for it, or press **Cancel** on its page.
 - **A run shows `interrupted`**: the previous `lyra serve` / `lyra run` process ended while it was running. Retry it from the stage shown.
-- **Port 7700 in use**: change `[server] bind`.
+- **Port 7700 in use**: change `[server] bind` to another loopback address and port, for example `127.0.0.1:7701`. The dashboard refuses LAN/wildcard binds such as `0.0.0.0:7700`.
+- **API request returns 403**: use the loopback dashboard URL and send its exact origin (for example `Origin: http://127.0.0.1:7700`) on POST requests. Cross-site browser requests and unexpected Host headers are rejected.

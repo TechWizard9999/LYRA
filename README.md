@@ -21,11 +21,11 @@ S6 draft PR  body from template + artifacts ; push verified SHA ; find-or-create
 
 ```sh
 git clone <this repo> lyra && cd lyra
-./setup.ps1          # Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -File .\setup.ps1   # Windows; policy applies to this process only
 ./setup.sh           # Linux / macOS
 ```
 
-The setup script checks your tools, builds `target/release/lyra`, writes `~/.lyra/config.toml` if it does not exist, and runs `lyra doctor`. Full prerequisites and troubleshooting are in [SETUP.md](SETUP.md).
+The setup script checks your tools, builds `target/release/lyra` with `--locked`, and runs `lyra doctor`, which creates `~/.lyra/config.toml` if it does not exist. Full prerequisites and troubleshooting are in [SETUP.md](SETUP.md).
 
 ```sh
 lyra doctor          # runtime on PATH + auth, gh auth status, cargo
@@ -43,6 +43,8 @@ lyra runs                                              # list runs
 lyra retry <run-id> --from fix                         # intake|context|repro|rca|fix|verify|pr
 lyra config                                            # print the effective configuration
 ```
+
+The dashboard and CLI share a writer lock per `LYRA_HOME`. Stop `lyra serve` before starting a CLI run or retry; read-only commands such as `lyra runs` remain available. Dashboard live events come from runs started by that dashboard process.
 
 ## Configuration
 
@@ -112,14 +114,18 @@ Read-only stages use the runtime's own restrictions (Claude `--tools "Read,Grep,
 
 ## Dashboard API
 
-`POST /api/runs` (RunRequest JSON → `{id}`), `GET /api/runs`, `GET /api/runs/{id}`, `GET /api/runs/{id}/events?since=N` (SSE, event `run`, id = seq), `POST /api/runs/{id}/cancel`, `POST /api/runs/{id}/retry/{stage}`, `GET /api/runs/{id}/artifacts/{path}`, `GET /api/doctor`, `GET /api/config`. Errors are `{"error": "..."}` with 400 / 404 / 409.
+`POST /api/runs` (RunRequest JSON → `{id}`), `GET /api/runs`, `GET /api/runs/{id}`, `GET /api/runs/{id}/events?since=N` (SSE, event `run`, id = seq), `POST /api/runs/{id}/cancel`, `POST /api/runs/{id}/retry/{stage}`, `GET /api/runs/{id}/artifacts/{path}`, `POST /api/doctor`, `GET /api/config`. Errors include 400 / 403 / 404 / 409.
+
+The server accepts loopback `Host` headers on its listening port and rejects cross-site browser requests. Every POST needs an `Origin` matching its URL exactly, including the scheme, host and port. For example: `curl -X POST -H "Origin: http://127.0.0.1:7700" http://127.0.0.1:7700/api/doctor`. Browser forms supply this automatically. Health diagnostics only run on this guarded POST; GET does not launch subprocesses.
+
+SSE reconnects resume with `Last-Event-ID`. After all saved events for a terminal, inactive run have been sent, the server sends an `end` event and closes the stream; clients should close their `EventSource` on `end`. A retry starts a new stream when its run page reloads. Artifacts are served as plain text with content sniffing disabled, and paths through symlinks or junctions are rejected.
 
 ## Limitations of this release
 
 - Rust repositories on GitHub only; one active run at a time; one runtime per run.
 - Draft PRs only, never merged. The policy acknowledgment is given when the run is submitted; a retry keeps the original answer.
-- The agent runs on your machine without a container sandbox. Edit stages may run `cargo`, which executes build scripts of the target repository: only run LYRA on repositories you are willing to build locally.
-- The dashboard has no authentication: keep `server.bind` on `127.0.0.1`.
+- LYRA builds and tests repositories on your machine without a container sandbox. The harness runs `cargo`, which executes the target repository's build scripts and tests; only run LYRA on repositories you are willing to build locally.
+- The dashboard supports loopback addresses only (`127.0.0.1`, `localhost`, or `::1`). Non-loopback binds are rejected; remote hosting is outside this release.
 - No automatic resume or fix-retry loop, no cost display, no multi-model RCA, no web search. See [docs/PLAN.md](docs/PLAN.md) §11 and [docs/RESEARCH.md](docs/RESEARCH.md) for what comes next.
 
 ## More
@@ -128,3 +134,5 @@ Read-only stages use the runtime's own restrictions (Claude `--tools "Read,Grep,
 - [docs/RESEARCH.md](docs/RESEARCH.md): deferred designs and the survey behind them.
 - [SETUP.md](SETUP.md): prerequisites, first run, troubleshooting.
 - [AGENTS.md](AGENTS.md): rules for contributors and coding agents working on LYRA.
+
+Dashboard browser behavior has offline tests using Node's built-in runner: `node --test src/web/static/app.test.js`. Rust handler and SSE tests run with `cargo test` and need no installed agent CLI or network access.
