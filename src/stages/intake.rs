@@ -48,13 +48,12 @@ fn intake(ctx: &mut StageCtx) -> Result<(), StageError> {
 
     // The issue.
     let request_issue = ctx.state.request.issue.clone();
+    let issue_slug;
     let issue = if let Some(text) = &issue_text {
-        let n = github::parse_issue_ref(&request_issue, Some(origin_slug.as_deref().unwrap_or("local/local")))
-            .map(|r| r.number)
-            .ok()
-            .or_else(|| first_number(&request_issue))
-            .ok_or_else(|| StageError::fatal(ErrorKind::Config, format!("no issue number in '{request_issue}'")))?;
-        github::issue_from_text(n, text)
+        let reference = github::parse_issue_ref(&request_issue, Some(origin_slug.as_deref().unwrap_or("local/local")))
+            .map_err(|e| StageError::fatal(ErrorKind::Config, format!("{e:#}")))?;
+        issue_slug = Some(reference.slug());
+        github::issue_from_text(reference.number, text)
     } else {
         let origin = origin_slug.as_deref().unwrap_or_default();
         let explicit =
@@ -70,6 +69,7 @@ fn intake(ctx: &mut StageCtx) -> Result<(), StageError> {
         };
         let r = github::parse_issue_ref(&request_issue, Some(&default_slug))
             .map_err(|e| StageError::fatal(ErrorKind::Config, format!("{e:#}")))?;
+        issue_slug = Some(r.slug());
         github::issue_view(&r.slug(), r.number).map_err(|e| StageError::from_anyhow(ErrorKind::GitHub, e))?
     };
     let md = ctx.run_dir.write("00-issue.md", github::issue_markdown(&issue)).map_err(io_err)?;
@@ -120,12 +120,8 @@ fn intake(ctx: &mut StageCtx) -> Result<(), StageError> {
     ctx.state.branch = Some(branch);
     ctx.state.issue_number = Some(issue.number);
     ctx.state.repo_slug = origin_slug;
+    ctx.state.issue_slug = issue_slug;
     Ok(())
-}
-
-fn first_number(s: &str) -> Option<u64> {
-    let digits: String = s.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
 }
 
 fn name_starts(p: &Path, prefixes: &[&str]) -> bool {
@@ -219,11 +215,5 @@ mod tests {
             got,
             vec!["AI_POLICY.txt", "CONTRIBUTING.md", ".github/PULL_REQUEST_TEMPLATE.md", "docs/a/code-provenance.md"]
         );
-    }
-
-    #[test]
-    fn number_fallback() {
-        assert_eq!(first_number("issue-77"), Some(77));
-        assert_eq!(first_number("none"), None);
     }
 }

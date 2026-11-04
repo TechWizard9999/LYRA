@@ -7,7 +7,7 @@ use super::{assets, Stage, StageCtx};
 use crate::error::{ErrorKind, StageError, StageOutcome};
 use crate::events::StageId;
 use crate::git;
-use crate::guards::{self, ReproRecord};
+use crate::guards;
 use crate::providers::Mode;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -41,10 +41,7 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
     let n = issue_number(&ctx.state);
 
     // 1. Inputs from earlier stages.
-    let rec: ReproRecord = ctx
-        .run_dir
-        .read_json("20-repro/repro.json")
-        .map_err(|e| StageError::fatal(ErrorKind::Io, format!("reading 20-repro/repro.json: {e:#}")))?;
+    let rec = ctx.state.require_frozen_repro()?.clone();
     let rca_json = ctx
         .run_dir
         .read("30-rca/rca.json")

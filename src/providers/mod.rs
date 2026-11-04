@@ -17,8 +17,9 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// File reading and search only; no commands, no edits (S1, S3).
+    /// Codex has no native file-reader tool, so it receives a harness source snapshot.
     ReadOnly,
-    /// May edit files and run cargo/git in the worktree (S2, S4).
+    /// May edit files in the worktree (S2, S4); the harness executes commands.
     Edit,
 }
 
@@ -27,7 +28,7 @@ pub struct AgentTask {
     pub stage: StageId,
     /// The worktree; the agent's working directory.
     pub cwd: PathBuf,
-    /// `~/.lyra/runs/<id>/artifacts`, made readable to the agent (`--add-dir`).
+    /// Harness-owned output directory. Never granted as an agent workspace.
     pub artifacts: PathBuf,
     pub prompt: String,
     pub mode: Mode,
@@ -43,7 +44,7 @@ pub struct AgentTask {
 pub struct AgentOutput {
     /// Final free-text message from the agent (may be empty when structured output is used).
     pub text: String,
-    /// Validated-by-runtime structured answer, if a schema was given.
+    /// Structured answer validated by both the runtime and the harness.
     pub structured: Option<Value>,
     /// True when the runtime reported success and (if a schema was given) produced structured output.
     pub ok: bool,
@@ -75,6 +76,40 @@ pub fn make_agent(id: &str, cfg: &ProviderConfig) -> SharedAgent {
     }
 }
 
+/// Runtime schema flags are an aid, not a trust boundary. In particular a JSON-looking
+/// free-text fallback must not bypass required fields or enum/type constraints.
+pub(crate) fn validate_output(schema: Option<&Value>, output: Option<&Value>) -> Result<()> {
+    let Some(schema) = schema else { return Ok(()) };
+    let output = output.ok_or_else(|| anyhow::anyhow!("no structured output"))?;
+    let validator = jsonschema::validator_for(schema).map_err(|e| anyhow::anyhow!("invalid output schema: {e}"))?;
+    if let Some(error) = validator.iter_errors(output).next() {
+        anyhow::bail!("structured output failed schema validation at {}: {}", error.instance_path, error);
+    }
+    Ok(())
+}
+
+/// Extra arguments may tune runtime behavior, but must not replace LYRA's tool,
+/// workspace, auth, or sandbox policy. Keep this deliberately small and explicit.
+pub(crate) fn validate_extra_args(args: &[String], valued: &[&str], flags: &[&str]) -> Result<()> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if flags.contains(&arg.as_str()) {
+            i += 1;
+        } else if valued.contains(&arg.as_str()) {
+            let value = args
+                .get(i + 1)
+                .filter(|s| !s.starts_with('-'))
+                .ok_or_else(|| anyhow::anyhow!("missing value for {arg}"))?;
+            anyhow::ensure!(!value.is_empty(), "empty value for {arg}");
+            i += 2;
+        } else {
+            anyhow::bail!("unsupported provider extra argument {arg:?}; it may override LYRA's execution policy");
+        }
+    }
+    Ok(())
+}
+
 /// Appends a raw line to the transcript file (best effort).
 pub(crate) fn append_transcript(path: &PathBuf, line: &str) {
     use std::io::Write;
@@ -84,5 +119,30 @@ pub(crate) fn append_transcript(path: &PathBuf, line: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = f.write_all(line.as_bytes());
         let _ = f.write_all(b"\n");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn schema_validation_rejects_empty_wrong_types_and_unknown_enum() {
+        let schema = json!({"type":"object", "required":["result"], "properties":{"result":{"type":"string","enum":["supported","unresolved"]}}});
+        for value in [json!({}), json!({"result":false}), json!({"result":"looks fine"})] {
+            assert!(validate_output(Some(&schema), Some(&value)).is_err());
+        }
+        assert!(validate_output(Some(&schema), Some(&json!({"result":"supported"}))).is_ok());
+        assert!(validate_output(Some(&schema), None).is_err());
+    }
+
+    #[test]
+    fn extra_arguments_cannot_override_execution_policy() {
+        for flag in ["--tools", "--add-dir", "--settings", "--dangerously-skip-permissions", "-c"] {
+            assert!(validate_extra_args(&[flag.into(), "x".into()], &["--effort"], &[]).is_err());
+        }
+        assert!(validate_extra_args(&["--effort".into(), "high".into()], &["--effort"], &[]).is_ok());
+        assert!(validate_extra_args(&["--max-budget-usd".into(), "1".into()], &["--effort"], &[]).is_err());
     }
 }

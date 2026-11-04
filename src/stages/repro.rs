@@ -90,17 +90,14 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
     // Normalise the record; the command is ours, never the agent's.
     rec.krate = rec.krate.trim().to_string();
     rec.test_name = rec.test_name.trim().to_string();
+    guards::validate_repro_record(&rec)
+        .map_err(|msg| StageError::new(ErrorKind::Guard, msg).with_details(&transcript))?;
     rec.test_file = guards::norm_path(&rec.test_file);
-    rec.registration_file = rec.registration_file.as_deref().map(guards::norm_path).filter(|s| !s.is_empty());
-    if rec.krate.is_empty() || rec.test_file.is_empty() || rec.test_name.is_empty() {
-        return Err(StageError::new(ErrorKind::Guard, "repro record must name crate, test_file and test_name")
-            .with_details(&transcript));
-    }
-    if rec.expected.trim().is_empty() {
-        return Err(StageError::new(ErrorKind::Guard, "expected assertion must be recorded (repro.expected is empty)")
-            .with_details(&transcript));
-    }
+    rec.registration_file = rec.registration_file.as_deref().map(guards::norm_path);
     rec.command = guards::repro_test_command(&rec.krate, &rec.test_name);
+    // Fields supplied by the model cannot claim that a checkpoint already exists.
+    rec.frozen_commit = None;
+    rec.frozen_len = None;
 
     // 3. Only the allowed files may have changed.
     let changes = git::changed_files(&worktree, &base).map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
@@ -116,10 +113,25 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
     }
     ctx.events.info(format!("repro: {} changed path(s), all within the allowed set", changes.len()));
 
-    // 4. Run exactly that test; it must fail on the recorded assertion.
-    let spec = CommandSpec::from_line(&rec.command, &worktree)
-        .map_err(|e| StageError::from_anyhow(ErrorKind::Config, e))?
-        .scrubbed();
+    // Format before the baseline run so the committed test is the test that was executed.
+    let abs_test = worktree.join(&rec.test_file);
+    let fmt =
+        CommandSpec::new("rustfmt", &worktree).args(["--edition", "2021"]).arg(abs_test.to_string_lossy()).scrubbed();
+    let formatted =
+        proc::run(&fmt, ctx.timeout(), &ctx.cancel).await.map_err(|e| StageError::from_anyhow(ErrorKind::Tool, e))?;
+    if !formatted.success() {
+        let log = write(ctx, "20-repro/format.txt", formatted.combined())?;
+        return Err(StageError::new(ErrorKind::Tool, "formatting the repro test failed").with_details(log));
+    }
+    let tested_source = std::fs::read(&abs_test).map_err(|e| StageError::new(ErrorKind::Io, e.to_string()))?;
+
+    // 4. Run exactly that test; selectors are validated and passed as individual args.
+    let args =
+        guards::repro_test_args(&rec.krate, &rec.test_name).map_err(|msg| StageError::new(ErrorKind::Guard, msg))?;
+    let spec = CommandSpec::new("cargo", &worktree)
+        .args(args)
+        .scrubbed()
+        .env("CARGO_TARGET_DIR", ctx.run_dir.root.join("repro-target").to_string_lossy());
     ctx.events.info(format!("repro: running `{}`", spec.display()));
     let run =
         proc::run(&spec, ctx.timeout(), &ctx.cancel).await.map_err(|e| StageError::from_anyhow(ErrorKind::Tool, e))?;
@@ -134,6 +146,17 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
     }
     match guards::classify_cargo_test(&output, &rec.test_name) {
         TestRun::Failed => {
+            let summaries = guards::parse_summaries(&output);
+            if run.exit_code != Some(101)
+                || summaries.iter().map(|s| s.failed).sum::<u64>() != 1
+                || summaries.iter().any(|s| s.passed != 0 || s.ignored != 0)
+            {
+                return Err(StageError::new(
+                    ErrorKind::Guard,
+                    "reproduction must execute exactly one failing test and exit with Cargo's test-failure status",
+                )
+                .with_details(out_rel));
+            }
             if !guards::output_contains_expected(&output, &rec.expected) {
                 let msg = format!(
                     "test {} failed, but its output does not contain the expected text {:?}",
@@ -154,22 +177,20 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
     }
     ctx.events.info(format!("repro: test {} fails with the expected text", rec.test_name));
 
-    // 5. Format (best effort) and freeze the test in a commit.
-    let abs_test = worktree.join(&rec.test_file);
-    let fmt =
-        CommandSpec::new("rustfmt", &worktree).args(["--edition", "2021"]).arg(abs_test.to_string_lossy()).scrubbed();
-    match proc::run(&fmt, ctx.timeout(), &ctx.cancel).await {
-        Ok(o) if o.success() => ctx.events.info(format!("repro: formatted {}", rec.test_file)),
-        Ok(o) => ctx
-            .events
-            .warn(format!("repro: rustfmt failed (ignored): {}", o.stderr.lines().next().unwrap_or("no output"))),
-        Err(e) => ctx.events.warn(format!("repro: rustfmt unavailable (ignored): {e:#}")),
+    // 5. Cargo/build scripts may have written files; guard that final diff before committing.
+    if std::fs::read(&abs_test).map_err(|e| StageError::new(ErrorKind::Io, e.to_string()))? != tested_source {
+        return Err(StageError::new(ErrorKind::Guard, "the reproduction test changed while it was executing"));
     }
+    let changes = git::changed_files(&worktree, &base).map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
+    guards::check_repro_changes(&changes, &rec, &worktree, &base)
+        .map_err(|msg| StageError::new(ErrorKind::Guard, msg))?;
     let sha = git::commit_all(&worktree, &format!("test: failing repro for #{n}"))
         .map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
     ctx.state.checkpoints.insert(StageId::Repro, sha.clone());
     rec.frozen_commit = Some(sha.clone());
     rec.frozen_len = std::fs::metadata(&abs_test).ok().map(|m| m.len());
+    rec.observed = output;
+    ctx.state.frozen_repro = Some(rec.clone());
 
     write_json(ctx, "20-repro/repro.json", &rec)?;
     write(ctx, "20-repro/repro.md", repro_markdown(&rec, n))?;

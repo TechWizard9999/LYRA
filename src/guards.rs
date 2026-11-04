@@ -55,6 +55,47 @@ pub fn repro_test_command(krate: &str, test_name: &str) -> String {
     format!("cargo test -p {} {} -- --exact", krate.trim(), test_name.trim())
 }
 
+/// Validate agent-provided selectors before they become separate process arguments.
+pub fn repro_test_args(krate: &str, test_name: &str) -> Result<Vec<String>, String> {
+    let package = Regex::new(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$").expect("package regex");
+    let test = Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)*$").expect("test regex");
+    if !package.is_match(krate) {
+        return Err("invalid Cargo package name in reproduction record".into());
+    }
+    if !test.is_match(test_name) {
+        return Err("invalid exact test name in reproduction record".into());
+    }
+    Ok(["test", "-p", krate, test_name, "--", "--exact"].into_iter().map(str::to_string).collect())
+}
+
+fn validate_repro_path(path: &str) -> Result<(), String> {
+    let path = path.replace('\\', "/");
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains(':')
+        || path.chars().any(char::is_control)
+        || path.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err("reproduction paths must be repository-relative paths without traversal".into());
+    }
+    Ok(())
+}
+
+pub fn validate_repro_record(rec: &ReproRecord) -> Result<(), String> {
+    repro_test_args(&rec.krate, &rec.test_name)?;
+    validate_repro_path(&rec.test_file)?;
+    if !rec.test_file.ends_with(".rs") {
+        return Err("the reproduction test must be a Rust source file".into());
+    }
+    if let Some(path) = &rec.registration_file {
+        validate_repro_path(path)?;
+    }
+    if !rec.reproduced || rec.expected.trim().is_empty() {
+        return Err("reproduction record must describe a prepared test and its expected assertion".into());
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------
 // cargo test output
 // ---------------------------------------------------------------------------------------
@@ -255,6 +296,20 @@ pub fn check_repro_changes(
     worktree: &Path,
     base_commit: &str,
 ) -> Result<(), String> {
+    validate_repro_record(rec)?;
+    let root = worktree.canonicalize().map_err(|e| e.to_string())?;
+    for path in std::iter::once(rec.test_file.as_str()).chain(rec.registration_file.as_deref()) {
+        let mut current = root.clone();
+        for component in path.replace('\\', "/").split('/') {
+            current.push(component);
+            if std::fs::symlink_metadata(&current).map_err(|e| e.to_string())?.file_type().is_symlink() {
+                return Err(format!("{path}: reproduction paths must not contain symlinks"));
+            }
+        }
+        if !current.canonicalize().map_err(|e| e.to_string())?.starts_with(&root) {
+            return Err(format!("{path}: reproduction path escapes the worktree"));
+        }
+    }
     let read_old = |p: &str| crate::git::show_file(worktree, base_commit, p).ok();
     let read_new = |p: &str| std::fs::read_to_string(worktree.join(p)).ok();
     check_repro_changes_with(changes, rec, &read_old, &read_new)
@@ -285,6 +340,13 @@ pub fn check_repro_changes_with(
         }
         let name = base_name(&path);
         if name == "Cargo.lock" {
+            let old = read_old(&path);
+            let new = read_new(&path);
+            if !new.as_deref().is_some_and(|new| cargo_lock_only_additions(old.as_deref(), new)) {
+                violations.push(format!(
+                    "{status} {path}: existing locked packages may not be removed, downgraded or changed"
+                ));
+            }
             continue;
         }
         if is_new(status) && (has_dir(&path, "tests") || has_dir(&path, "fixtures")) {
@@ -360,6 +422,54 @@ pub fn cargo_toml_only_dev_deps_changed(old: &str, new: &str) -> bool {
     rest(old) == rest(new)
 }
 
+/// Adding test dependencies may append packages and workspace dependency edges. Existing
+/// registry/git packages and all existing package identities must remain unchanged.
+pub fn cargo_lock_only_additions(old: Option<&str>, new: &str) -> bool {
+    let Ok(mut new_doc) = new.parse::<toml::Table>() else { return false };
+    let Some(new_packages) = new_doc.remove("package").and_then(|v| v.as_array().cloned()) else { return false };
+    let Some(old) = old else {
+        return new_packages.iter().all(|p| {
+            p.get("name").and_then(toml::Value::as_str).is_some()
+                && p.get("version").and_then(toml::Value::as_str).is_some()
+        });
+    };
+    let Ok(mut old_doc) = old.parse::<toml::Table>() else { return false };
+    let Some(old_packages) = old_doc.remove("package").and_then(|v| v.as_array().cloned()) else { return false };
+    if old_doc != new_doc {
+        return false;
+    }
+    for old_package in old_packages {
+        let same_identity =
+            |p: &&toml::Value| ["name", "version", "source"].iter().all(|key| old_package.get(key) == p.get(key));
+        let matches: Vec<_> = new_packages.iter().filter(same_identity).collect();
+        if matches.len() != 1 {
+            return false;
+        }
+        let new_package = matches[0];
+        if old_package.get("source").is_some() {
+            if &old_package != new_package {
+                return false;
+            }
+            continue;
+        }
+        let (Some(mut old_table), Some(mut new_table)) =
+            (old_package.as_table().cloned(), new_package.as_table().cloned())
+        else {
+            return false;
+        };
+        let old_deps = old_table.remove("dependencies").unwrap_or_else(|| toml::Value::Array(vec![]));
+        let new_deps = new_table.remove("dependencies").unwrap_or_else(|| toml::Value::Array(vec![]));
+        let (Some(old_deps), Some(new_deps)) = (old_deps.as_array(), new_deps.as_array()) else { return false };
+        if old_table != new_table
+            || !old_deps.iter().all(|dep| new_deps.contains(dep))
+            || !new_deps.iter().all(|dep| dep.is_str())
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Fix rule: `[[test]]` sections, `autotests` keys and `[dev-dependencies]` are unchanged.
 pub fn cargo_toml_test_sections_equal(old: &str, new: &str) -> bool {
     type Extract = (Vec<Vec<String>>, Vec<Vec<String>>, Vec<String>);
@@ -407,17 +517,71 @@ pub fn is_registration_line(line: &str) -> bool {
 pub fn is_registration_only_change(old: &str, new: &str) -> bool {
     let old: Vec<&str> = old.lines().map(str::trim_end).collect();
     let mut i = 0;
+    let mut added = Vec::new();
     for line in new.lines().map(str::trim_end) {
         if i < old.len() && line == old[i] {
             i += 1;
             continue;
         }
-        if line.trim().is_empty() || is_registration_line(line) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if is_registration_line(line) {
+            added.push(line.trim());
             continue;
         }
         return false;
     }
-    i == old.len()
+    i == old.len() && (added.is_empty() || one_line_re().is_match(&added.join(" ")))
+}
+
+/// Extract the declaration and every immediately preceding attribute/comment line. This
+/// locks attributes such as #[path] and extra #[cfg], including multiline attributes.
+fn registration_block(content: &str, issue: Option<u64>) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let matches: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let number = mod_line_issue(line).or_else(|| one_line_issue(line))?;
+            issue.is_none_or(|wanted| wanted == number).then_some(i)
+        })
+        .collect();
+    if matches.len() != 1 {
+        return None;
+    }
+    let end = matches[0];
+    let mut start = end;
+    let mut in_attribute = false;
+    let mut in_comment = false;
+    let trailing_comment = Regex::new(r"(?://.*|/\*.*?\*/)\s*$").expect("comment regex");
+    while start > 0 {
+        let line = lines[start - 1].trim();
+        let code = trailing_comment.replace(line, "");
+        let code = code.trim_end();
+        if in_comment {
+            start -= 1;
+            if line.contains("/*") {
+                in_comment = false;
+            }
+        } else if in_attribute {
+            start -= 1;
+            if line.starts_with("#[") {
+                in_attribute = false;
+            }
+        } else if line.is_empty() || line.starts_with("//") || line.starts_with("#[") {
+            start -= 1;
+        } else if code.ends_with(']') {
+            start -= 1;
+            in_attribute = !code.starts_with("#[");
+        } else if line.ends_with("*/") {
+            start -= 1;
+            in_comment = !line.contains("/*");
+        } else {
+            break;
+        }
+    }
+    Some(lines[start..=end].join("\n").trim_start_matches('\n').to_string())
 }
 
 /// True when `content` registers `issue_<n>_tests` under `#[cfg(test)]` (one line, or the
@@ -495,14 +659,12 @@ pub fn check_fix_changes_with(
         }
     }
 
-    // 2. The registration line is still there.
+    // 2. The entire registration attribute block is frozen, not merely cfg(test).
     if let Some(reg) = rec.registration_file.as_deref().map(norm_path).filter(|s| !s.is_empty()) {
-        match read_now(&reg) {
-            Some(c) if has_registration_line(&c, issue) => {}
-            Some(_) => violations.push(format!(
-                "{reg}: the `#[cfg(test)] mod issue_<n>_tests;` registration line was removed or changed"
-            )),
-            None => violations.push(format!("{reg}: the registration file was deleted")),
+        let old = read_checkpoint(&reg).and_then(|c| registration_block(&c, issue));
+        let new = read_now(&reg).and_then(|c| registration_block(&c, issue));
+        if old.is_none() || old != new {
+            violations.push(format!("{reg}: the frozen test registration line or its attribute block was changed"));
         }
     }
 
@@ -790,6 +952,25 @@ test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; fini
     }
 
     #[test]
+    fn reproduction_selectors_cannot_inject_cargo_arguments() {
+        assert_eq!(
+            repro_test_args("foo-bar", "parser::issue_123_x").unwrap(),
+            vec!["test", "-p", "foo-bar", "parser::issue_123_x", "--", "--exact"]
+        );
+        for package in ["foo --config=build.rustflags=x", "--workspace", "foo\n--release", ""] {
+            assert!(repro_test_args(package, NAME).is_err(), "{package}");
+        }
+        for name in ["--ignored", "a -- --ignored", "a;echo", "::", "a\nother"] {
+            assert!(repro_test_args("foo", name).is_err(), "{name}");
+        }
+        for path in ["../tests/a.rs", "/tests/a.rs", "C:\\tests\\a.rs", "tests/../../a.rs"] {
+            let mut record = rec();
+            record.test_file = path.into();
+            assert!(validate_repro_record(&record).is_err(), "{path}");
+        }
+    }
+
+    #[test]
     fn repro_record_roundtrips_and_tolerates_extras() {
         let json = r#"{"reproduced":true,"crate":"foo","test_file":"tests/issue_123.rs","test_name":"issue_123_x",
             "command":"cargo test -p foo issue_123_x -- --exact","expected":"boom","observed":"it boomed",
@@ -836,6 +1017,7 @@ test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; fini
         "[package]\nname = \"foo\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\nbytes = \"1\"\n";
     const LIB_OLD: &str = "pub mod parser;\n\npub fn x() {}\n";
     const LIB_REG: &str = "pub mod parser;\n\n#[cfg(test)]\nmod issue_123_tests;\n\npub fn x() {}\n";
+    const LOCK_OLD: &str = "version = 4\n[[package]]\nname = \"foo\"\nversion = \"0.1.0\"\ndependencies = [\"dep\"]\n[[package]]\nname = \"dep\"\nversion = \"2.0.0\"\nsource = \"registry+https://example.invalid\"\nchecksum = \"original\"\n";
 
     #[test]
     fn repro_changes_allowed_set() {
@@ -846,8 +1028,8 @@ test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; fini
             ("M".to_string(), "Cargo.toml".to_string()),
             ("M".to_string(), "Cargo.lock".to_string()),
         ];
-        let old: HashMap<&str, &str> = HashMap::from([("Cargo.toml", CARGO_OLD)]);
-        let new: HashMap<&str, &str> = HashMap::from([("Cargo.toml", CARGO_DEV)]);
+        let old: HashMap<&str, &str> = HashMap::from([("Cargo.toml", CARGO_OLD), ("Cargo.lock", LOCK_OLD)]);
+        let new: HashMap<&str, &str> = HashMap::from([("Cargo.toml", CARGO_DEV), ("Cargo.lock", LOCK_OLD)]);
         assert_eq!(check_repro_changes_with(&changes, &rec(), &reader(&old), &reader(&new)), Ok(()));
     }
 
@@ -932,6 +1114,49 @@ test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; fini
         assert!(cargo_toml_only_dev_deps_changed(
             CARGO_OLD,
             &CARGO_OLD.replace("\n[dependencies]", "\n\n  [dependencies]  # deps")
+        ));
+    }
+
+    #[test]
+    fn repro_lockfile_allows_test_additions_but_not_downgrades_or_rewrites() {
+        let addition = "\n[[package]]\nname = \"test-helper\"\nversion = \"1.0.0\"\nsource = \"registry+https://example.invalid\"\nchecksum = \"new\"\n";
+        let new = format!("{}{addition}", LOCK_OLD.replace("[\"dep\"]", "[\"dep\", \"test-helper\"]"));
+        assert!(cargo_lock_only_additions(Some(LOCK_OLD), &new));
+        assert!(cargo_lock_only_additions(None, LOCK_OLD));
+        assert!(!cargo_lock_only_additions(Some(LOCK_OLD), &LOCK_OLD.replace("2.0.0", "1.0.0")));
+        assert!(!cargo_lock_only_additions(Some(LOCK_OLD), &LOCK_OLD.replace("original", "replaced")));
+        assert!(!cargo_lock_only_additions(Some(LOCK_OLD), &LOCK_OLD.replace("[\"dep\"]", "[]")));
+        assert!(!cargo_lock_only_additions(Some(LOCK_OLD), "version = 4\npackage = []"));
+        assert!(!cargo_lock_only_additions(Some(LOCK_OLD), "not toml"));
+    }
+
+    #[test]
+    fn fix_cannot_redirect_or_disable_frozen_test_module() {
+        let mut record = rec();
+        record.test_file = "src/issue_123_tests.rs".into();
+        record.registration_file = Some("src/lib.rs".into());
+        let frozen =
+            HashMap::from([("src/issue_123_tests.rs", "#[test] fn issue_123_x() {}"), ("src/lib.rs", LIB_REG)]);
+        let changes = vec![("M".into(), "src/lib.rs".into())];
+        for injected in [
+            "#[path = \"evil.rs\"]\n#[cfg(test)]",
+            "#[cfg(any())]\n#[cfg(test)]",
+            "#[cfg(\n    any()\n)]\n#[cfg(test)]",
+            "#[cfg_attr(\n    test, path = \"evil.rs\"\n)] // redirect\n#[cfg(test)]",
+            "#[cfg_attr(\n    test, path = \"evil.rs\"\n)] /* redirect */\n#[cfg(test)]",
+            "#[path = \"evil.rs\"]\n// hide attribute\n#[cfg(test)]",
+        ] {
+            let changed = LIB_REG.replace("#[cfg(test)]", injected);
+            let current = HashMap::from([
+                ("src/issue_123_tests.rs", "#[test] fn issue_123_x() {}"),
+                ("src/lib.rs", changed.as_str()),
+            ]);
+            let error = check_fix_changes_with(&changes, &record, &reader(&frozen), &reader(&current)).unwrap_err();
+            assert!(error.contains("attribute block"), "{error}");
+        }
+        assert!(!is_registration_only_change(
+            "pub fn production() {}\n",
+            "#[cfg(test)]\npub fn production() {}\n#[cfg(test)] mod issue_123_tests;\n"
         ));
     }
 

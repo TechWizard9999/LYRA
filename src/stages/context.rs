@@ -38,7 +38,7 @@ async fn context(ctx: &mut StageCtx) -> Result<(), StageError> {
 
     // Related issues / PRs (needs GitHub).
     let mut related = json!({});
-    if let (Some(slug), Some(n)) = (ctx.state.repo_slug.clone(), ctx.state.issue_number) {
+    if let (Some(slug), Some(n)) = (ctx.state.issue_slug.clone(), ctx.state.issue_number) {
         if ctx.state.request.issue_text.is_none() {
             let kw = title_keywords(&issue.title);
             let search = if kw.is_empty() {
@@ -138,10 +138,10 @@ pub(crate) async fn run_readonly(
 
 /// Change detection for read-only stages: clean worktree and unchanged HEAD.
 pub(crate) fn readonly_guard(wt: &Path, head_before: &str) -> Result<(), StageError> {
-    let clean = git::is_clean(wt).map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
+    let changes = git::changed_files(wt, head_before).map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
     let head = git::head(wt).map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
-    if !clean || head != head_before {
-        let status = git::status_porcelain(wt).unwrap_or_default();
+    if !changes.is_empty() || head != head_before {
+        let status = format!("{changes:?}");
         return Err(StageError::new(
             ErrorKind::Guard,
             format!(
@@ -438,6 +438,12 @@ Also see crates/core/src/lib.rs and "expected a non-empty header line". `src/par
         let head = git::commit_all(p, "init").unwrap();
         assert!(readonly_guard(p, &head).is_ok());
         std::fs::write(p.join("b.txt"), "b").unwrap();
+        assert_eq!(readonly_guard(p, &head).unwrap_err().kind, ErrorKind::Guard);
+        git::reset_hard_clean(p, &head).unwrap();
+        std::fs::write(p.join(".git/info/exclude"), ".cargo/\n").unwrap();
+        std::fs::create_dir(p.join(".cargo")).unwrap();
+        std::fs::write(p.join(".cargo/config.toml"), "[alias]\n").unwrap();
+        assert!(git::is_clean(p).unwrap(), "the status-only check misses ignored files");
         assert_eq!(readonly_guard(p, &head).unwrap_err().kind, ErrorKind::Guard);
     }
 

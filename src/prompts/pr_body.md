@@ -1,6 +1,6 @@
 ## Issue
 
-Fixes #{{ issue_number }}{% if issue_title %}: {{ issue_title }}{% endif %}
+Fixes {% if issue_ref %}{{ issue_ref }}{% else %}#{{ issue_number }}{% endif %}{% if issue_title %}: {{ issue_title }}{% endif %}
 {%- if issue_url %}
 ({{ issue_url }}){% endif %}
 
@@ -68,6 +68,9 @@ _Change scope not recorded._
 
 {% if verify -%}
 {% if verify.ok %}All checks passed{% else %}Some checks failed{% endif %} on `{{ verified_commit }}` (branch `{{ branch }}`).
+{% if verify.repository_overrides %}
+Repository verification overrides from `lyra.toml` were used. The table lists the effective commands.
+{% endif %}
 
 | Step | Command | Result | Time |
 |---|---|---|---|

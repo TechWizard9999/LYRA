@@ -1,0 +1,6 @@
+{
+  "disableAllHooks": true,
+  "permissions": {
+    "deny": ["Bash", "Agent", "Task", "WebFetch", "WebSearch", "mcp__*"]
+  }
+}

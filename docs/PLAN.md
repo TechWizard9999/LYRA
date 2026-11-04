@@ -1,6 +1,6 @@
 # LYRA — plan
 
-v5 · 2026-11-04 · Rust. Final for the first release; later work is listed in §11 and designed in `docs/RESEARCH.md`.
+v5 · 2026-11-04 · Rust. Review corrections applied; later work is listed in §11 and designed in `docs/RESEARCH.md`.
 
 LYRA is a harness around an off‑the‑shelf coding agent. From a local dashboard you give it a cloned Rust repository and a GitHub issue; it gathers context, writes a failing regression test, finds the root cause, fixes it, verifies, and opens a draft PR. Every step is saved and streamed live.
 
@@ -10,7 +10,7 @@ LYRA is a harness around an off‑the‑shelf coding agent. From a local dashboa
 
 - One agent runtime per run: **Claude Code or Codex CLI**, chosen in config. Both adapters ship.
 - One fixed pipeline: intake → context → repro → RCA → fix → verify → draft PR.
-- One active run at a time; runs are kept and browsable.
+- One active run at a time, enforced by atomic admission and an OS-held writer lock per LYRA home; runs are kept and browsable. CLI and dashboard writers cannot share a home concurrently.
 - Dashboard as the entry point (`lyra serve`): live progress, artifacts, errors, Cancel, Retry from stage.
 - Stage checkpoints + append‑only event log; interrupted runs are marked and can be retried.
 - Draft PR only, created for the exact commit that passed verification.
@@ -63,10 +63,11 @@ S6 draft PR  body from template + artifacts ; push verified SHA ; find-or-create
 - `repro.json.expected` records what failure proves the bug (assertion message or panic text). The harness runs `cargo test -p <crate> <test_name> -- --exact` and requires: it compiles, exactly that test ran, result `FAILED`, and the output contains `expected`. A compile error, a missing dependency, "0 tests run" or an unrelated panic is not a reproduction → failed (retryable).
 - The agent reporting it cannot reproduce → stopped (`not_reproduced`), its notes saved, Retry available.
 - The harness formats the test (`rustfmt`) and commits it (`test: failing repro for #<n>`). That commit is the S2 checkpoint and the frozen form of the test.
+- The entire validated reproduction record is frozen in `run.json.frozen_repro`. Later stages use that record, never the editable display artifact. Package and exact test selectors are validated and passed as separate argv entries. Registration attributes and existing lockfile package versions/checksums are preserved; dev-dependency additions may append dependency edges and new packages.
 
 ### 3.2 RCA: read‑only, evidence supplied by the harness, may be unresolved
 
-- The agent gets only file reading and search (Claude: `--tools "Read,Grep,Glob"`; Codex: `--sandbox read-only`). It does not run commands; the harness passes in what it would have run: `git log`/`blame` for the candidate files, `cargo metadata`, and the repro output. This keeps the stage read‑only without extra sandboxing (Bash could write files and `cargo` executes build scripts).
+- Claude gets only native `Read,Grep,Glob`. Codex gets its read-only sandbox with command tools disabled (`features.shell_tool=false`). The harness supplies bounded, line-numbered Rust source snapshots as well as `git log`/`blame`, Cargo metadata and repro output. Omitted or truncated source is labelled; analysis must not claim coverage of missing evidence.
 - After the call: `git status --porcelain` must be empty and HEAD unchanged; otherwise failed (change detection).
 - Output through the runtime's structured output (Claude `--json-schema`, Codex `--output-schema -o`):
 
@@ -96,16 +97,17 @@ S6 draft PR  body from template + artifacts ; push verified SHA ; find-or-create
 3. `cargo test --workspace`
 4. `cargo fmt --all -- --check`
 
-Pass → `verified_commit = HEAD` recorded. Fail → stopped (`verify_failed`) with the logs; the run page offers **Retry from Fix**, which reruns S4 with the verify output attached.
+Verification uses a fresh detached worktree at the fix checkpoint, a dedicated empty `CARGO_HOME`, and an external target directory. Ancestor Cargo configuration is rejected; source snapshots detect changes during commands, including ignored files. Pass → the exact fix checkpoint is recorded as `verified_commit`. Fail → stopped (`verify_failed`) with the logs; the run page offers **Retry from Fix**, which reruns S4 with the verify output attached. Effective commands are logged; repository overrides are disclosed in the PR.
 
 ### 3.5 Draft PR for the verified commit
 
 - Push `verified_commit` to `lyra/issue-<n>-<run-id>` on the push remote.
-- Find an existing PR with `gh pr list --repo <target> --head <owner>:<branch> --base <default>`; it counts as done only if its head SHA equals `verified_commit`; otherwise create one with `gh pr create --draft --repo <target> --head <owner>:<branch> --base <default> --title … --body-file 60-pr/body.md`.
+- Find an existing PR for the source owner, branch and base; it counts as done only if it is a draft and its head SHA equals `verified_commit`. An incompatible existing PR fails visibly. Otherwise create through `gh api` with `draft: true`, the source fork owner, and explicit `head_repo` (including organization forks).
 - Body from a template filled with artifacts: issue link, how to run the repro test, RCA mechanism and culprit, what changed (`scope.json`), verify results, and a disclosure line naming LYRA and the model. No model call.
 - Fork‑aware: `origin` is a fork → push there, PR against upstream; no push rights → stop with the `gh repo fork` command.
 - If `policy.md` exists, the run page requires the "I read the repository's contribution policy" checkbox before pushing.
 - Commits use the operator's git identity; no AI co‑author trailers.
+- Issue repository identity is recorded independently of the code origin; context queries and fully qualified closing references retain it. Pull-request URLs are rejected as issue input. Public text neutralizes `@mentions`.
 
 ## 4. Runtime adapters
 
@@ -123,11 +125,15 @@ pub enum AgentEvent { Text(String), ToolCall { name: String, summary: String }, 
 
 | | Claude Code (2.1.317 installed) | Codex CLI (0.166.0 installed) |
 |---|---|---|
-| Read‑only (S1, S3) | `claude -p "<prompt>" --output-format stream-json --verbose --tools "Read,Grep,Glob" --json-schema <schema> --add-dir <artifacts>` | `codex exec --json -C <worktree> --sandbox read-only --output-schema <schema> -o <artifacts>/…json --ephemeral "<prompt>"` |
-| Edit (S2, S4) | `claude -p "<prompt>" --output-format stream-json --verbose --tools default --allowedTools "Read,Grep,Glob,Edit,Write,Bash(cargo *),Bash(git diff *),Bash(git log *)" --permission-mode acceptEdits --add-dir <artifacts>` | `codex exec --json -C <worktree> --sandbox workspace-write --ephemeral "<prompt>"` |
-| Auth profiles | `auth = "api_key"`: add `--bare`, needs `ANTHROPIC_API_KEY`. `auth = "login"`: no `--bare` (uses your `claude` login), add `--setting-sources user --disallowedTools "mcp__*"` so the target repo's project settings and MCP servers are not loaded | `CODEX_API_KEY` or saved `codex` login |
-| Repo hooks/MCP | `--bare` skips them; in `login` mode the flags above exclude project settings and MCP (`CLAUDE.md` still loads) | project `.codex/` config loads (providers ignored); hooks need explicit trust and LYRA never passes bypass flags; `AGENTS.md` loads natively |
+| Read‑only (S1, S3) | Native `Read,Grep,Glob`; restricted file access, no command tools | `--sandbox read-only`, shell tool disabled; harness source snapshots |
+| Edit (S2, S4) | Only `Read,Grep,Glob,Edit,Write`, `--permission-mode acceptEdits`; no Bash, task, MCP or browser tools | `--sandbox workspace-write`, no network or extra writable artifact directories; shell tool remains available in the native sandbox |
+| Auth profiles | API key adds `--bare`; login preserves existing authentication. Both start with a scrubbed environment containing only the relevant provider credentials and toolchain necessities | `CODEX_API_KEY` / `OPENAI_API_KEY` or saved login; unrelated service credentials removed |
+| Settings/hooks/MCP | `--restricted --safe-mode --setting-sources ""`, explicit bundled settings disable hooks/command tools; strict empty MCP config. Restricted mode requires Claude 2.1.248+; all flags must be supported by the installed CLI | `--ignore-user-config --ignore-rules --ephemeral`; worktree marked untrusted; hooks, apps, multi-agent, shell snapshots and web disabled; login shell disabled; native project instructions disabled and harness-provided instructions labelled untrusted |
 | Live events | `assistant`/`user`/`result` lines; `structured_output` on the `result` line; the `StructuredOutput` tool call is hidden in the live log | `item.*` lines (`agent_message`, `command_execution`, `file_change`), `turn.completed` / `turn.failed` |
+
+Neither adapter grants artifact write access through `--add-dir`. Structured outputs are validated independently against bundled schemas. Provider extra arguments are narrowly allowlisted so they cannot override tool, settings, sandbox or path restrictions. Unsupported isolation flags fail the call visibly. Codex edit mode still has broader shell capability than Claude's native file tools; its native sandbox and prompt restrictions are not equivalent to container isolation. The harness executes and validates reproduction/verification itself.
+
+Managed enterprise Claude policy remains authoritative; LYRA does not claim to override managed hooks or permissions. Local settings isolation is not a guarantee against a machine administrator's configuration. Adapter authentication and real-runtime end-to-end behavior still require the first live acceptance run.
 | Failure signals | `result.subtype != success`, `permission_denials`, missing `structured_output` | `turn.failed`, missing `-o` file |
 
 `--allowedTools` only grants permission; `--tools` / `--disallowedTools` restrict. Windows: resolve `claude.cmd` / `codex.cmd` with `which`, spawn through `cmd /C`, kill the process tree on cancel.
@@ -184,7 +190,7 @@ test  = "cargo test --workspace"
 fmt   = "cargo fmt --all -- --check"
 ```
 
-`lyra doctor` (and `GET /api/doctor`): runtime on PATH + version, auth works (one cheap prompt), `gh auth status`, cargo present.
+`lyra doctor` (and same-origin `POST /api/doctor`): runtime on PATH + version, auth works (one cheap prompt), `gh auth status`, cargo present.
 
 ## 8. Code layout
 
@@ -203,14 +209,14 @@ src/
 tests/fixtures/      recorded stream-json / codex --json samples; guard and reducer tests
 ```
 
-Crates: `tokio`, `axum`, `maud`, `clap`, `serde`, `serde_json`, `toml`, `anyhow`, `thiserror`, `tracing`, `async-trait`, `tokio-util`, `jsonschema`, `which`, `minijinja`. No database, no HTTP model client.
+Core crates include `tokio`, `clap`, `serde`, `serde_json`, `toml`, `anyhow`, `async-trait`, `tokio-util`, `jsonschema`, `which`, `minijinja`, `fs2` (writer lock), `dunce` (Windows-compatible canonical paths), and platform process APIs (`libc` / `windows-sys`). Dashboard dependencies are introduced by the dashboard PR. No database, no HTTP model client.
 
 ## 9. Build order
 
 1. **Skeleton**: `lyra serve`, new‑run form, run dir, `run.json` + `events.jsonl`, Claude adapter, live log over SSE, Cancel. Check: a "list the crates in this workspace" run shows live tool calls and finishes.
 2. **Complete path with its guards**, on a seeded bug in a scratch crate: S0 → S6 including the repro rules (separate file, expected assertion), test lock, verify parsing, verified‑SHA PR. Check: a draft PR with the failing‑then‑passing test, submitted from the browser, whose head is the verified commit.
 3. **Codex adapter**, recorded fixtures for both runtimes, `doctor`.
-4. **Retries and recovery**: typed errors on the run page, Retry from stage with checkpoint restore (`reset --hard` + `clean -fd`) and invalidation, interrupted marking.
+4. **Retries and recovery**: typed errors on the run page, Retry from stage with mandatory checkpoint restore (`reset --hard` + `clean -fdx`) and invalidation, interrupted marking only while holding the home writer lock.
 5. **Exercise**: the seeded bug, one unreproducible issue, one real issue in a Rust OSS repo. README.
 
 ## 10. Decisions
@@ -220,7 +226,7 @@ Crates: `tokio`, `axum`, `maud`, `clap`, `serde`, `serde_json`, `toml`, `anyhow`
 | D1 | One runtime per run (Claude Code or Codex); no model API client; multi‑model RCA later, chosen with data (RESEARCH.md §1) |
 | D2 | The repro test is the regression test: its own file, written before the fix, discoverable by Cargo, fails on the recorded assertion, frozen and locked during the fix, executed and passing in verify |
 | D3 | Read‑only stages get file reading and search only; the harness supplies command output; the git check is change detection |
-| D4 | Structured outputs through the runtimes' own schema flags |
+| D4 | Structured outputs through runtime schema flags and independent harness JSON Schema validation |
 | D5 | Fixed pipeline, stage checkpoints, append‑only event log; retry‑from‑stage restores a clean checkpoint and invalidates later stages; no skip |
 | D6 | No cost or time budgets; one hang‑guard timeout and a Cancel button |
 | D7 | Dashboard is the entry point; `axum` + `maud` + htmx + SSE in one binary |
@@ -230,3 +236,13 @@ Crates: `tokio`, `axum`, `maud`, `clap`, `serde`, `serde_json`, `toml`, `anyhow`
 ## 11. After the first release
 
 In rough order: multi‑model RCA with blind parallel runs and adjudication (RESEARCH.md §1) · OpenCode (NVIDIA / any OpenAI‑compatible key), Copilot CLI, generic command adapter · cost display where the runtime reports it · automatic fix‑retry loop · automatic resume of interrupted runs · GitHub label/comment trigger and pre‑work issue comment · eval set on closed issues with known fixes · web search in context · container sandbox · non‑Rust repos · richer UI (Dioxus) or distributed execution (Temporal / Restate) if ever needed.
+
+## 12. Review hardening and compatibility
+
+The run-state format adds optional `frozen_repro` and `issue_slug` fields; old run files remain readable. Old runs without a frozen record must retry from Repro before Fix/Verify, and missing issue identity requires retry from Intake before publication. Run ids are validated before filesystem access. State saves use unique temporary files and sync before replacement. Event replay tolerates truncated UTF-8 records, and appending separates an incomplete tail. Retried runs reuse their event sender; completed streams close and unused senders are evicted.
+
+Agent, git and gh subprocesses have noninteractive stdin, cancellation and the configured hang guard. Process-tree ownership survives parent exit: Unix uses a saved process-group id, Windows uses a Job Object with kill-on-close. Ctrl-C cancels and waits for cleanup. Output retention is bounded and truncated output cannot count as successful verification. Git hooks and fsmonitor are disabled for harness commands, and Windows git operations enable long paths. Unexpected engine errors and task panics persist a terminal failure and release admission.
+
+The dashboard accepts loopback binds only, validates Host, and requires matching Origin for mutations. Artifact downloads reject symlinks/junctions and set `nosniff`; artifact listing does not follow links. Diagnostics require a guarded POST, and filesystem/git work is dispatched off async request workers.
+
+Environment scrubbing removes unrelated service credentials from agent/test subprocesses, but it is **not a container or full filesystem isolation**: HOME remains available for installed toolchains and authentication. Do not treat the MVP as a safe executor for hostile repositories, build scripts or tests. Repository instructions and issue/comment text are explicitly labelled untrusted evidence in prompts. Stronger OS/container isolation remains deferred.

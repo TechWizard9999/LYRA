@@ -5,7 +5,7 @@
 //! as normalised `AgentEvent`s. The terminal `{"type":"result"}` line carries the final text,
 //! the structured output and the failure signals (`subtype`, `is_error`, `permission_denials`).
 
-use super::{append_transcript, Agent, AgentOutput, AgentTask, Mode};
+use super::{append_transcript, validate_extra_args, validate_output, Agent, AgentOutput, AgentTask, Mode};
 use crate::config::{ClaudeAuth, ProviderConfig};
 use crate::events::{AgentEvent, EventSink, StageId};
 use crate::proc::{self, CommandOutput, CommandSpec, StreamLine};
@@ -17,7 +17,7 @@ use std::time::Duration;
 
 const INSTRUCTION: &str = "Follow the task description provided on stdin exactly.";
 const READ_ONLY_TOOLS: &str = "Read,Grep,Glob";
-const EDIT_ALLOWED_TOOLS: &str = "Read,Grep,Glob,Edit,Write,Bash(cargo *),Bash(git diff *),Bash(git log *)";
+const EDIT_ALLOWED_TOOLS: &str = "Read,Grep,Glob,Edit,Write";
 /// The structured-output mechanism, not a step; hidden from the live log.
 const STRUCTURED_OUTPUT_TOOL: &str = "StructuredOutput";
 const FILE_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
@@ -38,13 +38,24 @@ impl ClaudeAgent {
     /// The full command line for `task` (program unresolved: `cfg.bin` or `claude`).
     pub(crate) fn build_command(&self, task: &AgentTask) -> CommandSpec {
         let mut spec = CommandSpec::new(self.cfg.bin.as_deref().unwrap_or("claude"), &task.cwd)
-            .args(["-p", INSTRUCTION, "--output-format", "stream-json", "--verbose", "--add-dir"])
-            .arg(task.artifacts.to_string_lossy());
+            .args(["-p", INSTRUCTION, "--output-format", "stream-json", "--verbose"])
+            // Restricted mode confines file tools to cwd, strips command tools and ignores
+            // user/project settings. Safe mode preserves login but disables customizations.
+            .args(["--restricted", "--safe-mode", "--setting-sources", ""])
+            .arg("--settings")
+            // Compact JSON is essential for Windows .cmd shims: embedded newlines are
+            // rejected by std's safe batch-argument escaping.
+            .arg(
+                serde_json::from_str::<Value>(include_str!("claude-settings.json"))
+                    .expect("bundled settings are valid JSON")
+                    .to_string(),
+            )
+            .args(["--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}"]);
         spec = match task.mode {
             Mode::ReadOnly => spec.args(["--tools", READ_ONLY_TOOLS]),
             Mode::Edit => spec.args([
                 "--tools",
-                "default",
+                EDIT_ALLOWED_TOOLS,
                 "--allowedTools",
                 EDIT_ALLOWED_TOOLS,
                 "--permission-mode",
@@ -56,11 +67,13 @@ impl ClaudeAgent {
         }
         spec = match self.cfg.auth {
             ClaudeAuth::ApiKey => spec.arg("--bare"),
-            ClaudeAuth::Login => spec.args(["--setting-sources", "user", "--disallowedTools", "mcp__*"]),
+            ClaudeAuth::Login => spec,
         };
         if let Some(model) = &self.cfg.model {
             spec = spec.args(["--model", model.as_str()]);
         }
+        spec.clear_env = true;
+        spec.env = proc::provider_env(&["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR"]);
         spec.args(self.cfg.extra_args.iter().cloned()).stdin(task.prompt.clone())
     }
 
@@ -78,6 +91,7 @@ impl Agent for ClaudeAgent {
         format!("Claude Code ({})", self.cfg.model.clone().unwrap_or_else(|| "default".into()))
     }
     async fn run(&self, task: AgentTask, events: &EventSink) -> Result<AgentOutput> {
+        validate_extra_args(&self.cfg.extra_args, &["--effort"], &[])?;
         let mut spec = self.build_command(&task);
         spec.program = proc::resolve_program(&spec.program)?.to_string_lossy().into_owned();
         append_transcript(&task.transcript, &format!("# {}", spec.display()));
@@ -121,7 +135,13 @@ impl Agent for ClaudeAgent {
                 self.emit(events, task.stage, AgentEvent::Text { text });
             }
         }
-        let (ok, failure) = judge(&out, result.as_ref(), task.schema.is_some(), &stderr_tail, task.timeout);
+        let (mut ok, mut failure) = judge(&out, result.as_ref(), task.schema.is_some(), &stderr_tail, task.timeout);
+        if ok {
+            if let Err(e) = validate_output(task.schema.as_ref(), result.as_ref().and_then(|r| r.structured.as_ref())) {
+                ok = false;
+                failure = Some(e.to_string());
+            }
+        }
         let summary = finish_summary(&out, tool_calls, result.as_ref());
         self.emit(events, task.stage, AgentEvent::Finished { ok, summary });
 
@@ -335,6 +355,9 @@ pub(crate) fn judge(
     if out.cancelled {
         return (false, Some("cancelled".to_string()));
     }
+    if out.output_truncated || out.drain_timed_out {
+        return (false, Some("incomplete subprocess output (size limit or pipe drain timeout)".into()));
+    }
     let Some(r) = result else {
         let msg = format!("no result line from claude (exit {})", exit_str(out));
         return (false, Some(with_stderr(msg, stderr_tail)));
@@ -498,27 +521,32 @@ mod tests {
         assert_eq!(spec.cwd, PathBuf::from("/wt"));
         assert_eq!(spec.stdin.as_deref(), Some("find the bug\nline two"));
         let a = &spec.args;
-        assert_eq!(&a[..7], &["-p", INSTRUCTION, "--output-format", "stream-json", "--verbose", "--add-dir", "/art"]);
-        assert_eq!(&a[7..9], &["--tools", "Read,Grep,Glob"]);
+        assert_eq!(&a[..5], &["-p", INSTRUCTION, "--output-format", "stream-json", "--verbose"]);
+        assert!(a.windows(2).any(|p| p == ["--tools", "Read,Grep,Glob"]));
         let schema_arg = schema.to_string();
-        assert_eq!(&a[9..11], &["--json-schema", schema_arg.as_str()]);
-        assert_eq!(&a[11..], &["--bare", "--model", "opus"]);
-        assert!(!a.iter().any(|x| x == "--allowedTools" || x == "--setting-sources" || x == "--permission-mode"));
+        assert!(a.windows(2).any(|p| p == ["--json-schema", schema_arg.as_str()]));
+        assert!(a.contains(&"--bare".into()));
+        assert!(a.contains(&"--restricted".into()));
+        assert!(a.contains(&"--safe-mode".into()));
+        assert!(!a.contains(&"--add-dir".into()));
+        assert!(spec.clear_env);
+        assert!(a.iter().all(|arg| !arg.contains(['\n', '\r'])));
     }
 
     #[test]
     fn edit_login_bin_extra_args_flags() {
         let mut c = cfg(ClaudeAuth::Login, None);
         c.bin = Some("/opt/bin/claude.cmd".into());
-        c.extra_args = vec!["--max-turns".into(), "40".into()];
+        c.extra_args = vec!["--effort".into(), "high".into()];
         let spec = ClaudeAgent::new("claude", &c).build_command(&task(Mode::Edit, None));
         assert_eq!(spec.program, "/opt/bin/claude.cmd");
         let a = &spec.args;
-        assert_eq!(
-            &a[7..13],
-            &["--tools", "default", "--allowedTools", EDIT_ALLOWED_TOOLS, "--permission-mode", "acceptEdits"]
-        );
-        assert_eq!(&a[13..], &["--setting-sources", "user", "--disallowedTools", "mcp__*", "--max-turns", "40"]);
+        assert!(a.windows(2).any(|p| p == ["--tools", EDIT_ALLOWED_TOOLS]));
+        assert!(a.windows(2).any(|p| p == ["--allowedTools", EDIT_ALLOWED_TOOLS]));
+        assert!(a.windows(2).any(|p| p == ["--setting-sources", ""]));
+        assert!(a.windows(2).any(|p| p == ["--effort", "high"]));
+        assert!(!EDIT_ALLOWED_TOOLS.contains("Bash"));
+        assert!(!a.contains(&"--add-dir".into()));
         assert!(!a.iter().any(|x| x == "--bare" || x == "--json-schema" || x == "--model"));
     }
 
@@ -743,5 +771,18 @@ mod tests {
         let err =
             ClaudeAgent::new("claude", &c).run(task(Mode::ReadOnly, None), &EventSink::memory("r")).await.unwrap_err();
         assert!(err.to_string().contains("not found on PATH"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn runtime_success_cannot_bypass_harness_schema_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(ClaudeAuth::ApiKey, None);
+        c.bin = Some(fake_binary(dir.path()).to_string_lossy().into_owned());
+        let mut t = task(Mode::ReadOnly, Some(json!({"type":"object", "required":["missing"]})));
+        t.cwd = dir.path().to_path_buf();
+        t.transcript = dir.path().join("transcript.jsonl");
+        let out = ClaudeAgent::new("claude", &c).run(t, &EventSink::memory("r")).await.unwrap();
+        assert!(!out.ok);
+        assert!(out.failure.unwrap().contains("schema validation"));
     }
 }

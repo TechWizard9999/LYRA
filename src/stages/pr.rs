@@ -61,7 +61,7 @@ fn pr(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
             .parent
             .clone()
             .ok_or_else(|| StageError::new(ErrorKind::GitHub, format!("{slug} is a fork but gh reports no parent")))?;
-        let user = github::gh_user().map_err(gh_err)?;
+        let user = fork_owner(&slug).map_err(gh_err)?;
         let base = github::repo_view(&parent).map(|p| p.default_branch).unwrap_or_else(|_| rv.default_branch.clone());
         (parent, user.clone(), format!("{user}:{branch}"), base)
     } else if matches!(rv.viewer_permission.as_str(), "ADMIN" | "MAINTAIN" | "WRITE") {
@@ -83,19 +83,26 @@ fn pr(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
 
     let existing = github::find_pr(&target, &head_owner, &branch, &base).map_err(gh_err)?;
     let url = match existing {
-        Some(p) if p.head_sha == verified => {
+        Some(p) if p.head_sha == verified && p.is_draft => {
             ctx.events.info(format!("reusing PR #{} for {}", p.number, git::short(&verified)));
             p.url
         }
-        other => {
+        Some(p) => {
+            return Err(StageError::new(
+                ErrorKind::Guard,
+                format!("existing PR {} must be a draft at the verified commit; refusing to replace it", p.url),
+            ))
+        }
+        None => {
             let issue: github::Issue = ctx.run_dir.read_json("00-issue.json").unwrap_or_default();
             let n = ctx.state.issue_number.unwrap_or(issue.number);
             let read_json = |rel: &str| ctx.run_dir.read_json::<Value>(rel).unwrap_or(Value::Null);
             let body = pr_body(&json!({
                 "issue_url": issue.url,
                 "issue_number": n,
+                "issue_ref": issue_reference(ctx.state.issue_slug.as_deref(), n).map_err(gh_err)?,
                 "issue_title": issue.title,
-                "repro": read_json("20-repro/repro.json"),
+                "repro": ctx.state.frozen_repro,
                 "rca": read_json("30-rca/rca.json"),
                 "scope": read_json("40-fix/scope.json"),
                 "verify": read_json("50-verify/result.json"),
@@ -112,14 +119,7 @@ fn pr(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
             ctx.events.artifact(ctx.run_dir.write("60-pr/body.md", &body).map_err(io)?);
             ctx.events.artifact(ctx.run_dir.write("60-pr/title.txt", &title).map_err(io)?);
             let body_path = ctx.run_dir.artifacts().join("60-pr/body.md");
-            github::create_draft_pr(&target, &head_ref, &base, &title, &body_path).map_err(|e| {
-                let mut err = gh_err(e);
-                if let Some(p) = other {
-                    err.message =
-                        format!("{} (an open PR {} exists with head {})", err.message, p.url, git::short(&p.head_sha));
-                }
-                err
-            })?
+            github::create_draft_pr(&target, &slug, &head_ref, &base, &title, &body_path).map_err(gh_err)?
         }
     };
     ctx.events
@@ -131,7 +131,7 @@ fn pr(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
 
 /// `Fix #<n>: <title>`, at most 70 characters.
 pub fn pr_title(n: u64, title: &str) -> String {
-    let t = format!("Fix #{n}: {}", title.trim());
+    let t = format!("Fix #{n}: {}", neutralize_mentions(title.trim()));
     if t.chars().count() <= 70 {
         return t;
     }
@@ -144,7 +144,21 @@ pub fn pr_title(n: u64, title: &str) -> String {
 pub fn pr_body(values: &Value) -> anyhow::Result<String> {
     let mut env = minijinja::Environment::new();
     env.add_template("pr_body.md", assets::PR_BODY_TEMPLATE)?;
-    Ok(env.get_template("pr_body.md")?.render(values)?)
+    Ok(neutralize_mentions(&env.get_template("pr_body.md")?.render(values)?))
+}
+
+fn neutralize_mentions(text: &str) -> String {
+    text.replace('@', "@\u{200b}")
+}
+
+fn fork_owner(slug: &str) -> anyhow::Result<String> {
+    let (owner, _) = slug.split_once('/').ok_or_else(|| anyhow::anyhow!("invalid origin repository"))?;
+    Ok(owner.into())
+}
+
+fn issue_reference(slug: Option<&str>, number: u64) -> anyhow::Result<String> {
+    let slug = slug.ok_or_else(|| anyhow::anyhow!("issue repository is missing; retry intake"))?;
+    Ok(format!("{slug}#{number}"))
 }
 
 #[cfg(test)]
@@ -214,5 +228,18 @@ mod tests {
         assert!(b.contains("## Verification"));
         assert!(b.contains("Fixes #42"));
         assert!(b.contains("not recorded"));
+    }
+
+    #[test]
+    fn publication_keeps_issue_repository_and_neutralizes_mentions() {
+        assert_eq!(fork_owner("team/fork").unwrap(), "team");
+        assert_eq!(issue_reference(Some("other/project"), 42).unwrap(), "other/project#42");
+        assert!(issue_reference(None, 42).is_err());
+        let mut values = sample();
+        values["issue_ref"] = json!("other/project#42");
+        values["issue_title"] = json!("@team check");
+        let body = pr_body(&values).unwrap();
+        assert!(body.contains("Fixes other/project#42"));
+        assert!(!body.contains("@team"));
     }
 }
