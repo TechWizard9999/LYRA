@@ -98,16 +98,7 @@ fn intake(ctx: &mut StageCtx) -> Result<(), StageError> {
     ctx.events.info(format!("worktree {} on {branch} from {default} @ {}", wt.display(), git::short(&base)));
 
     // Contribution / AI policy text, as of the base commit.
-    let mut policy = String::new();
-    for f in policy_files(&wt) {
-        let Ok(text) = std::fs::read_to_string(&f) else { continue };
-        let ex = policy_excerpts(&text);
-        if ex.is_empty() {
-            continue;
-        }
-        let rel = f.strip_prefix(&wt).unwrap_or(&f).to_string_lossy().replace('\\', "/");
-        policy.push_str(&format!("## {rel}\n\n{}\n\n", ex.join("\n\n")));
-    }
+    let policy = read_policy(&wt)?;
     ctx.state.has_policy = !policy.is_empty();
     if ctx.state.has_policy {
         let p =
@@ -122,6 +113,22 @@ fn intake(ctx: &mut StageCtx) -> Result<(), StageError> {
     ctx.state.repo_slug = origin_slug;
     ctx.state.issue_slug = issue_slug;
     Ok(())
+}
+
+fn read_policy(wt: &Path) -> Result<String, StageError> {
+    let mut policy = String::new();
+    for f in policy_files(wt) {
+        let text = std::fs::read_to_string(&f).map_err(|error| {
+            StageError::fatal(ErrorKind::Policy, format!("cannot read contribution policy {}: {error}", f.display()))
+        })?;
+        let ex = policy_excerpts(&text);
+        if ex.is_empty() {
+            continue;
+        }
+        let rel = f.strip_prefix(wt).unwrap_or(&f).to_string_lossy().replace('\\', "/");
+        policy.push_str(&format!("## {rel}\n\n{}\n\n", ex.join("\n\n")));
+    }
+    Ok(policy)
 }
 
 fn name_starts(p: &Path, prefixes: &[&str]) -> bool {
@@ -179,6 +186,15 @@ pub fn policy_excerpts(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreadable_policy_is_an_explicit_policy_failure() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("CONTRIBUTING.md"), [0xff, 0xfe]).unwrap();
+        let error = read_policy(root.path()).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Policy);
+        assert!(error.message.contains("CONTRIBUTING.md"));
+    }
 
     #[test]
     fn excerpts_match_ai_paragraphs_only() {
