@@ -79,6 +79,14 @@ mod tests {
         assert_eq!(display_url("[::1]:8080".parse().unwrap()), "http://[::1]:8080");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn setup_script_can_be_executed_from_a_fresh_checkout() {
+        use std::os::unix::fs::PermissionsExt;
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("setup.sh");
+        assert_ne!(std::fs::metadata(script).unwrap().permissions().mode() & 0o111, 0);
+    }
+
     #[cfg(windows)]
     #[test]
     fn setup_handles_native_auth_stderr_on_windows_powershell_51() {

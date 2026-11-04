@@ -42,7 +42,11 @@ fn request_allowed(req: &Request, address: SocketAddr) -> bool {
         format!("[::1]:{}", address.port()),
         address.to_string(),
     ];
-    if !address.ip().is_loopback() || !allowed_hosts.iter().any(|h| h == host) {
+    // Browsers omit HTTP's default port from Host and Origin, even when the
+    // dashboard URL was written with an explicit :80.
+    if !address.ip().is_loopback()
+        || !allowed_hosts.iter().any(|h| h == host || (address.port() == 80 && h.strip_suffix(":80") == Some(host)))
+    {
         return false;
     }
     if let Some(site) = req.headers().get("sec-fetch-site") {
@@ -50,9 +54,12 @@ fn request_allowed(req: &Request, address: SocketAddr) -> bool {
             return false;
         }
     }
-    let expected = format!("http://{host}");
+    let authority = if address.port() == 80 { host.strip_suffix(":80").unwrap_or(host) } else { host };
+    let expected = format!("http://{authority}");
     if let Some(origin) = req.headers().get(header::ORIGIN) {
-        if origin.to_str().ok() != Some(expected.as_str()) {
+        let Ok(origin) = origin.to_str() else { return false };
+        let origin = if address.port() == 80 { origin.strip_suffix(":80").unwrap_or(origin) } else { origin };
+        if origin != expected {
             return false;
         }
     } else if !matches!(*req.method(), Method::GET | Method::HEAD) {
@@ -179,9 +186,22 @@ async fn cancel_form(State(s): State<AppState>, Path(id): Path<String>) -> Respo
     back_to_run(&id, api::cancel(&s.engine, &id).err())
 }
 
-async fn retry_form(State(s): State<AppState>, Path((id, stage)): Path<(String, String)>) -> Response {
+#[derive(Default, Deserialize)]
+struct RetryForm {
+    #[serde(default)]
+    policy_acknowledged: Option<String>,
+}
+
+async fn retry_form(
+    State(s): State<AppState>,
+    Path((id, stage)): Path<(String, String)>,
+    Form(f): Form<RetryForm>,
+) -> Response {
     let retry_id = id.clone();
-    back_to_run(&id, api::blocking(move || api::retry(&s.engine, &retry_id, &stage)).await.err())
+    back_to_run(
+        &id,
+        api::blocking(move || api::retry(&s.engine, &retry_id, &stage, f.policy_acknowledged.is_some())).await.err(),
+    )
 }
 
 fn flash_message(code: Option<&str>) -> Option<&'static str> {
@@ -263,6 +283,28 @@ mod tests {
         let sink = EventSink::open(id, &events_path(&rd.root)).unwrap();
         sink.emit(EventKind::StageStarted { stage: StageId::Intake, attempt: 1 });
         sink.info("hello");
+    }
+
+    fn seed_retry(engine: &Engine) {
+        seed(engine, "r1");
+        let repo = engine.home().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        // Stop the background driver before stages, git or provider calls.
+        std::fs::write(repo.join("lyra.toml"), "[invalid").unwrap();
+        let mut st = engine.get("r1").unwrap();
+        st.request.repo = repo;
+        st.has_policy = true;
+        st.save(&engine.run_dir("r1").unwrap().root).unwrap();
+    }
+
+    async fn wait_idle(engine: &Engine) {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while engine.is_busy() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     async fn call(app: &Router, method: &str, uri: &str) -> (StatusCode, String) {
@@ -371,6 +413,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_api_accepts_policy_acknowledgment_and_existing_empty_body_requests() {
+        for (content_type, body, acknowledged) in [
+            (None, "", false),
+            (Some("application/json"), "", false),
+            (Some("application/json"), r#"{"policy_acknowledged":true}"#, true),
+        ] {
+            let (_home, engine, app) = app();
+            seed_retry(&engine);
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/api/runs/r1/retry/intake")
+                .header(header::HOST, "127.0.0.1:7700")
+                .header(header::ORIGIN, "http://127.0.0.1:7700");
+            if let Some(content_type) = content_type {
+                req = req.header(header::CONTENT_TYPE, content_type);
+            }
+            let response = app.oneshot(req.body(Body::from(body)).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            wait_idle(&engine).await;
+            assert_eq!(engine.get("r1").unwrap().request.policy_acknowledged, acknowledged);
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_form_persists_the_policy_checkbox_before_starting_the_driver() {
+        for (body, acknowledged) in [("", false), ("policy_acknowledged=on", true)] {
+            let (_home, engine, app) = app();
+            seed_retry(&engine);
+            let req = Request::builder()
+                .method("POST")
+                .uri("/runs/r1/retry/intake")
+                .header(header::HOST, "127.0.0.1:7700")
+                .header(header::ORIGIN, "http://127.0.0.1:7700")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap();
+            let response = app.oneshot(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            assert_eq!(response.headers()[header::LOCATION], "/runs/r1");
+            wait_idle(&engine).await;
+            assert_eq!(engine.get("r1").unwrap().request.policy_acknowledged, acknowledged);
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_retry_body_does_not_change_the_saved_run() {
+        let (_home, engine, app) = app();
+        seed_retry(&engine);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/runs/r1/retry/intake")
+            .header(header::HOST, "127.0.0.1:7700")
+            .header(header::ORIGIN, "http://127.0.0.1:7700")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"policy_acknowledged":"yes"}"#))
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
+        let state = engine.get("r1").unwrap();
+        assert_eq!(state.status, Status::Failed);
+        assert!(!state.request.policy_acknowledged);
+        assert!(!engine.is_busy());
+    }
+
+    #[tokio::test]
     async fn localhost_guards_reject_rebinding_and_cross_site_requests_before_handlers() {
         let (_h, engine, app) = app();
         for uri in ["/runs", "/api/runs", "/runs/r1/cancel", "/api/runs/r1/retry/fix", "/api/doctor"] {
@@ -415,6 +521,55 @@ mod tests {
         }
         let (status, _) = call(&app, "GET", "/api/doctor").await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn default_http_port_accepts_browser_hosts_and_same_origin_posts() {
+        let home = tempfile::tempdir().unwrap();
+        let engine = Engine::new(home.path().to_path_buf(), Config::default());
+        let app = router(AppState::new(engine, "127.0.0.1:80".parse().unwrap()));
+        for host in ["127.0.0.1", "localhost", "[::1]"] {
+            for authority in [host.to_string(), format!("{host}:80")] {
+                let req =
+                    Request::builder().uri("/api/config").header(header::HOST, &authority).body(Body::empty()).unwrap();
+                assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK, "{authority}");
+                for origin in [format!("http://{host}"), format!("http://{host}:80")] {
+                    let req = Request::builder()
+                        .method("POST")
+                        .uri("/api/runs/missing/cancel")
+                        .header(header::HOST, &authority)
+                        .header(header::ORIGIN, &origin)
+                        .body(Body::empty())
+                        .unwrap();
+                    assert_eq!(
+                        app.clone().oneshot(req).await.unwrap().status(),
+                        StatusCode::NOT_FOUND,
+                        "same-origin POST must reach its handler: {authority}, {origin}"
+                    );
+                }
+            }
+        }
+        for (host, origin) in [
+            ("127.0.0.1", None),
+            ("127.0.0.1", Some("null")),
+            ("127.0.0.1", Some("https://127.0.0.1")),
+            ("127.0.0.1", Some("http://127.0.0.1:81")),
+            ("127.0.0.1", Some("http://localhost")),
+            ("127.0.0.1:80", Some("http://localhost:80")),
+            ("localhost", Some("http://evil.example")),
+            ("evil.example", Some("http://evil.example")),
+            ("localhost:81", Some("http://localhost:81")),
+        ] {
+            let mut req = Request::builder().method("POST").uri("/api/runs/missing/cancel").header(header::HOST, host);
+            if let Some(origin) = origin {
+                req = req.header(header::ORIGIN, origin);
+            }
+            assert_eq!(
+                app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap().status(),
+                StatusCode::FORBIDDEN,
+                "{host}, {origin:?}"
+            );
+        }
     }
 
     #[tokio::test]

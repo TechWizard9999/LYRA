@@ -5,10 +5,12 @@ use super::server::AppState;
 use crate::engine::Engine;
 use crate::events::StageId;
 use crate::state::{RunRequest, RunState};
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use serde::Deserialize;
 use serde_json::json;
 use std::path::{Component, PathBuf};
 
@@ -134,13 +136,13 @@ pub fn cancel(engine: &Engine, id: &str) -> ApiResult<()> {
     }
 }
 
-pub fn retry(engine: &std::sync::Arc<Engine>, id: &str, stage: &str) -> ApiResult<StageId> {
+pub fn retry(engine: &std::sync::Arc<Engine>, id: &str, stage: &str, acknowledge_policy: bool) -> ApiResult<StageId> {
     let from = StageId::parse(stage).ok_or_else(|| ApiError::bad_request(format!("unknown stage '{stage}'")))?;
     let st = load_run(engine, id)?;
     if !st.status.is_terminal() || engine.is_busy() {
         return Err(ApiError::conflict("a run is active; wait for it to finish or cancel it"));
     }
-    engine.retry(id, from).map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    engine.retry_with_policy_ack(id, from, acknowledge_policy).map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     Ok(from)
 }
 
@@ -164,12 +166,26 @@ pub async fn cancel_run(State(s): State<AppState>, Path(id): Path<String>) -> Ap
     Ok(Json(json!({ "id": id, "cancelled": true })))
 }
 
+#[derive(Default, Deserialize)]
+pub struct RetryRequest {
+    #[serde(default)]
+    pub policy_acknowledged: bool,
+}
+
 pub async fn retry_run(
     State(s): State<AppState>,
     Path((id, stage)): Path<(String, String)>,
+    body: Bytes,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // Existing API clients post no body; an optional JSON body may acknowledge
+    // a policy discovered by intake without recreating the run.
+    let request: RetryRequest = if body.is_empty() {
+        RetryRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(format!("invalid retry request: {e}")))?
+    };
     let retry_id = id.clone();
-    let from = blocking(move || retry(&s.engine, &retry_id, &stage)).await?;
+    let from = blocking(move || retry(&s.engine, &retry_id, &stage, request.policy_acknowledged)).await?;
     Ok(Json(json!({ "id": id, "from": from })))
 }
 

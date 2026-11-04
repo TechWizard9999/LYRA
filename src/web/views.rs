@@ -199,9 +199,15 @@ pub fn run_page(v: &RunView) -> Markup {
                     }
                 }
                 @if terminal {
-                    @for s in retry_stages(r) {
-                        form method="post" action=(format!("/runs/{}/retry/{}", r.id, s.as_str())) {
-                            button type="submit" { "Retry from " (s.label()) }
+                    form.retry-controls method="post" action=(format!("/runs/{}/retry/{}", r.id, r.stage.as_str())) {
+                        @if r.has_policy && !r.request.policy_acknowledged {
+                            label.check {
+                                input type="checkbox" name="policy_acknowledged";
+                                span { "I read the repository's contribution policy" }
+                            }
+                        }
+                        @for s in retry_stages(r) {
+                            button type="submit" formaction=(format!("/runs/{}/retry/{}", r.id, s.as_str())) { "Retry from " (s.label()) }
                         }
                     }
                 }
@@ -223,12 +229,11 @@ pub fn run_page(v: &RunView) -> Markup {
             }
             section.card {
                 h2 { "Artifacts" }
-                @if v.artifacts.is_empty() {
-                    p.muted { "None yet." }
-                } @else {
-                    ul.artifacts {
-                        @for a in v.artifacts {
-                            li { a href=(format!("/runs/{}/artifacts/{}", r.id, url_path(a))) target="_blank" { (a) } }
+                p #no-artifacts .muted hidden[!v.artifacts.is_empty()] { "None yet." }
+                ul #artifacts .artifacts {
+                    @for a in v.artifacts {
+                        li data-artifact=(a) {
+                            a href=(format!("/runs/{}/artifacts/{}", r.id, url_path(a))) target="_blank" rel="noopener" { (a) }
                         }
                     }
                 }
@@ -421,6 +426,7 @@ mod tests {
         assert!(html.contains("Open PR"));
         assert!(html.contains("2.3s"));
         assert!(html.contains("/runs/demo-7-20261104-101500/artifacts/20-repro/output.txt"));
+        assert!(html.contains(r#"data-artifact="20-repro/output.txt""#));
         assert!(html.contains("Retry from S0 Intake"));
         assert!(!html.contains(">Cancel<"));
         assert!(html.contains(r#"data-seq="5""#));
@@ -437,6 +443,8 @@ mod tests {
         assert!(html.contains("Cancel"));
         assert!(!html.contains("Retry from"));
         assert!(html.contains("Be nice."));
+        assert!(html.contains(r#"id="no-artifacts""#));
+        assert!(html.contains(r#"id="artifacts""#));
 
         r.status = crate::state::Status::Failed;
         r.set_stage_status(StageId::Repro, StageStatus::Failed);
@@ -469,6 +477,30 @@ mod tests {
         assert!(html.contains("demo-7-20261104-101500"));
         assert!(html.contains(r#"<option value="codex" selected>"#));
         assert!(html.contains("repo path is required"));
+    }
+
+    #[test]
+    fn unacknowledged_policy_has_one_shared_checkbox_for_all_retry_buttons() {
+        let mut r = run();
+        r.status = crate::state::Status::Stopped;
+        r.stage = StageId::Pr;
+        r.has_policy = true;
+        for stage in StageId::ALL {
+            r.set_stage_status(stage, if stage == StageId::Pr { StageStatus::Stopped } else { StageStatus::Done });
+        }
+        let render = |run: &RunState| {
+            run_page(&RunView { run, artifacts: &[], policy: Some("Read this policy."), last_seq: 0, flash: None })
+                .into_string()
+        };
+        let html = render(&r);
+        assert_eq!(html.matches(r#"name="policy_acknowledged""#).count(), 1);
+        assert!(html.contains(r#"formaction="/runs/demo-7-20261104-101500/retry/pr""#));
+        assert!(html.contains(r#"formaction="/runs/demo-7-20261104-101500/retry/intake""#));
+        r.request.policy_acknowledged = true;
+        assert!(!render(&r).contains(r#"name="policy_acknowledged""#));
+        r.request.policy_acknowledged = false;
+        r.has_policy = false;
+        assert!(!render(&r).contains(r#"name="policy_acknowledged""#));
     }
 
     #[test]

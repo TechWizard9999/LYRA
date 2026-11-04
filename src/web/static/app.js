@@ -67,6 +67,33 @@
     el.querySelector(".status").textContent = text;
   }
 
+  var artifacts = document.getElementById("artifacts");
+  var artifactPaths = new Set();
+  if (artifacts) {
+    artifacts.querySelectorAll("[data-artifact]").forEach(function (item) {
+      artifactPaths.add(item.dataset.artifact);
+    });
+  }
+  function addArtifact(path) {
+    if (!artifacts || typeof path !== "string" || path.indexOf("\0") !== -1) return;
+    var parts = path.split(/[\\/]/).filter(function (part) { return part && part !== "."; });
+    if (!parts.length || parts.some(function (part) { return part === ".." || part.indexOf(":") !== -1; })) return;
+    var canonicalPath = parts.join("/");
+    if (artifactPaths.has(canonicalPath)) return;
+    var item = document.createElement("li");
+    item.dataset.artifact = canonicalPath;
+    var link = document.createElement("a");
+    link.href = "/runs/" + encodeURIComponent(runId) + "/artifacts/" + parts.map(encodeURIComponent).join("/");
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.textContent = canonicalPath;
+    item.appendChild(link);
+    artifacts.appendChild(item);
+    artifactPaths.add(canonicalPath);
+    var empty = document.getElementById("no-artifacts");
+    if (empty) empty.hidden = true;
+  }
+
   var es = new EventSource("/api/runs/" + encodeURIComponent(runId) + "/events?since=0");
   function reload() {
     es.close();
@@ -89,6 +116,7 @@
       if (stick) log.scrollTop = log.scrollHeight;
     }
     if (e.seq <= renderedSeq) return; // replayed history: the page already reflects it
+    if (e.kind === "artifact_written") addArtifact(e.path);
     if (e.kind === "stage_started") setStage(e.stage, "running", "running");
     if (e.kind === "stage_completed") setStage(e.stage, "done", "done");
     if (e.kind === "retry_requested" && renderedTerminal) reload();

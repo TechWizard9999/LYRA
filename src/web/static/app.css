@@ -72,6 +72,8 @@ pre.msg, pre.policy { white-space: pre-wrap; word-break: break-word; background:
 .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .actions:empty { display: none; }
 .actions form { margin: 0; }
+.actions .retry-controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.retry-controls label.check { display: flex; gap: 8px; align-items: center; font-size: 13px; }
 details summary { cursor: pointer; color: var(--muted); }
 
 #log { font-family: var(--mono); font-size: 12.5px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; height: 420px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
