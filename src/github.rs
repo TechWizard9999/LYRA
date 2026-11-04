@@ -348,6 +348,26 @@ pub fn find_pr(target_slug: &str, head_owner: &str, branch: &str, base: &str) ->
     Ok(parse_pr_list(&out, head_owner)?.into_iter().next())
 }
 
+/// Before a push, inspect every open PR for this source branch, including PRs
+/// a human retargeted away from the repository's current default branch.
+pub fn find_prs_for_branch(target_slug: &str, head_owner: &str, branch: &str) -> Result<Vec<PrInfo>> {
+    let out = gh(&[
+        "pr",
+        "list",
+        "--repo",
+        target_slug,
+        "--head",
+        branch,
+        "--state",
+        "open",
+        "--limit",
+        "1000",
+        "--json",
+        "number,url,headRefOid,headRepositoryOwner,isDraft",
+    ])?;
+    parse_pr_list(&out, head_owner)
+}
+
 /// `head` is `owner:branch` (fork) or `branch`. Returns the PR URL (last stdout line).
 pub fn create_draft_pr(
     target_slug: &str,

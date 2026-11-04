@@ -45,6 +45,7 @@ impl CodexAgent {
             "web_search=\"disabled\"",
             "allow_login_shell=false",
             "project_doc_max_bytes=0",
+            "skills.include_instructions=false",
             "shell_environment_policy.inherit=\"core\"",
             "shell_environment_policy.ignore_default_excludes=false",
             "sandbox_workspace_write.network_access=false",
@@ -474,6 +475,7 @@ mod tests {
         assert!(a.contains(&"--ignore-rules".into()));
         assert!(a.contains(&"features.hooks=false".into()));
         assert!(a.contains(&"features.shell_tool=false".into()));
+        assert!(a.contains(&"skills.include_instructions=false".into()));
         assert!(a.contains(&"projects.\"/wt\".trust_level=\"untrusted\"".into()));
         assert!(!a.contains(&"--add-dir".into()));
         assert!(spec.clear_env);

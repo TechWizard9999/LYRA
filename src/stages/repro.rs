@@ -132,6 +132,7 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
         .args(args)
         .scrubbed()
         .env("CARGO_TARGET_DIR", ctx.run_dir.root.join("repro-target").to_string_lossy());
+    check_source_binding(ctx, &rec, spec.clone(), "20-repro/source-binding.txt").await?;
     ctx.events.info(format!("repro: running `{}`", spec.display()));
     let run =
         proc::run(&spec, ctx.timeout(), &ctx.cancel).await.map_err(|e| StageError::from_anyhow(ErrorKind::Tool, e))?;
@@ -144,6 +145,7 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
         let msg = format!("`{}` timed out after {}s", spec.display(), ctx.timeout().as_secs());
         return Err(StageError::new(ErrorKind::Timeout, msg).with_details(out_rel));
     }
+    require_complete_evidence(&run).map_err(|error| error.with_details(&out_rel))?;
     match guards::classify_cargo_test(&output, &rec.test_name) {
         TestRun::Failed => {
             let summaries = guards::parse_summaries(&output);
@@ -196,6 +198,116 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
     write(ctx, "20-repro/repro.md", repro_markdown(&rec, n))?;
     ctx.events.info(format!("repro: committed {} (S2 checkpoint)", git::short(&sha)));
     Ok(StageOutcome::Completed)
+}
+
+fn require_complete_evidence(run: &proc::CommandOutput) -> Result<(), StageError> {
+    if run.output_truncated || run.drain_timed_out {
+        return Err(StageError::new(
+            ErrorKind::Guard,
+            "incomplete subprocess output cannot establish reproduction evidence",
+        ));
+    }
+    Ok(())
+}
+
+/// Prove the exact selected test comes from the frozen source, rather than an
+/// existing test or another target with the same name. `--list` compiles but never
+/// executes the tests, and works for both integration and private-module tests.
+pub(crate) async fn check_source_binding(
+    ctx: &StageCtx,
+    rec: &ReproRecord,
+    spec: CommandSpec,
+    log_rel: &str,
+) -> Result<(), StageError> {
+    let path = spec.cwd.join(&rec.test_file);
+    let mut source = TemporarilyEmptySource::new(path)?;
+    let listing_spec = source_binding_spec(&spec).arg("--list");
+    ctx.events.info(format!("checking reproduction source binding: `{}`", listing_spec.display()));
+    let run = proc::run(&listing_spec, ctx.timeout(), &ctx.cancel).await;
+    // Restore before interpreting any subprocess failure, including cancellation.
+    source.restore()?;
+    let run = run.map_err(|e| StageError::from_anyhow(ErrorKind::Tool, e))?;
+    let log = write(
+        ctx,
+        log_rel,
+        format!(
+            "Source temporarily emptied: {}\nCommand: {}\nThe discovery-only lint cap preserves active environment flags, or appends build.rustflags. Target-specific Cargo rustflags may take precedence; discovery then fails closed. Real test commands retain their original flags.\n\n{}",
+            rec.test_file,
+            listing_spec.display(),
+            run.combined()
+        ),
+    )?;
+    require_complete_evidence(&run).map_err(|error| error.with_details(&log))?;
+    if !run.success() {
+        let kind = if run.timed_out { ErrorKind::Timeout } else { ErrorKind::Guard };
+        return Err(StageError::new(kind, "reproduction source binding could not be established: test discovery failed with the new source temporarily empty").with_details(log));
+    }
+    guards::assert_test_absent_from_list(&run.stdout, &rec.test_name)
+        .map_err(|message| StageError::new(ErrorKind::Guard, message).with_details(log))
+}
+
+/// Emptying a test module can make existing test-only helpers/imports unused.
+/// Cap lints only for discovery, preserving the active rustflags source. Cargo
+/// merges the fallback array with build.rustflags; target-specific rustflags
+/// still take precedence, so we fail closed rather than replace their cfg flags.
+fn source_binding_spec(original: &CommandSpec) -> CommandSpec {
+    let mut spec = original.clone();
+    let active = |key: &str| {
+        original
+            .env
+            .iter()
+            .rev()
+            .find(|(name, _)| name == key || (cfg!(windows) && name.eq_ignore_ascii_case(key)))
+            .map(|(_, value)| value.clone())
+            .or_else(|| (!original.clear_env).then(|| std::env::var(key).ok()).flatten())
+    };
+    if let Some(mut encoded) = active("CARGO_ENCODED_RUSTFLAGS") {
+        if !encoded.is_empty() {
+            encoded.push('\u{1f}');
+        }
+        encoded.push_str("--cap-lints=allow");
+        spec.env.push(("CARGO_ENCODED_RUSTFLAGS".into(), encoded));
+    } else if let Some(mut flags) = active("RUSTFLAGS") {
+        if !flags.is_empty() {
+            flags.push(' ');
+        }
+        flags.push_str("--cap-lints=allow");
+        spec.env.push(("RUSTFLAGS".into(), flags));
+    } else {
+        spec.args.splice(0..0, ["--config".into(), "build.rustflags=[\"--cap-lints=allow\"]".into()]);
+    }
+    spec
+}
+
+struct TemporarilyEmptySource {
+    path: std::path::PathBuf,
+    original: Option<Vec<u8>>,
+}
+
+impl TemporarilyEmptySource {
+    fn new(path: std::path::PathBuf) -> Result<Self, StageError> {
+        let original = std::fs::read(&path).map_err(|e| StageError::new(ErrorKind::Io, e.to_string()))?;
+        let source = Self { path, original: Some(original) };
+        std::fs::write(&source.path, []).map_err(|e| StageError::new(ErrorKind::Io, e.to_string()))?;
+        Ok(source)
+    }
+
+    fn restore(&mut self) -> Result<(), StageError> {
+        if let Some(original) = self.original.as_ref() {
+            std::fs::write(&self.path, original).map_err(|e| {
+                StageError::new(ErrorKind::Io, format!("restoring reproduction source {}: {e}", self.path.display()))
+            })?;
+            self.original = None;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TemporarilyEmptySource {
+    fn drop(&mut self) {
+        // Covers unwinding; ordinary exits surface restoration errors above.
+        let _ = self.restore();
+    }
 }
 
 fn repro_markdown(rec: &ReproRecord, n: u64) -> String {
@@ -259,6 +371,207 @@ pub(crate) fn write_json<T: serde::Serialize>(ctx: &StageCtx, rel: &str, value: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_baseline_output_is_not_reproduction_evidence() {
+        for run in [
+            proc::CommandOutput { output_truncated: true, ..Default::default() },
+            proc::CommandOutput { drain_timed_out: true, ..Default::default() },
+        ] {
+            assert!(require_complete_evidence(&run).is_err());
+        }
+        assert!(require_complete_evidence(&proc::CommandOutput::default()).is_ok());
+    }
+
+    fn source_binding_fixture() -> (tempfile::TempDir, StageCtx, ReproRecord) {
+        use crate::artifacts::RunDir;
+        use crate::config::Config;
+        use crate::events::EventSink;
+        use crate::state::RunRequest;
+        use tokio_util::sync::CancellationToken;
+        let temporary = tempfile::tempdir().unwrap();
+        let run_dir = RunDir::new(temporary.path().join("run"));
+        run_dir.create().unwrap();
+        let worktree = run_dir.worktree();
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        std::fs::create_dir_all(worktree.join("tests")).unwrap();
+        std::fs::write(
+            worktree.join("Cargo.toml"),
+            "[package]\nname = 'lyra_binding_fixture'\nversion = '0.1.0'\nedition = '2021'\n",
+        )
+        .unwrap();
+        std::fs::write(worktree.join("src/lib.rs"), "#[test]\nfn existing_bug() { panic!(\"existing bug\"); }\n")
+            .unwrap();
+        let config = Config::default();
+        let agent = crate::providers::make_agent("claude", config.provider("claude").unwrap());
+        let state = RunState::new(
+            "binding".into(),
+            RunRequest {
+                repo: worktree,
+                issue: "1".into(),
+                issue_text: None,
+                provider: None,
+                policy_acknowledged: false,
+            },
+            "claude".into(),
+        );
+        let ctx = StageCtx {
+            run_dir,
+            state,
+            config,
+            agent,
+            events: EventSink::memory("binding"),
+            cancel: CancellationToken::new(),
+        };
+        let record = ReproRecord {
+            reproduced: true,
+            krate: "lyra_binding_fixture".into(),
+            test_file: "tests/issue_1.rs".into(),
+            test_name: "existing_bug".into(),
+            command: guards::repro_test_command("lyra_binding_fixture", "existing_bug"),
+            expected: "existing bug".into(),
+            observed: String::new(),
+            registration_file: None,
+            notes: String::new(),
+            frozen_commit: None,
+            frozen_len: None,
+        };
+        (temporary, ctx, record)
+    }
+
+    fn binding_spec(ctx: &StageCtx, record: &ReproRecord) -> CommandSpec {
+        CommandSpec::new("cargo", ctx.run_dir.worktree())
+            .args(guards::repro_test_args(&record.krate, &record.test_name).unwrap())
+            .scrubbed()
+            .env("CARGO_NET_OFFLINE", "true")
+            .env("CARGO_TARGET_DIR", ctx.run_dir.root.join("target").to_string_lossy())
+    }
+
+    #[test]
+    fn discovery_lint_cap_preserves_active_flags_and_leaves_strict_command_unchanged() {
+        let process_flags = std::env::var_os("RUSTFLAGS");
+        let process_encoded = std::env::var_os("CARGO_ENCODED_RUSTFLAGS");
+        let mut strict = CommandSpec::new("cargo", ".").args(["test", "--", "--exact"]);
+        strict.clear_env = true;
+        strict.env.push(("RUSTFLAGS".into(), "--cfg keep_me -Dwarnings".into()));
+        let before = strict.env.clone();
+        let discovery = source_binding_spec(&strict);
+        assert_eq!(
+            discovery.env.last().unwrap(),
+            &("RUSTFLAGS".into(), "--cfg keep_me -Dwarnings --cap-lints=allow".into())
+        );
+        assert_eq!(strict.env, before);
+        assert_eq!(discovery.args, strict.args);
+
+        strict.env.push(("CARGO_ENCODED_RUSTFLAGS".into(), "--cfg\u{1f}encoded_cfg\u{1f}-Dwarnings".into()));
+        let before = strict.env.clone();
+        let discovery = source_binding_spec(&strict);
+        assert_eq!(
+            discovery.env.last().unwrap(),
+            &("CARGO_ENCODED_RUSTFLAGS".into(), "--cfg\u{1f}encoded_cfg\u{1f}-Dwarnings\u{1f}--cap-lints=allow".into())
+        );
+        assert_eq!(strict.env, before);
+        strict.env.push(("CARGO_ENCODED_RUSTFLAGS".into(), String::new()));
+        assert_eq!(source_binding_spec(&strict).env.last().unwrap().1, "--cap-lints=allow");
+
+        strict.env.clear();
+        let discovery = source_binding_spec(&strict);
+        assert_eq!(&discovery.args[..2], &["--config", "build.rustflags=[\"--cap-lints=allow\"]"]);
+        assert_eq!(&discovery.args[2..], &strict.args);
+        assert!(strict.env.is_empty());
+        assert_eq!(std::env::var_os("RUSTFLAGS"), process_flags);
+        assert_eq!(std::env::var_os("CARGO_ENCODED_RUSTFLAGS"), process_encoded);
+    }
+
+    #[tokio::test]
+    async fn source_binding_allows_preexisting_strict_test_only_helpers_without_relaxing_real_tests() {
+        let (_temporary, ctx, mut record) = source_binding_fixture();
+        std::fs::write(
+            ctx.run_dir.worktree().join("src/lib.rs"),
+            "#![deny(warnings)]\n#[cfg(test)]\nfn helper() -> i32 { 1 }\n#[cfg(test)]\nmod issue_1_tests;\n",
+        )
+        .unwrap();
+        record.test_file = "src/issue_1_tests.rs".into();
+        record.test_name = "issue_1_tests::regression".into();
+        record.registration_file = Some("src/lib.rs".into());
+        let path = ctx.run_dir.worktree().join(&record.test_file);
+        std::fs::write(&path, "#[test]\nfn regression() { assert_eq!(super::helper(), 1); }\n").unwrap();
+        let strict = binding_spec(&ctx, &record);
+        let source = std::fs::read(&path).unwrap();
+        check_source_binding(&ctx, &record, strict.clone(), "20-repro/source-binding.txt").await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), source);
+        let run = proc::run(&strict, ctx.timeout(), &ctx.cancel).await.unwrap();
+        assert!(run.success(), "{}", run.combined());
+        assert!(guards::assert_test_passed(&run.combined(), &record.test_name).is_ok());
+        // The unmodified command still enforces deny(warnings) after discovery.
+        std::fs::write(&path, "#[test]\nfn regression() { let unused = super::helper(); }\n").unwrap();
+        let strict_failure = proc::run(&strict, ctx.timeout(), &ctx.cancel).await.unwrap();
+        assert!(!strict_failure.success());
+        assert!(strict_failure.combined().contains("unused variable"), "{}", strict_failure.combined());
+    }
+
+    #[tokio::test]
+    async fn existing_test_cannot_be_claimed_by_an_empty_new_source() {
+        let (_temporary, ctx, record) = source_binding_fixture();
+        let path = ctx.run_dir.worktree().join(&record.test_file);
+        std::fs::write(&path, "// no regression test\r\n").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        // Before the source-binding check, this record and empty new file passed S2's diff guard.
+        assert!(guards::check_repro_changes_with(
+            &[("??".into(), record.test_file.clone())],
+            &record,
+            &|_| None,
+            &|_| Some(String::new())
+        )
+        .is_ok());
+        let error = check_source_binding(&ctx, &record, binding_spec(&ctx, &record), "20-repro/source-binding.txt")
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("still discovered"), "{error:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn source_binding_accepts_integration_and_private_module_tests() {
+        let (_temporary, ctx, mut record) = source_binding_fixture();
+        let integration = ctx.run_dir.worktree().join(&record.test_file);
+        std::fs::write(&integration, "#[test]\nfn new_regression() { panic!(\"new bug\"); }\n").unwrap();
+        record.test_name = "new_regression".into();
+        let before = std::fs::read(&integration).unwrap();
+        check_source_binding(&ctx, &record, binding_spec(&ctx, &record), "20-repro/source-binding.txt").await.unwrap();
+        assert_eq!(std::fs::read(&integration).unwrap(), before);
+
+        std::fs::write(
+            ctx.run_dir.worktree().join("src/lib.rs"),
+            "fn private_value() -> i32 { 0 }\n#[cfg(test)]\nmod issue_1_tests;\n",
+        )
+        .unwrap();
+        record.test_file = "src/issue_1_tests.rs".into();
+        record.test_name = "issue_1_tests::private_regression".into();
+        record.registration_file = Some("src/lib.rs".into());
+        let private = ctx.run_dir.worktree().join(&record.test_file);
+        std::fs::write(&private, "#[test]\nfn private_regression() { assert_eq!(super::private_value(), 1); }\n")
+            .unwrap();
+        let before = std::fs::read(&private).unwrap();
+        check_source_binding(&ctx, &record, binding_spec(&ctx, &record), "20-repro/source-binding.txt").await.unwrap();
+        assert_eq!(std::fs::read(&private).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn source_binding_restores_exact_bytes_on_failure_and_cancellation() {
+        let (_temporary, ctx, record) = source_binding_fixture();
+        let path = ctx.run_dir.worktree().join(&record.test_file);
+        let before = b"// exact bytes\r\n\r\n";
+        std::fs::write(&path, before).unwrap();
+        let invalid = CommandSpec::new("lyra-missing-binding-command", ctx.run_dir.worktree());
+        assert!(check_source_binding(&ctx, &record, invalid, "20-repro/source-binding.txt").await.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        ctx.cancel.cancel();
+        assert!(check_source_binding(&ctx, &record, binding_spec(&ctx, &record), "20-repro/source-binding.txt")
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
 
     #[test]
     fn issue_number_parsing() {

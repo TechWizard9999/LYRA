@@ -102,6 +102,20 @@ async fn verify_checkout(
     guards::check_fix_changes(&changes, rec, worktree, checkpoint)
         .map_err(|msg| StageError::new(ErrorKind::Guard, msg))?;
     let snapshot = source_snapshot(worktree).map_err(|e| StageError::from_anyhow(ErrorKind::Io, e))?;
+    ensure_empty_cargo_config(cargo_home)?;
+    let binding = CommandSpec::new("cargo", worktree).args(
+        guards::repro_test_args(&rec.krate, &rec.test_name)
+            .map_err(|message| StageError::new(ErrorKind::Guard, message))?,
+    );
+    super::repro::check_source_binding(
+        ctx,
+        rec,
+        controlled_cargo_environment(binding, cargo_home, target),
+        "50-verify/source-binding.txt",
+    )
+    .await?;
+    assert_checkout_unchanged(worktree, candidate, &snapshot)?;
+    ensure_empty_cargo_config(cargo_home)?;
 
     let steps: [(&str, String, &str); 4] = [
         ("build", ctx.config.verify.build.clone(), "50-verify/build.txt"),
@@ -441,6 +455,89 @@ mod tests {
         assert!(result.steps[0].ok);
         assert!(result.steps[1].command.contains("issue_7_expected"));
         assert!(!result.steps[1].command.contains("unrelated_pass"));
+    }
+
+    #[tokio::test]
+    async fn redirected_parent_module_cannot_substitute_a_passing_test() {
+        use crate::artifacts::RunDir;
+        use crate::config::Config;
+        use crate::events::EventSink;
+        use crate::state::{RunRequest, RunState};
+        use tokio_util::sync::CancellationToken;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let run_dir = RunDir::new(temporary.path().join("run"));
+        run_dir.create().unwrap();
+        let repository = run_dir.worktree();
+        std::fs::create_dir_all(repository.join("src/parent")).unwrap();
+        git::run(&repository, &["init"]).unwrap();
+        git::run(&repository, &["config", "user.name", "LYRA test"]).unwrap();
+        git::run(&repository, &["config", "user.email", "lyra-test@example.invalid"]).unwrap();
+        std::fs::write(
+            repository.join("Cargo.toml"),
+            "[package]\nname = 'lyra_redirect_fixture'\nversion = '0.1.0'\nedition = '2021'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repository.join("Cargo.lock"),
+            "version = 4\n[[package]]\nname = 'lyra_redirect_fixture'\nversion = '0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("src/lib.rs"), "pub mod parent;\n").unwrap();
+        std::fs::write(
+            repository.join("src/parent/mod.rs"),
+            "fn value() -> i32 { 0 }\n#[cfg(test)]\nmod issue_7_tests;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repository.join("src/parent/issue_7_tests.rs"),
+            "#[test]\nfn issue_7_expected() { assert_eq!(super::value(), 1); }\n",
+        )
+        .unwrap();
+        let repro_commit = git::commit_all(&repository, "test: reproduce").unwrap();
+        std::fs::write(repository.join("src/lib.rs"), "#[path = \"replacement.rs\"]\npub mod parent;\n").unwrap();
+        std::fs::write(
+            repository.join("src/replacement.rs"),
+            "#[cfg(test)]\nmod issue_7_tests { #[test] fn issue_7_expected() {} }\n",
+        )
+        .unwrap();
+        let candidate = git::commit_all(&repository, "fix: redirect the parent module").unwrap();
+        let record: ReproRecord = serde_json::from_value(serde_json::json!({
+            "reproduced": true, "crate": "lyra_redirect_fixture", "test_file": "src/parent/issue_7_tests.rs",
+            "test_name": "parent::issue_7_tests::issue_7_expected", "registration_file": "src/parent/mod.rs",
+            "expected": "assertion failed", "command": guards::repro_test_command("lyra_redirect_fixture", "parent::issue_7_tests::issue_7_expected"),
+            "frozen_commit": repro_commit
+        })).unwrap();
+        // The source file and immediate registration are unchanged, so the old lock passes.
+        let changes = git::changed_files(&repository, record.frozen_commit.as_deref().unwrap()).unwrap();
+        guards::check_fix_changes(&changes, &record, &repository, record.frozen_commit.as_deref().unwrap()).unwrap();
+        let config = Config::default();
+        let agent = crate::providers::make_agent("claude", config.provider("claude").unwrap());
+        let mut state = RunState::new(
+            "redirect".into(),
+            RunRequest {
+                repo: repository,
+                issue: "7".into(),
+                issue_text: None,
+                provider: None,
+                policy_acknowledged: false,
+            },
+            "claude".into(),
+        );
+        state.checkpoints.insert(StageId::Repro, record.frozen_commit.clone().unwrap());
+        state.checkpoints.insert(StageId::Fix, candidate);
+        state.frozen_repro = Some(record);
+        let mut ctx = StageCtx {
+            run_dir,
+            state,
+            config,
+            agent,
+            events: EventSink::memory("redirect"),
+            cancel: CancellationToken::new(),
+        };
+        let error = run_inner(&mut ctx).await.unwrap_err();
+        assert!(error.message.contains("still discovered"), "{error:?}");
+        assert!(ctx.state.verified_commit.is_none());
     }
 
     #[test]

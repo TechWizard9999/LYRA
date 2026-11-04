@@ -38,6 +38,9 @@ enum Cmd {
         run_id: String,
         #[arg(long)]
         from: String,
+        /// Acknowledge the contribution policy discovered by the previous attempt.
+        #[arg(long)]
+        ack_policy: bool,
     },
     /// List runs.
     Runs,
@@ -100,11 +103,11 @@ async fn main() -> Result<()> {
             let code = follow(&engine, &id).await;
             std::process::exit(code);
         }
-        Cmd::Retry { run_id, from } => {
+        Cmd::Retry { run_id, from, ack_policy } => {
             let stage = StageId::parse(&from).with_context(|| format!("unknown stage '{from}'"))?;
             let engine = Engine::new(home, config);
             engine.mark_interrupted()?;
-            engine.retry(&run_id, stage)?;
+            engine.retry_with_policy_ack(&run_id, stage, ack_policy)?;
             let code = follow(&engine, &run_id).await;
             std::process::exit(code);
         }
@@ -198,6 +201,15 @@ fn print_event(kind: &EventKind) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_can_acknowledge_a_newly_discovered_policy() {
+        let explicit = Cli::try_parse_from(["lyra", "retry", "run-1", "--from", "pr", "--ack-policy"]).unwrap();
+        assert!(matches!(explicit.cmd, Cmd::Retry { ack_policy: true, .. }));
+        let unchanged = Cli::try_parse_from(["lyra", "retry", "run-1", "--from", "pr"]).unwrap();
+        assert!(matches!(unchanged.cmd, Cmd::Retry { ack_policy: false, .. }));
+    }
+
     #[tokio::test]
     async fn follow_replays_already_finished_run() {
         let home = tempfile::tempdir().unwrap();

@@ -228,6 +228,29 @@ pub fn assert_test_passed(output: &str, test_name: &str) -> Result<(), String> {
     }
 }
 
+/// A negative-control `--exact --list` run must discover no test after the new
+/// reproduction source is emptied. This binds the selected test to the frozen file.
+pub(crate) fn assert_test_absent_from_list(output: &str, test_name: &str) -> Result<(), String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"^(\d+) tests?, (\d+) benchmarks?$").unwrap());
+    let mut saw_summary = false;
+    for line in output.lines().map(str::trim) {
+        if line == format!("{test_name}: test") || line == format!("{test_name}: benchmark") {
+            return Err(format!("test {test_name} is still discovered without the recorded reproduction source"));
+        }
+        if let Some(captures) = re.captures(line) {
+            saw_summary = true;
+            if captures[1].parse::<u64>() != Ok(0) || captures[2].parse::<u64>() != Ok(0) {
+                return Err(format!("tests are still discovered without the recorded reproduction source: {line}"));
+            }
+        }
+    }
+    if !saw_summary {
+        return Err("source binding check produced no test-discovery summary".into());
+    }
+    Ok(())
+}
+
 fn squash(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
@@ -944,6 +967,14 @@ test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; fini
         assert_eq!(summaries.len(), 2);
         assert_eq!(summaries[1].failed, 1);
         assert_eq!(summaries[0].filtered, 12);
+    }
+
+    #[test]
+    fn source_binding_requires_a_complete_empty_test_listing() {
+        assert!(assert_test_absent_from_list("0 tests, 0 benchmarks\n", NAME).is_ok());
+        assert!(assert_test_absent_from_list(&format!("{NAME}: test\n1 test, 0 benchmarks\n"), NAME).is_err());
+        assert!(assert_test_absent_from_list("1 test, 0 benchmarks\n", NAME).is_err());
+        assert!(assert_test_absent_from_list("", NAME).is_err());
     }
 
     #[test]
