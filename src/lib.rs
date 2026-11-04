@@ -23,6 +23,7 @@ pub mod proc;
 pub mod providers;
 pub mod stages;
 pub mod state;
+pub mod web;
 
 pub use error::{ErrorKind, StageError, StageOutcome, StopReason};
 pub use events::{AgentEvent, Event, EventSink, StageId};

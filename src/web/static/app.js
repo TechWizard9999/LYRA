@@ -1,0 +1,130 @@
+// LYRA run page: live log over SSE. No framework; served from /static/app.js.
+(function () {
+  "use strict";
+  document.querySelectorAll('form[method="post"]').forEach(function (form) {
+    form.addEventListener("submit", function (event) {
+      if (form.dataset.submitting) { event.preventDefault(); return; }
+      form.dataset.submitting = "true";
+      document.querySelectorAll('button[type="submit"]').forEach(function (button) {
+        if (!button.disabled) { button.dataset.submitting = "true"; button.disabled = true; }
+      });
+    });
+  });
+  // Restore controls when a browser returns to this page from its back/forward cache.
+  window.addEventListener("pageshow", function () {
+    document.querySelectorAll('[data-submitting]').forEach(function (element) {
+      delete element.dataset.submitting;
+      if (element.tagName === "BUTTON") element.disabled = false;
+    });
+  });
+  var log = document.getElementById("log");
+  if (!log || !window.EventSource) return;
+  var runId = log.dataset.run;
+  var renderedSeq = parseInt(log.dataset.seq || "0", 10);
+  var seenSeq = 0;
+  var renderedTerminal = log.dataset.terminal === "true";
+  var reloading = false;
+  var LABELS = { intake: "S0 Intake", context: "S1 Context", repro: "S2 Repro", rca: "S3 RCA", fix: "S4 Fix", verify: "S5 Verify", pr: "S6 Draft PR" };
+  var TERMINAL = { run_finished: 1, run_stopped: 1, stage_failed: 1, run_cancelled: 1, run_interrupted: 1 };
+
+  function label(s) { return LABELS[s] || s || ""; }
+  function firstLine(s) { return String(s || "").split("\n")[0]; }
+  function secs(ms) { return (ms / 1000).toFixed(1) + "s"; }
+
+  function describe(e) {
+    switch (e.kind) {
+      case "run_created": return ["info", "run created for " + e.request.issue];
+      case "retry_requested": return ["info", "retry requested from " + label(e.from)];
+      case "stage_started": return ["stage", "== " + label(e.stage) + " started (attempt " + e.attempt + ")"];
+      case "stage_completed": return ["ok", "   " + label(e.stage) + " done in " + secs(e.duration_ms)];
+      case "stage_failed": return ["err", "!! " + label(e.stage) + " failed: " + e.error.kind + ": " + firstLine(e.error.message)];
+      case "run_stopped": return ["err", "STOPPED at " + label(e.stage) + " (" + e.reason + "): " + firstLine(e.message)];
+      case "run_finished": return ["ok", "DONE " + (e.pr_url || "")];
+      case "run_cancelled": return ["err", "CANCELLED" + (e.stage ? " at " + label(e.stage) : "")];
+      case "run_interrupted": return ["err", "INTERRUPTED" + (e.stage ? " at " + label(e.stage) : "")];
+      case "artifact_written": return ["muted", "+ " + e.path];
+      case "log": return [e.level === "info" ? "muted" : "err", e.level + ": " + e.message];
+      case "agent": {
+        var a = e.event || {};
+        switch (a.type) {
+          case "tool_call": return ["tool", "[" + a.name + "] " + a.summary];
+          case "text": return ["text", firstLine(a.text)];
+          case "file_changed": return ["tool", "[edit] " + a.path];
+          case "tool_result": return a.ok ? null : ["err", "[tool failed] " + firstLine(a.summary)];
+          case "error": return ["err", "[error] " + a.message];
+          case "finished": return [a.ok ? "muted" : "err", "[agent finished] " + firstLine(a.summary)];
+          default: return null;
+        }
+      }
+      default: return null;
+    }
+  }
+
+  function setStage(stage, cls, text) {
+    var el = document.getElementById("stage-" + stage);
+    if (!el) return;
+    el.className = "stage " + cls;
+    el.querySelector(".status").textContent = text;
+  }
+
+  var artifacts = document.getElementById("artifacts");
+  var artifactPaths = new Set();
+  if (artifacts) {
+    artifacts.querySelectorAll("[data-artifact]").forEach(function (item) {
+      artifactPaths.add(item.dataset.artifact);
+    });
+  }
+  function addArtifact(path) {
+    if (!artifacts || typeof path !== "string" || path.indexOf("\0") !== -1) return;
+    var parts = path.split(/[\\/]/).filter(function (part) { return part && part !== "."; });
+    if (!parts.length || parts.some(function (part) { return part === ".." || part.indexOf(":") !== -1; })) return;
+    var canonicalPath = parts.join("/");
+    if (artifactPaths.has(canonicalPath)) return;
+    var item = document.createElement("li");
+    item.dataset.artifact = canonicalPath;
+    var link = document.createElement("a");
+    link.href = "/runs/" + encodeURIComponent(runId) + "/artifacts/" + parts.map(encodeURIComponent).join("/");
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.textContent = canonicalPath;
+    item.appendChild(link);
+    artifacts.appendChild(item);
+    artifactPaths.add(canonicalPath);
+    var empty = document.getElementById("no-artifacts");
+    if (empty) empty.hidden = true;
+  }
+
+  var es = new EventSource("/api/runs/" + encodeURIComponent(runId) + "/events?since=0");
+  function reload() {
+    es.close();
+    if (reloading) return;
+    reloading = true;
+    setTimeout(function () { location.reload(); }, 400);
+  }
+  es.addEventListener("run", function (msg) {
+    var e;
+    try { e = JSON.parse(msg.data); } catch (_) { return; }
+    if (!Number.isSafeInteger(e.seq) || e.seq <= seenSeq) return;
+    seenSeq = e.seq;
+    var d = describe(e);
+    if (d) {
+      var stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
+      var line = document.createElement("div");
+      line.className = "line " + d[0];
+      line.textContent = (e.ts || "").slice(11, 19) + "  " + d[1];
+      log.appendChild(line);
+      if (stick) log.scrollTop = log.scrollHeight;
+    }
+    if (e.seq <= renderedSeq) return; // replayed history: the page already reflects it
+    if (e.kind === "artifact_written") addArtifact(e.path);
+    if (e.kind === "stage_started") setStage(e.stage, "running", "running");
+    if (e.kind === "stage_completed") setStage(e.stage, "done", "done");
+    if (e.kind === "retry_requested" && renderedTerminal) reload();
+    if (TERMINAL[e.kind]) reload();
+  });
+  es.addEventListener("end", function () {
+    es.close();
+    // Covers a completion racing page rendering, even if its event was replayed.
+    if (!renderedTerminal) reload();
+  });
+})();

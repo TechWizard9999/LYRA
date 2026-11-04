@@ -17,6 +17,10 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
+axum = { version = "0.8", features = ["json"] }
+maud = "0.26"
+futures = "0.3"
+open = "5"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -41,3 +45,5 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
