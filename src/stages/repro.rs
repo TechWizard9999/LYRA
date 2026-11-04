@@ -538,7 +538,11 @@ mod tests {
         std::fs::write(&integration, "#[test]\nfn new_regression() { panic!(\"new bug\"); }\n").unwrap();
         record.test_name = "new_regression".into();
         let before = std::fs::read(&integration).unwrap();
-        check_source_binding(&ctx, &record, binding_spec(&ctx, &record), "20-repro/source-binding.txt").await.unwrap();
+        check_source_binding(&ctx, &record, binding_spec(&ctx, &record), "20-repro/source-binding.txt")
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{error:?}\n{}", ctx.run_dir.read("20-repro/source-binding.txt").unwrap_or_default())
+            });
         assert_eq!(std::fs::read(&integration).unwrap(), before);
 
         std::fs::write(
@@ -553,7 +557,11 @@ mod tests {
         std::fs::write(&private, "#[test]\nfn private_regression() { assert_eq!(super::private_value(), 1); }\n")
             .unwrap();
         let before = std::fs::read(&private).unwrap();
-        check_source_binding(&ctx, &record, binding_spec(&ctx, &record), "20-repro/source-binding.txt").await.unwrap();
+        check_source_binding(&ctx, &record, binding_spec(&ctx, &record), "20-repro/source-binding.txt")
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{error:?}\n{}", ctx.run_dir.read("20-repro/source-binding.txt").unwrap_or_default())
+            });
         assert_eq!(std::fs::read(&private).unwrap(), before);
     }
 

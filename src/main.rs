@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use lyra::config::{lyra_home, Config};
 use lyra::engine::Engine;
-use lyra::events::{AgentEvent, EventKind, StageId};
+use lyra::events::{AgentEvent, Event, EventKind, StageId};
 use lyra::state::{RunRequest, Status};
 use std::path::PathBuf;
 
@@ -132,36 +132,80 @@ async fn main() -> Result<()> {
 
 /// Prints events as they happen until the run reaches a terminal status. Returns an exit code.
 async fn follow(engine: &std::sync::Arc<Engine>, id: &str) -> i32 {
-    let mut rx = match engine.subscribe(id) {
+    let rx = match engine.subscribe(id) {
         Some(rx) => rx,
         None => return 2,
     };
+    follow_events(
+        rx,
+        |since| engine.history(id, since),
+        || {
+            if engine.is_active(id) {
+                (true, None)
+            } else {
+                (false, engine.get(id).ok().map(|state| state.status))
+            }
+        },
+        || {
+            engine.cancel(id);
+        },
+        |event| print_event(&event.kind),
+    )
+    .await
+}
+
+async fn follow_events(
+    mut rx: tokio::sync::broadcast::Receiver<Event>,
+    mut history: impl FnMut(u64) -> Vec<Event>,
+    mut run_status: impl FnMut() -> (bool, Option<Status>),
+    mut cancel: impl FnMut(),
+    mut on_event: impl FnMut(&Event),
+) -> i32 {
     let mut seq = 0;
     let mut stopping = false;
     let mut terminal = None;
+    let mut replay = true;
+    let mut stream_closed = false;
     loop {
         // Subscribe before replay so even a run that finished before follow() is observable.
-        for ev in engine.history(id, seq) {
-            seq = ev.seq;
-            print_event(&ev.kind);
-            terminal = event_exit_code(&ev.kind).or(terminal);
-        }
-        if !engine.is_active(id) {
-            if let Ok(st) = engine.get(id) {
-                if st.status.is_terminal() {
-                    return status_code(st.status);
+        // Subsequent events arrive through broadcast; reread the durable log only on lag.
+        if replay {
+            for ev in history(seq) {
+                if ev.seq > seq {
+                    seq = ev.seq;
+                    on_event(&ev);
+                    terminal = event_exit_code(&ev.kind).or(terminal);
                 }
             }
-            if let Some(code) = terminal {
+            replay = false;
+        }
+        let (active, status) = run_status();
+        if !active {
+            let code = status.filter(|status| status.is_terminal()).map(status_code).or(terminal);
+            if let Some(code) = code {
+                // Admission is released only after the driver's final event is emitted.
+                // Drain that durable tail once even when terminal state beats queued live events.
+                for ev in history(seq) {
+                    if ev.seq > seq {
+                        seq = ev.seq;
+                        on_event(&ev);
+                    }
+                }
                 return code;
             }
         }
         tokio::select! {
-            _ = tokio::signal::ctrl_c(), if !stopping => { stopping = true; engine.cancel(id); }
-            ev = rx.recv() => {
-                if let Ok(ev) = ev {
-                    if ev.seq > seq { seq = ev.seq; print_event(&ev.kind); }
-                    terminal = event_exit_code(&ev.kind).or(terminal);
+            _ = tokio::signal::ctrl_c(), if !stopping => { stopping = true; cancel(); }
+            ev = rx.recv(), if !stream_closed => {
+                match ev {
+                    Ok(ev) if ev.seq > seq => {
+                        seq = ev.seq;
+                        on_event(&ev);
+                        terminal = event_exit_code(&ev.kind).or(terminal);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => replay = true,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => stream_closed = true,
+                    _ => {}
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
@@ -216,6 +260,99 @@ fn print_event(kind: &EventKind) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stream_event(seq: u64, terminal: bool) -> Event {
+        Event {
+            seq,
+            ts: String::new(),
+            run_id: "fixture".into(),
+            kind: if terminal {
+                EventKind::RunFinished { pr_url: None }
+            } else {
+                EventKind::Log { level: lyra::events::Level::Info, message: String::new() }
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn live_follow_replays_once_instead_of_rereading_per_event() {
+        let (sender, receiver) = tokio::sync::broadcast::channel(256);
+        for seq in 1..=100 {
+            sender.send(stream_event(seq, seq == 100)).unwrap();
+        }
+        let mut replays = 0;
+        let code = follow_events(
+            receiver,
+            |_| {
+                replays += 1;
+                Vec::new()
+            },
+            || (false, None),
+            || panic!("unexpected cancel"),
+            |_| {},
+        )
+        .await;
+        assert_eq!(code, 0);
+        assert_eq!(replays, 2, "only initial and final replay should read the event log");
+    }
+
+    #[tokio::test]
+    async fn lagged_follow_replays_missing_events_from_last_seen_sequence() {
+        let (sender, receiver) = tokio::sync::broadcast::channel(2);
+        for seq in 1..=10 {
+            sender.send(stream_event(seq, seq == 10)).unwrap();
+        }
+        let mut cursors = Vec::new();
+        let code = follow_events(
+            receiver,
+            |since| {
+                cursors.push(since);
+                if cursors.len() == 1 {
+                    vec![stream_event(1, false)]
+                } else {
+                    (2..=10).map(|seq| stream_event(seq, seq == 10)).collect()
+                }
+            },
+            || (false, None),
+            || panic!("unexpected cancel"),
+            |_| {},
+        )
+        .await;
+        assert_eq!(code, 0);
+        assert_eq!(cursors, [0, 1, 10]);
+    }
+
+    #[tokio::test]
+    async fn finished_follow_processes_queued_unseen_logs_before_returning() {
+        let (sender, receiver) = tokio::sync::broadcast::channel(8);
+        for seq in 2..=6 {
+            sender.send(stream_event(seq, seq == 6)).unwrap();
+        }
+        let mut cursors = Vec::new();
+        let mut processed = Vec::new();
+        let code = follow_events(
+            receiver,
+            |since| {
+                cursors.push(since);
+                if since == 0 {
+                    vec![stream_event(1, false)]
+                } else {
+                    (2..=6).map(|seq| stream_event(seq, seq == 6)).collect()
+                }
+            },
+            || (false, Some(Status::Done)),
+            || panic!("unexpected cancel"),
+            |event| processed.push(event.seq),
+        )
+        .await;
+        assert_eq!(code, 0);
+        assert_eq!(cursors, [0, 1]);
+        assert_eq!(
+            processed,
+            [1, 2, 3, 4, 5, 6],
+            "final replay must deliver queued logs and terminal event exactly once"
+        );
+    }
 
     #[test]
     fn retry_can_acknowledge_a_newly_discovered_policy() {

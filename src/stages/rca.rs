@@ -1,7 +1,7 @@
 //! S3 RCA: one read-only agent call fed with the context, git history and repro output.
 //! `unresolved` stops the run with the analysis saved.
 
-use super::context::{cap, readonly_guard, run_readonly};
+use super::context::{cap, readonly_guard, readonly_snapshot, run_readonly};
 use super::{assets, Stage, StageCtx};
 use crate::error::{ErrorKind, StageError, StageOutcome, StopReason};
 use crate::events::StageId;
@@ -53,12 +53,13 @@ async fn rca(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
         )
         .map_err(|e| StageError::from_anyhow(ErrorKind::Config, e))?;
     let head_before = git::head(&wt).map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
+    let before = readonly_snapshot(&wt)?;
     let out = run_readonly(ctx, StageId::Rca, prompt, assets::RCA_SCHEMA).await?;
     let rca = out.structured.unwrap_or(Value::Null);
     let io = |e| StageError::from_anyhow(ErrorKind::Io, e);
     ctx.events.artifact(ctx.run_dir.write_json("30-rca/rca.json", &rca).map_err(io)?);
     ctx.events.artifact(ctx.run_dir.write("30-rca/rca.md", rca_markdown(&rca)).map_err(io)?);
-    readonly_guard(&wt, &head_before)?;
+    readonly_guard(&wt, &head_before, &before)?;
 
     let mechanism = rca.get("mechanism").and_then(Value::as_str).unwrap_or_default().to_string();
     match rca.get("result").and_then(Value::as_str) {

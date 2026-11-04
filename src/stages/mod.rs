@@ -44,11 +44,9 @@ impl StageCtx {
         schema: Option<serde_json::Value>,
     ) -> AgentTask {
         let attempt = self.state.attempt_count(stage).max(1);
-        if mode == Mode::ReadOnly {
-            // Codex read-only calls have command tools disabled. Supply bounded source
-            // evidence directly; Claude may additionally inspect with its native file tools.
-            prompt.push_str(&readonly_source_snapshot(&self.run_dir.worktree()));
-        }
+        // Codex command tools are disabled in both modes. Supply source evidence
+        // for apply_patch as well as analysis; Claude can also use native file tools.
+        prompt.push_str(&readonly_source_snapshot(&self.run_dir.worktree(), &self.relevant_source_paths()));
         AgentTask {
             stage,
             cwd: self.run_dir.worktree(),
@@ -66,6 +64,24 @@ impl StageCtx {
         }
     }
 
+    fn relevant_source_paths(&self) -> Vec<String> {
+        let mut paths = Vec::new();
+        for (artifact, array, field) in
+            [("10-context/summary.json", "candidate_files", "path"), ("30-rca/rca.json", "culprits", "file")]
+        {
+            if let Ok(value) = self.run_dir.read_json::<serde_json::Value>(artifact) {
+                if let Some(entries) = value.get(array).and_then(serde_json::Value::as_array) {
+                    paths.extend(entries.iter().filter_map(|entry| entry.get(field)?.as_str().map(str::to_owned)));
+                }
+            }
+        }
+        if let Some(repro) = &self.state.frozen_repro {
+            paths.push(repro.test_file.clone());
+            paths.extend(repro.registration_file.iter().cloned());
+        }
+        paths
+    }
+
     /// Renders a prompt template from `src/prompts/` with the given values.
     pub fn render(&self, template_name: &str, template: &str, values: serde_json::Value) -> anyhow::Result<String> {
         let mut env = minijinja::Environment::new();
@@ -75,10 +91,31 @@ impl StageCtx {
     }
 }
 
-fn readonly_source_snapshot(root: &std::path::Path) -> String {
+fn readonly_source_snapshot(root: &std::path::Path, relevant: &[String]) -> String {
     use std::io::Read;
     const FILE_LIMIT: usize = 24_000;
     const TOTAL_LIMIT: usize = 240_000;
+    // Artifact paths are model output. Check their syntax and resolved location
+    // before reading them or deriving ancestor manifests.
+    fn safe_source(root: &std::path::Path, raw: &str) -> Option<std::path::PathBuf> {
+        use std::path::{Component, Path};
+        let normalized = raw.replace('\\', "/");
+        let relative = Path::new(&normalized);
+        if normalized.is_empty()
+            || normalized.contains(':')
+            || relative.components().any(|part| !matches!(part, Component::Normal(name) if name != ".git"))
+        {
+            return None;
+        }
+        let resolved = dunce::canonicalize(root.join(relative)).ok()?;
+        (resolved.starts_with(root) && resolved.is_file()).then_some(relative.to_path_buf())
+    }
+    fn append_source(snapshot: &mut String, relative: &std::path::Path, source: &str) {
+        snapshot.push_str(&format!("\nFile: {}\n", relative.display()));
+        for (index, line) in source.lines().enumerate() {
+            snapshot.push_str(&format!("{}: {}\n", index + 1, line));
+        }
+    }
     fn collect(dir: &std::path::Path, depth: usize, paths: &mut Vec<std::path::PathBuf>) {
         if depth > 16 || paths.len() >= 2000 {
             return;
@@ -113,10 +150,47 @@ fn readonly_source_snapshot(root: &std::path::Path) -> String {
     collect(root, 0, &mut paths);
     paths.sort();
     let mut snapshot = String::new();
+    let canonical_root = dunce::canonicalize(root).ok();
+    let mut complete = std::collections::BTreeSet::new();
+    if let Some(canonical_root) = canonical_root.as_deref() {
+        for raw in relevant {
+            match safe_source(canonical_root, raw) {
+                Some(path) => {
+                    complete.insert(path.clone());
+                    for ancestor in path.parent().into_iter().flat_map(std::path::Path::ancestors) {
+                        let manifest = ancestor.join("Cargo.toml");
+                        if let Some(manifest) = safe_source(canonical_root, &manifest.to_string_lossy()) {
+                            complete.insert(manifest);
+                        }
+                    }
+                }
+                None => snapshot
+                    .push_str(&format!("\n[Relevant source omitted: invalid, missing or unsafe path {raw:?}.]\n")),
+            }
+        }
+        for path in &complete {
+            match std::fs::read_to_string(canonical_root.join(path)) {
+                Ok(source) => append_source(&mut snapshot, path, &source),
+                Err(error) => {
+                    snapshot.push_str(&format!("\n[Relevant source omitted: {}: {error}.]\n", path.display()))
+                }
+            }
+        }
+    }
+    let mut overview_bytes = 0;
+    snapshot.push_str("\n[Fallback source overview: bounded by file count, directory depth and bytes; other sources may be omitted.]\n");
     for path in paths {
-        if snapshot.len() >= TOTAL_LIMIT {
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        if complete.contains(relative) {
+            continue;
+        }
+        if overview_bytes >= TOTAL_LIMIT {
             snapshot.push_str("\n[Remaining source files omitted: snapshot limit reached.]\n");
             break;
+        }
+        // Also validate fallback files, including ancestors replaced by symlinks.
+        if canonical_root.as_deref().is_none_or(|root| safe_source(root, &relative.to_string_lossy()).is_none()) {
+            continue;
         }
         let Ok(file) = std::fs::File::open(&path) else {
             continue;
@@ -127,14 +201,12 @@ fn readonly_source_snapshot(root: &std::path::Path) -> String {
         }
         let truncated = bytes.len() > FILE_LIMIT;
         bytes.truncate(FILE_LIMIT);
-        let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
-        snapshot.push_str(&format!("\nFile: {rel}\n"));
-        for (index, line) in String::from_utf8_lossy(&bytes).lines().enumerate() {
-            snapshot.push_str(&format!("{}: {}\n", index + 1, line));
-        }
+        let start = snapshot.len();
+        append_source(&mut snapshot, relative, &String::from_utf8_lossy(&bytes));
         if truncated {
             snapshot.push_str("[File truncated.]\n");
         }
+        overview_bytes += snapshot.len() - start;
     }
     include_str!("../prompts/readonly-source.md").replace("{{ source }}", &snapshot)
 }
@@ -200,9 +272,72 @@ mod tests {
         std::fs::create_dir(dir.path().join("target")).unwrap();
         std::fs::write(dir.path().join("src/lib.rs"), "pub fn culprit() {}\n").unwrap();
         std::fs::write(dir.path().join("target/generated.rs"), "DO_NOT_INCLUDE").unwrap();
-        let snapshot = readonly_source_snapshot(dir.path());
+        let snapshot = readonly_source_snapshot(dir.path(), &[]);
         assert!(snapshot.contains("1: pub fn culprit() {}"));
         assert!(!snapshot.contains("DO_NOT_INCLUDE"));
         assert!(snapshot.contains("untrusted_repository_source"));
+    }
+
+    #[test]
+    fn edit_task_receives_source_without_a_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let rd = RunDir::new(dir.path().join("run"));
+        rd.create().unwrap();
+        std::fs::create_dir_all(rd.worktree().join("src")).unwrap();
+        std::fs::write(rd.worktree().join("src/lib.rs"), "pub fn edit_me() {}\n").unwrap();
+        std::fs::write(rd.worktree().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(
+            rd.worktree().join("src/zz_culprit.rs"),
+            format!("{}\nfn complete_tail() {{}}\n", "// source\n".repeat(4000)),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("secret.rs"), "OUTSIDE_SECRET_MUST_NOT_BE_READ").unwrap();
+        rd.write_json(
+            "30-rca/rca.json",
+            &serde_json::json!({
+                "culprits": [{"file": "src/zz_culprit.rs"}, {"file": "../../secret.rs"},
+                    {"file": dir.path().join("secret.rs").to_string_lossy()}]
+            }),
+        )
+        .unwrap();
+        let request = crate::state::RunRequest {
+            repo: rd.worktree(),
+            issue: "1".into(),
+            issue_text: None,
+            provider: None,
+            policy_acknowledged: false,
+        };
+        let ctx = StageCtx {
+            events: EventSink::open("fixture", &dir.path().join("events.jsonl")).unwrap(),
+            run_dir: rd,
+            state: RunState::new("fixture".into(), request, "codex".into()),
+            config: Config::default(),
+            agent: crate::providers::make_agent("codex", &crate::config::ProviderConfig::default()),
+            cancel: CancellationToken::new(),
+        };
+        let task = ctx.agent_task(StageId::Fix, "Fix the issue".into(), Mode::Edit, None);
+        assert!(task.prompt.contains("1: pub fn edit_me() {}"));
+        assert!(
+            task.prompt.contains("4002: fn complete_tail() {}"),
+            "the complete culprit exceeds the overview's per-file limit"
+        );
+        assert!(task.prompt.contains("1: [workspace]"));
+        assert!(!task.prompt.contains("OUTSIDE_SECRET_MUST_NOT_BE_READ"));
+        assert!(task.prompt.contains("Relevant source omitted: invalid, missing or unsafe path"));
+        assert!(task.prompt.find("fn complete_tail()").unwrap() < task.prompt.find("pub fn edit_me()").unwrap());
+        assert_eq!(task.mode, Mode::Edit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relevant_source_rejects_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(dir.path().join("secret.rs"), "SYMLINK_OUTSIDE_SECRET").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("secret.rs"), root.join("linked.rs")).unwrap();
+        let snapshot = readonly_source_snapshot(&root, &["linked.rs".into()]);
+        assert!(!snapshot.contains("SYMLINK_OUTSIDE_SECRET"));
+        assert!(snapshot.contains("Relevant source omitted"));
     }
 }
