@@ -15,3 +15,4 @@ Follow [AGENTS.md](../AGENTS.md); it is the canonical guide for this repository.
 11. Prompts live in `src/prompts/`, schemas in `src/schemas/`; artifacts follow the PLAN §7 layout (`artifacts/<NN-stage>/...`).
 12. Read-only stages stay read-only; guards are not weakened to make a run pass.
 13. Done means: builds, fmt/clippy/tests clean, new behaviour tested, docs updated for user-visible changes.
+14. Detailed rules and skills live in `.agents/` (see `.agents/README.md`).

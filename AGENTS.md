@@ -53,6 +53,10 @@ Run directory (PLAN §7):
 13. **Read-only stages stay read-only** (file reading and search only; the harness supplies command output). Guards are not weakened to make a run pass.
 14. **Follow the target repository's own rules** (CONTRIBUTING, AI policy, AGENTS.md) as written; no blanket skip rules.
 
+## Agent context (`.agents/`)
+
+Detailed rules, task playbooks (skills) and the decision log live in [`.agents/`](.agents/README.md), the only place agent instructions are kept: `rules/` (development, testing, contracts, security, git-and-prs, windows), `skills/` (one folder per task: `change-a-stage`, `add-guard`, `add-provider-adapter`, `add-prompt-or-schema`, `add-artifact`, `change-contract`, `add-dashboard-feature`, `write-tests`, `record-fixture`, `pre-pr-check`, `acceptance-run`, `onboard`, `debug-a-run`, `commit-and-pr`, `review-checklist`, `update-docs`) and `decisions/`. Codex reads `.agents/skills/` directly. `.claude/skills/` is generated from it for Claude Code: after editing a skill run `./scripts/agents.sh sync` (PowerShell `.\scripts\agents.ps1 sync`); `check` runs in CI. `./scripts/agents.sh install-hooks` installs the commit-msg and pre-commit hooks.
+
 ## Running tests
 
 ```powershell
