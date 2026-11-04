@@ -1,7 +1,8 @@
 //! `run.json`: the checkpointed state of one run. Rewritten on every transition.
 
-use crate::error::{StageError, StopReason};
+use crate::error::{ErrorKind, StageError, StopReason};
 use crate::events::StageId;
+use crate::guards::{self, ReproRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -109,9 +110,15 @@ pub struct RunState {
     pub issue_number: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_slug: Option<String>,
+    /// Repository owning the issue (may differ from a local fork's origin).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_slug: Option<String>,
     /// Commits recorded after S2 (test) and S4 (fix).
     #[serde(default)]
     pub checkpoints: BTreeMap<StageId, String>,
+    /// Harness-owned S2 evidence. Artifact files are display copies, never authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_repro: Option<ReproRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_commit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,7 +156,9 @@ impl RunState {
             branch: None,
             issue_number: None,
             repo_slug: None,
+            issue_slug: None,
             checkpoints: BTreeMap::new(),
+            frozen_repro: None,
             verified_commit: None,
             pr_url: None,
             stop_reason: None,
@@ -170,11 +179,35 @@ impl RunState {
 
     /// Atomic rewrite (write temp, rename).
     pub fn save(&self, run_dir: &Path) -> anyhow::Result<()> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
         let path = Self::path(run_dir);
-        let tmp = run_dir.join("run.json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+        let tmp =
+            run_dir.join(format!("run.json.{}.{}.tmp", std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed)));
+        let result = (|| -> anyhow::Result<()> {
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            file.write_all(serde_json::to_string_pretty(self)?.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp, &path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
+    }
+
+    pub fn require_frozen_repro(&self) -> Result<&ReproRecord, StageError> {
+        let retry = |reason: &str| StageError::new(ErrorKind::Guard, format!("{reason}; retry from repro"));
+        let rec = self.frozen_repro.as_ref().ok_or_else(|| retry("frozen reproduction record is missing"))?;
+        guards::validate_repro_record(rec).map_err(|reason| retry(&reason))?;
+        let checkpoint = self.checkpoints.get(&StageId::Repro).ok_or_else(|| retry("repro checkpoint is missing"))?;
+        if rec.frozen_commit.as_ref() != Some(checkpoint) {
+            return Err(retry("frozen reproduction record does not match the S2 checkpoint"));
+        }
+        Ok(rec)
     }
 
     pub fn stage_status(&self, stage: StageId) -> StageStatus {
@@ -198,6 +231,9 @@ impl RunState {
         }
         if from <= StageId::Verify {
             self.verified_commit = None;
+        }
+        if from <= StageId::Repro {
+            self.frozen_repro = None;
         }
         if from <= StageId::Pr {
             self.pr_url = None;
@@ -249,6 +285,43 @@ mod tests {
         st.save(dir.path()).unwrap();
         let back = RunState::load(dir.path()).unwrap();
         assert_eq!(back, st);
+        st.has_policy = true;
+        st.save(dir.path()).unwrap();
+        assert_eq!(RunState::load(dir.path()).unwrap(), st);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    fn frozen_record() -> ReproRecord {
+        serde_json::from_value(serde_json::json!({
+            "reproduced": true, "crate": "fixture", "test_file": "tests/issue_1.rs",
+            "test_name": "issue_1_bug", "expected": "the bug", "frozen_commit": "s2"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn legacy_state_loads_but_cannot_certify_without_frozen_reproduction() {
+        let state = RunState::new("legacy".into(), req(), "claude".into());
+        let mut value = serde_json::to_value(&state).unwrap();
+        value.as_object_mut().unwrap().remove("frozen_repro");
+        value.as_object_mut().unwrap().remove("issue_slug");
+        let loaded: RunState = serde_json::from_value(value).unwrap();
+        let error = loaded.require_frozen_repro().unwrap_err();
+        assert!(error.message.contains("retry from repro"));
+    }
+
+    #[test]
+    fn frozen_record_requires_matching_checkpoint_and_survives_only_later_retries() {
+        let mut state = RunState::new("r".into(), req(), "claude".into());
+        state.frozen_repro = Some(frozen_record());
+        state.checkpoints.insert(StageId::Repro, "different".into());
+        assert!(state.require_frozen_repro().is_err());
+        state.checkpoints.insert(StageId::Repro, "s2".into());
+        assert!(state.require_frozen_repro().is_ok());
+        state.invalidate_from(StageId::Fix);
+        assert!(state.require_frozen_repro().is_ok());
+        state.invalidate_from(StageId::Repro);
+        assert!(state.frozen_repro.is_none());
     }
 
     #[test]

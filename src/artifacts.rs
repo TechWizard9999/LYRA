@@ -1,7 +1,7 @@
 //! Run directory layout: `~/.lyra/runs/<run-id>/{run.json,events.jsonl,worktree/,artifacts/,attempts/}`.
 
 use crate::events::StageId;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -51,7 +51,7 @@ impl RunDir {
     /// Writes a file under `artifacts/` and returns its path relative to `artifacts/`.
     pub fn write(&self, rel: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> Result<String> {
         let rel = rel.as_ref();
-        let path = self.artifacts().join(rel);
+        let path = self.safe_path(rel)?;
         if let Some(p) = path.parent() {
             std::fs::create_dir_all(p)?;
         }
@@ -64,7 +64,7 @@ impl RunDir {
     }
 
     pub fn read(&self, rel: impl AsRef<Path>) -> Result<String> {
-        let path = self.artifacts().join(rel.as_ref());
+        let path = self.safe_path(rel.as_ref())?;
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
     }
 
@@ -73,7 +73,23 @@ impl RunDir {
     }
 
     pub fn exists(&self, rel: impl AsRef<Path>) -> bool {
-        self.artifacts().join(rel.as_ref()).exists()
+        self.safe_path(rel.as_ref()).is_ok_and(|p| p.exists())
+    }
+
+    fn safe_path(&self, rel: &Path) -> Result<PathBuf> {
+        if rel.as_os_str().is_empty() || rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+            bail!("invalid artifact path");
+        }
+        let mut path = self.artifacts();
+        for part in std::iter::once(None).chain(rel.components().map(Some)) {
+            if let Some(part) = part {
+                path.push(part.as_os_str());
+            }
+            if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+                bail!("artifact symlink is not allowed");
+            }
+        }
+        Ok(path)
     }
 
     /// Moves the artifact directories of stages >= `from` into `attempts/<n>/` and recreates them empty.
@@ -102,13 +118,24 @@ impl RunDir {
     pub fn list(&self) -> Vec<String> {
         let mut out = Vec::new();
         fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
+            if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
+                return;
+            }
             if let Ok(rd) = std::fs::read_dir(dir) {
                 for e in rd.flatten() {
                     let p = e.path();
-                    if p.is_dir() {
+                    let Ok(kind) = e.file_type() else {
+                        continue;
+                    };
+                    if kind.is_symlink() {
+                        continue;
+                    }
+                    if kind.is_dir() {
                         walk(base, &p, out);
-                    } else if let Ok(rel) = p.strip_prefix(base) {
-                        out.push(rel.to_string_lossy().replace('\\', "/"));
+                    } else if kind.is_file() {
+                        if let Ok(rel) = p.strip_prefix(base) {
+                            out.push(rel.to_string_lossy().replace('\\', "/"));
+                        }
                     }
                 }
             }
@@ -138,5 +165,25 @@ mod tests {
         assert!(!rd.exists("40-fix/fix.diff"));
         assert!(rd.attempts().join("001-fix/40-fix/fix.diff").exists());
         assert!(rd.stage_dir(StageId::Fix).exists());
+    }
+
+    #[test]
+    fn rejects_artifact_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let rd = RunDir::new(dir.path());
+        rd.create().unwrap();
+        assert!(rd.write("../outside", "bad").is_err());
+        assert!(rd.read("../run.json").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_does_not_follow_symlink_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let rd = RunDir::new(dir.path());
+        rd.create().unwrap();
+        std::os::unix::fs::symlink(rd.artifacts(), rd.artifacts().join("cycle")).unwrap();
+        assert!(rd.list().is_empty());
+        assert!(rd.write("cycle/x", "bad").is_err());
     }
 }

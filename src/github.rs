@@ -1,21 +1,17 @@
 //! Thin, synchronous wrappers over the `gh` CLI. JSON parsing lives in pure functions that
 //! take `&str` so it can be tested without calling `gh`.
 
+use crate::proc::CommandSpec;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
-use std::process::Command;
 
 /// Runs `gh <args>` and returns trimmed stdout; non-zero exit is an error with stderr.
 fn gh(args: &[&str]) -> Result<String> {
-    let out = Command::new("gh").args(args).output().with_context(|| format!("running gh {}", args.join(" ")))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim_end().to_string();
-        bail!("gh {} failed ({}): {}", args.join(" "), out.status, if stderr.is_empty() { stdout } else { stderr });
-    }
-    Ok(stdout)
+    crate::git::command(
+        &CommandSpec::new("gh", std::env::current_dir()?).args(args.iter().copied()).env("GH_PROMPT_DISABLED", "1"),
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -43,18 +39,21 @@ fn split_slug(slug: &str) -> Result<(String, String)> {
 }
 
 fn parse_number(s: &str) -> Result<u64> {
-    s.trim().parse::<u64>().with_context(|| format!("not an issue number: '{s}'"))
+    let n = s.trim().parse::<u64>().with_context(|| format!("not an issue number: '{s}'"))?;
+    if n == 0 {
+        bail!("issue number must be positive");
+    }
+    Ok(n)
 }
 
 /// Accepts `https://github.com/o/r/issues/123`, `o/r#123`, `#123` and `123` (the last two need
 /// `default_slug`).
 pub fn parse_issue_ref(input: &str, default_slug: Option<&str>) -> Result<IssueRef> {
     let s = input.trim();
-    if let Some(i) = s.find("github.com/") {
-        let rest = &s[i + "github.com/".len()..];
+    if let Some(rest) = s.strip_prefix("https://github.com/") {
         let rest = rest.split(['?', '#']).next().unwrap_or(rest);
         let parts: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
-        if parts.len() >= 4 && (parts[2] == "issues" || parts[2] == "pull") {
+        if parts.len() == 4 && parts[2] == "issues" && !parts[0].is_empty() && !parts[1].is_empty() {
             return Ok(IssueRef { owner: parts[0].into(), repo: parts[1].into(), number: parse_number(parts[3])? });
         }
         bail!("not a GitHub issue URL: '{input}'");
@@ -305,6 +304,8 @@ pub struct PrInfo {
     pub url: String,
     pub head_sha: String,
     pub head_owner: String,
+    #[serde(default)]
+    pub is_draft: bool,
 }
 
 /// Parses `gh pr list --json number,url,headRefOid,headRepositoryOwner` and keeps PRs whose
@@ -320,6 +321,7 @@ pub fn parse_pr_list(text: &str, head_owner: &str) -> Result<Vec<PrInfo>> {
                         url: s(p, "url"),
                         head_sha: s(p, "headRefOid"),
                         head_owner: login(p, "headRepositoryOwner"),
+                        is_draft: p.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
                     })
                 })
                 .filter(|p| p.head_owner.eq_ignore_ascii_case(head_owner))
@@ -341,34 +343,41 @@ pub fn find_pr(target_slug: &str, head_owner: &str, branch: &str, base: &str) ->
         "--state",
         "open",
         "--json",
-        "number,url,headRefOid,headRepositoryOwner",
+        "number,url,headRefOid,headRepositoryOwner,isDraft",
     ])?;
     Ok(parse_pr_list(&out, head_owner)?.into_iter().next())
 }
 
 /// `head` is `owner:branch` (fork) or `branch`. Returns the PR URL (last stdout line).
-pub fn create_draft_pr(target_slug: &str, head: &str, base: &str, title: &str, body_path: &Path) -> Result<String> {
-    let body = body_path.to_string_lossy().to_string();
-    let out = gh(&[
-        "pr",
-        "create",
-        "--repo",
-        target_slug,
-        "--draft",
-        "--head",
-        head,
-        "--base",
-        base,
-        "--title",
-        title,
-        "--body-file",
-        &body,
-    ])?;
-    last_url_line(&out).context("gh pr create printed no URL")
+pub fn create_draft_pr(
+    target_slug: &str,
+    source_slug: &str,
+    head: &str,
+    base: &str,
+    title: &str,
+    body_path: &Path,
+) -> Result<String> {
+    // REST supports organization-owned forks; `gh pr create --head org:branch` does not.
+    let payload = draft_payload(source_slug, head, base, title, &std::fs::read_to_string(body_path)?)?;
+    let spec = CommandSpec::new("gh", std::env::current_dir()?)
+        .args(["api", "--method", "POST", &format!("repos/{target_slug}/pulls"), "--input", "-"])
+        .stdin(serde_json::to_string(&payload)?)
+        .env("GH_PROMPT_DISABLED", "1");
+    let out = crate::git::command(&spec)?;
+    let value: Value = serde_json::from_str(&out)?;
+    value
+        .get("html_url")
+        .and_then(Value::as_str)
+        .filter(|u| u.starts_with("https://github.com/"))
+        .map(String::from)
+        .context("create pull request returned no GitHub URL")
 }
 
-fn last_url_line(out: &str) -> Option<String> {
-    out.lines().rev().map(str::trim).find(|l| l.starts_with("http")).map(String::from)
+fn draft_payload(source_slug: &str, head: &str, base: &str, title: &str, body: &str) -> Result<Value> {
+    let (_, repo) = split_slug(source_slug)?;
+    Ok(
+        serde_json::json!({ "title": title, "head": head, "head_repo": repo, "base": base, "body": body, "draft": true }),
+    )
 }
 
 pub fn gh_user() -> Result<String> {
@@ -380,7 +389,7 @@ pub fn gh_user() -> Result<String> {
 }
 
 pub fn auth_ok() -> bool {
-    Command::new("gh").args(["auth", "status"]).output().map(|o| o.status.success()).unwrap_or(false)
+    gh(&["auth", "status"]).is_ok()
 }
 
 #[cfg(test)]
@@ -403,6 +412,8 @@ mod tests {
         assert!(parse_issue_ref("#9", None).is_err());
         assert!(parse_issue_ref("abc", Some("a/b")).is_err());
         assert!(parse_issue_ref("https://github.com/o/r", None).is_err());
+        assert!(parse_issue_ref("https://github.com/o/r/pull/123", None).is_err());
+        assert!(parse_issue_ref("https://fakegithub.com/o/r/issues/123", None).is_err());
     }
 
     const ISSUE: &str = r#"{"author":{"id":"x","is_bot":false,"login":"alice","name":"Alice"},
@@ -478,9 +489,11 @@ mod tests {
     }
 
     #[test]
-    fn pr_create_url_is_last_line() {
-        let out = "Warning: 1 uncommitted change\n\nCreating draft pull request\nhttps://github.com/o/r/pull/9\n";
-        assert_eq!(last_url_line(out).as_deref(), Some("https://github.com/o/r/pull/9"));
-        assert!(last_url_line("nothing").is_none());
+    fn draft_payload_supports_organization_fork() {
+        let v = draft_payload("org/fork", "org:fix", "main", "Fix", "Body\nline").unwrap();
+        assert_eq!(v["head"], "org:fix");
+        assert_eq!(v["head_repo"], "fork");
+        assert_eq!(v["draft"], true);
+        assert_eq!(v["body"], "Body\nline");
     }
 }

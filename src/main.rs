@@ -87,9 +87,9 @@ async fn main() -> Result<()> {
                 None => None,
             };
             let engine = Engine::new(home, config);
-            engine.mark_interrupted();
+            engine.mark_interrupted()?;
             let req = RunRequest {
-                repo: repo.canonicalize().unwrap_or(repo),
+                repo: dunce::canonicalize(&repo).with_context(|| format!("opening {}", repo.display()))?,
                 issue,
                 issue_text,
                 provider,
@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
         Cmd::Retry { run_id, from } => {
             let stage = StageId::parse(&from).with_context(|| format!("unknown stage '{from}'"))?;
             let engine = Engine::new(home, config);
-            engine.mark_interrupted();
+            engine.mark_interrupted()?;
             engine.retry(&run_id, stage)?;
             let code = follow(&engine, &run_id).await;
             std::process::exit(code);
@@ -118,24 +118,55 @@ async fn follow(engine: &std::sync::Arc<Engine>, id: &str) -> i32 {
         Some(rx) => rx,
         None => return 2,
     };
+    let mut seq = 0;
+    let mut stopping = false;
+    let mut terminal = None;
     loop {
-        match rx.recv().await {
-            Ok(ev) => {
-                print_event(&ev.kind);
-                match ev.kind {
-                    EventKind::RunFinished { .. } => return 0,
-                    EventKind::RunStopped { .. } => return 3,
-                    EventKind::StageFailed { .. } => return 4,
-                    EventKind::RunCancelled { .. } | EventKind::RunInterrupted { .. } => return 5,
-                    _ => {}
+        // Subscribe before replay so even a run that finished before follow() is observable.
+        for ev in engine.history(id, seq) {
+            seq = ev.seq;
+            print_event(&ev.kind);
+            terminal = event_exit_code(&ev.kind).or(terminal);
+        }
+        if !engine.is_active(id) {
+            if let Ok(st) = engine.get(id) {
+                if st.status.is_terminal() {
+                    return status_code(st.status);
                 }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(_) => break,
+            if let Some(code) = terminal {
+                return code;
+            }
+        }
+        tokio::select! {
+            _ = tokio::signal::ctrl_c(), if !stopping => { stopping = true; engine.cancel(id); }
+            ev = rx.recv() => {
+                if let Ok(ev) = ev {
+                    if ev.seq > seq { seq = ev.seq; print_event(&ev.kind); }
+                    terminal = event_exit_code(&ev.kind).or(terminal);
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
         }
     }
-    match engine.get(id).map(|s| s.status) {
-        Ok(Status::Done) => 0,
+}
+
+fn event_exit_code(kind: &EventKind) -> Option<i32> {
+    match kind {
+        EventKind::RunFinished { .. } => Some(0),
+        EventKind::RunStopped { .. } => Some(3),
+        EventKind::StageFailed { .. } => Some(4),
+        EventKind::RunCancelled { .. } | EventKind::RunInterrupted { .. } => Some(5),
+        _ => None,
+    }
+}
+
+fn status_code(status: Status) -> i32 {
+    match status {
+        Status::Done => 0,
+        Status::Stopped => 3,
+        Status::Failed => 4,
+        Status::Cancelled | Status::Interrupted => 5,
         _ => 1,
     }
 }
@@ -161,5 +192,31 @@ fn print_event(kind: &EventKind) {
         },
         EventKind::Log { level, message } => println!("    {level:?}: {message}"),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn follow_replays_already_finished_run() {
+        let home = tempfile::tempdir().unwrap();
+        let engine = Engine::new(home.path().into(), Config::default());
+        let rd = engine.run_dir("finished").unwrap();
+        rd.create().unwrap();
+        let req = RunRequest {
+            repo: PathBuf::from("."),
+            issue: "1".into(),
+            issue_text: None,
+            provider: None,
+            policy_acknowledged: false,
+        };
+        let mut st = lyra::state::RunState::new("finished".into(), req, "claude".into());
+        st.status = Status::Failed;
+        st.save(&rd.root).unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), follow(&engine, "finished")).await.unwrap(),
+            4
+        );
     }
 }

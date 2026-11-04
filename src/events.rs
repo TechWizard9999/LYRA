@@ -156,6 +156,11 @@ impl EventSink {
         let run_id = run_id.into();
         let seq = if path.exists() { read_events(path)?.last().map(|e| e.seq).unwrap_or(0) } else { 0 };
         let file = OpenOptions::new().create(true).append(true).open(path)?;
+        // A crashed writer may have left an incomplete (even non-UTF8) last record.
+        // Separate the next record so replay can recover instead of joining two JSON objects.
+        if std::fs::read(path)?.last().is_some_and(|b| *b != b'\n') {
+            (&file).write_all(b"\n")?;
+        }
         let (tx, _rx) = broadcast::channel(4096);
         Ok(Self { inner: Arc::new(Mutex::new(SinkInner { file: Some(file), seq })), tx, run_id })
     }
@@ -174,19 +179,25 @@ impl EventSink {
         self.tx.subscribe()
     }
 
+    pub fn receiver_count(&self) -> usize {
+        self.tx.receiver_count()
+    }
+
     pub fn emit(&self, kind: EventKind) -> Event {
         let mut inner = self.inner.lock().expect("event sink poisoned");
         inner.seq += 1;
         let ev = Event { seq: inner.seq, ts: now_rfc3339(), run_id: self.run_id.clone(), kind };
         if let Some(f) = inner.file.as_mut() {
-            if let Ok(line) = serde_json::to_string(&ev) {
-                let _ = f.write_all(line.as_bytes());
-                let _ = f.write_all(b"\n");
+            if let Ok(mut line) = serde_json::to_vec(&ev) {
+                line.push(b'\n');
+                let _ = f.write_all(&line);
                 let _ = f.flush();
             }
         }
-        drop(inner);
+        // Keep broadcast order identical to the durable sequence. Unlocking before
+        // send lets a concurrent emitter publish seq N+1 first; SSE would drop N.
         let _ = self.tx.send(ev.clone());
+        drop(inner);
         ev
     }
 
@@ -211,12 +222,12 @@ impl EventSink {
 pub fn read_events(path: &Path) -> std::io::Result<Vec<Event>> {
     let f = File::open(path)?;
     let mut out = Vec::new();
-    for line in BufReader::new(f).lines() {
+    for line in BufReader::new(f).split(b'\n') {
         let line = line?;
-        if line.trim().is_empty() {
+        if line.is_empty() {
             continue;
         }
-        if let Ok(ev) = serde_json::from_str::<Event>(&line) {
+        if let Ok(ev) = serde_json::from_slice::<Event>(&line) {
             out.push(ev);
         }
     }
@@ -265,5 +276,37 @@ mod tests {
         std::fs::write(&path, "not json\n\n{\"seq\":1,\"ts\":\"t\",\"run_id\":\"r\",\"kind\":\"log\",\"level\":\"info\",\"message\":\"m\"}\n").unwrap();
         let events = read_events(&path).unwrap();
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn recovers_after_truncated_utf8_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        EventSink::open("r", &path).unwrap().info("first");
+        OpenOptions::new().append(true).open(&path).unwrap().write_all(b"{\"message\":\"\xf0\x9f").unwrap();
+        let sink = EventSink::open("r", &path).unwrap();
+        sink.info("recovered");
+        let events = read_events(&path).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].seq, 2);
+    }
+
+    #[test]
+    fn concurrent_emitters_publish_in_sequence_order() {
+        let sink = EventSink::memory("concurrent");
+        let mut rx = sink.subscribe();
+        let barrier = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    for _ in 0..100 {
+                        sink.info("event");
+                    }
+                });
+            }
+        });
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).map(|e| e.seq).collect();
+        assert_eq!(events, (1..=1600).collect::<Vec<_>>());
     }
 }

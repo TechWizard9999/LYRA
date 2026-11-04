@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
@@ -91,12 +91,20 @@ pub struct CommandOutput {
     pub stderr: String,
     pub timed_out: bool,
     pub cancelled: bool,
+    /// Output was too large to retain safely; never use partial output as test evidence.
+    pub output_truncated: bool,
+    /// A descendant kept an inherited output pipe open after the direct child exited.
+    pub drain_timed_out: bool,
     pub duration: Duration,
 }
 
 impl CommandOutput {
     pub fn success(&self) -> bool {
-        self.exit_code == Some(0) && !self.timed_out && !self.cancelled
+        self.exit_code == Some(0)
+            && !self.timed_out
+            && !self.cancelled
+            && !self.output_truncated
+            && !self.drain_timed_out
     }
     /// stdout followed by stderr, for logs.
     pub fn combined(&self) -> String {
@@ -147,6 +155,15 @@ pub fn scrubbed_env() -> Vec<(String, String)> {
     std::env::vars().filter(|(k, _)| KEEP.iter().any(|keep| keep.eq_ignore_ascii_case(k))).collect()
 }
 
+/// Keep only the runtime's authentication variables in addition to the ordinary toolchain
+/// environment. This does not isolate files in HOME; tool permissions and the runtime's
+/// sandbox remain responsible for filesystem access.
+pub fn provider_env(keys: &[&str]) -> Vec<(String, String)> {
+    let mut env = scrubbed_env();
+    env.extend(std::env::vars().filter(|(k, _)| keys.iter().any(|key| key.eq_ignore_ascii_case(k))));
+    env
+}
+
 /// Finds `name` on PATH. On Windows this resolves npm shims (`claude.cmd`); Rust's std runs
 /// `.cmd`/`.bat` files through `cmd.exe` with proper escaping, so the path can be spawned directly.
 pub fn resolve_program(name: &str) -> Result<PathBuf> {
@@ -174,41 +191,235 @@ fn build(spec: &CommandSpec) -> Command {
     {
         cmd.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+        // Assign the Job Object before any child code can spawn an escaping descendant.
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+    }
     cmd
 }
 
-/// Kills the process and all of its descendants.
-pub async fn kill_tree(child: &mut Child) {
-    if let Some(pid) = child.id() {
-        #[cfg(windows)]
-        {
-            let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).output().await;
-        }
+/// Owns the process group/job independently of `Child::id()`, which disappears on reap.
+/// Dropping the future therefore also kills descendants, including npm shim children.
+struct ProcessTree {
+    #[cfg(unix)]
+    pgid: libc::pid_t,
+    #[cfg(windows)]
+    job: std::os::windows::io::OwnedHandle,
+}
+
+impl ProcessTree {
+    fn attach(child: &Child) -> Result<Self> {
+        let pid = child.id().context("spawned process has no PID")?;
         #[cfg(unix)]
         {
-            // Negative pid = the process group we created with process_group(0).
-            let _ = Command::new("kill").args(["-9", &format!("-{pid}")]).output().await;
+            Ok(Self { pgid: pid as libc::pid_t })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+            use windows_sys::Win32::System::JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            };
+            // SAFETY: all handles are checked, owned once, and remain alive throughout use.
+            unsafe {
+                let raw = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if raw.is_null() {
+                    return Err(std::io::Error::last_os_error()).context("creating process job");
+                }
+                let job = OwnedHandle::from_raw_handle(raw);
+                let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                if SetInformationJobObject(
+                    job.as_raw_handle(),
+                    JobObjectExtendedLimitInformation,
+                    &limits as *const _ as *const _,
+                    std::mem::size_of_val(&limits) as u32,
+                ) == 0
+                {
+                    return Err(std::io::Error::last_os_error()).context("configuring process job");
+                }
+                let handle = child.raw_handle().context("spawned process has no handle")?;
+                if AssignProcessToJobObject(job.as_raw_handle(), handle) == 0 {
+                    return Err(std::io::Error::last_os_error()).context("assigning process job");
+                }
+                let tree = Self { job };
+                resume_suspended_process(pid)?;
+                Ok(tree)
+            }
         }
     }
-    let _ = child.kill().await;
+
+    fn kill(&self) {
+        #[cfg(unix)]
+        // SAFETY: pgid is the retained positive PID of the new process group we own.
+        unsafe {
+            libc::killpg(self.pgid, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            // SAFETY: the owned Job Object handle remains valid for this call.
+            unsafe {
+                windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job.as_raw_handle(), 1);
+            }
+        }
+    }
+}
+
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+#[cfg(windows)]
+fn resume_suspended_process(pid: u32) -> Result<()> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+    // SAFETY: snapshot/thread handles are checked and immediately placed in RAII owners.
+    unsafe {
+        let raw = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if raw == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error()).context("enumerating suspended process thread");
+        }
+        let snapshot = OwnedHandle::from_raw_handle(raw);
+        let mut entry: THREADENTRY32 = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of_val(&entry) as u32;
+        let mut found = Thread32First(snapshot.as_raw_handle(), &mut entry);
+        while found != 0 {
+            if entry.th32OwnerProcessID == pid {
+                let raw = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
+                if raw.is_null() {
+                    return Err(std::io::Error::last_os_error()).context("opening suspended process thread");
+                }
+                let thread = OwnedHandle::from_raw_handle(raw);
+                if ResumeThread(thread.as_raw_handle()) == u32::MAX {
+                    return Err(std::io::Error::last_os_error()).context("resuming process thread");
+                }
+                return Ok(());
+            }
+            found = Thread32Next(snapshot.as_raw_handle(), &mut entry);
+        }
+    }
+    anyhow::bail!("no initial thread found for suspended process {pid}")
+}
+
+const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_LINE_BYTES: usize = 1024 * 1024;
+const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+fn append_bounded(dst: &mut String, line: &str) -> bool {
+    let remaining = MAX_CAPTURE_BYTES.saturating_sub(dst.len());
+    if remaining == 0 {
+        return true;
+    }
+    let mut end = line.len().min(remaining);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    dst.push_str(&line[..end]);
+    if dst.len() < MAX_CAPTURE_BYTES {
+        dst.push('\n');
+    }
+    end < line.len() || line.len().saturating_add(1) > remaining
+}
+
+enum PipeEvent {
+    Line(StreamLine),
+    Truncated,
+    ReadError(String),
+}
+
+/// Bounded buffering even when a child emits a huge line or no newlines at all. Decode
+/// only complete byte lines so a split UTF-8 sequence is preserved; invalid bytes are lossy.
+async fn read_pipe<R: AsyncRead + Unpin>(mut reader: R, tx: tokio::sync::mpsc::Sender<PipeEvent>, stdout: bool) {
+    let mut chunk = [0u8; 8192];
+    let mut pending = Vec::new();
+    let mut discarding = false;
+    loop {
+        let n = match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                let _ = tx.send(PipeEvent::ReadError(e.to_string())).await;
+                return;
+            }
+        };
+        for byte in &chunk[..n] {
+            if *byte == b'\n' {
+                if !discarding && !send_pipe_line(&tx, &pending, stdout).await {
+                    return;
+                }
+                pending.clear();
+                discarding = false;
+            } else if !discarding {
+                if pending.len() == MAX_LINE_BYTES {
+                    pending.clear();
+                    discarding = true;
+                    if tx.send(PipeEvent::Truncated).await.is_err() {
+                        return;
+                    }
+                } else {
+                    pending.push(*byte);
+                }
+            }
+        }
+    }
+    if !pending.is_empty() && !discarding {
+        let _ = send_pipe_line(&tx, &pending, stdout).await;
+    }
+}
+
+async fn send_pipe_line(tx: &tokio::sync::mpsc::Sender<PipeEvent>, bytes: &[u8], stdout: bool) -> bool {
+    let line = String::from_utf8_lossy(bytes).trim_end_matches('\r').to_string();
+    tx.send(PipeEvent::Line(if stdout { StreamLine::Stdout(line) } else { StreamLine::Stderr(line) })).await.is_ok()
+}
+
+/// Aborting an outer run must also stop its pipe readers and blocked stdin writer.
+struct IoTasks(Vec<tokio::task::JoinHandle<()>>);
+impl Drop for IoTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
 }
 
 /// Runs to completion, collecting stdout/stderr.
 pub async fn run(spec: &CommandSpec, timeout: Duration, cancel: &CancellationToken) -> Result<CommandOutput> {
     let mut stdout = String::new();
     let mut stderr = String::new();
-    let out = run_streaming(spec, timeout, cancel, |line| match line {
+    let mut truncated = false;
+    let mut out = run_streaming(spec, timeout, cancel, |line| match line {
         StreamLine::Stdout(l) => {
-            stdout.push_str(&l);
-            stdout.push('\n');
+            truncated |= append_bounded(&mut stdout, &l);
         }
         StreamLine::Stderr(l) => {
-            stderr.push_str(&l);
-            stderr.push('\n');
+            truncated |= append_bounded(&mut stderr, &l);
         }
     })
     .await?;
+    out.output_truncated |= truncated;
     Ok(CommandOutput { stdout, stderr, ..out })
+}
+
+/// Bridge for synchronous git/gh call sites. A dedicated thread avoids nesting or
+/// blocking the caller's Tokio runtime; cancellation still reaches the process tree.
+pub fn run_blocking(spec: &CommandSpec, timeout: Duration, cancel: &CancellationToken) -> Result<CommandOutput> {
+    let spec = spec.clone();
+    let cancel = cancel.clone();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(run(&spec, timeout, &cancel))
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("subprocess worker panicked"))?
 }
 
 /// Runs the command, calling `on_line` for every stdout/stderr line as it arrives.
@@ -225,49 +436,22 @@ where
     let start = Instant::now();
     let mut cmd = build(spec);
     let mut child = cmd.spawn().with_context(|| format!("spawning `{}` in {}", spec.display(), spec.cwd.display()))?;
+    let tree = ProcessTree::attach(&child)?;
+    let mut tasks = IoTasks(Vec::new());
 
     if let (Some(input), Some(mut stdin)) = (spec.stdin.clone(), child.stdin.take()) {
-        tokio::spawn(async move {
+        tasks.0.push(tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
             let _ = stdin.write_all(input.as_bytes()).await;
             let _ = stdin.shutdown().await;
-        });
+        }));
     }
 
     let stdout = child.stdout.take().context("no stdout")?;
     let stderr = child.stderr.take().context("no stderr")?;
-    let mut out_lines = BufReader::new(stdout).lines();
-    let mut err_reader = BufReader::new(stderr);
-    let mut err_buf = Vec::new();
-
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamLine>();
-    let tx_err = tx.clone();
-    let err_task = tokio::spawn(async move {
-        let mut chunk = [0u8; 4096];
-        let mut pending = String::new();
-        loop {
-            match err_reader.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    err_buf.extend_from_slice(&chunk[..n]);
-                    pending.push_str(&String::from_utf8_lossy(&chunk[..n]));
-                    while let Some(i) = pending.find('\n') {
-                        let line = pending[..i].trim_end_matches('\r').to_string();
-                        pending = pending[i + 1..].to_string();
-                        let _ = tx_err.send(StreamLine::Stderr(line));
-                    }
-                }
-            }
-        }
-        if !pending.is_empty() {
-            let _ = tx_err.send(StreamLine::Stderr(pending));
-        }
-    });
-    let out_task = tokio::spawn(async move {
-        while let Ok(Some(line)) = out_lines.next_line().await {
-            let _ = tx.send(StreamLine::Stdout(line));
-        }
-    });
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<PipeEvent>(32);
+    tasks.0.push(tokio::spawn(read_pipe(stdout, tx.clone(), true)));
+    tasks.0.push(tokio::spawn(read_pipe(stderr, tx, false)));
 
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
@@ -275,41 +459,73 @@ where
     let mut cancelled = false;
     let mut exit_code: Option<i32> = None;
     let mut exited = false;
+    let mut pipes_closed = false;
+    let mut output_truncated = false;
+    let mut drain_timed_out = false;
+    let mut read_error = None;
+    let mut drain_deadline = None;
 
-    loop {
+    while !exited || !pipes_closed {
+        let drain_at = drain_deadline;
+        let drain = async move {
+            match drain_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::select! {
             biased;
-            _ = cancel.cancelled(), if !cancelled && !exited => {
+            _ = cancel.cancelled(), if !cancelled => {
                 cancelled = true;
-                kill_tree(&mut child).await;
+                tree.kill();
+                let _ = child.start_kill();
+                drain_deadline.get_or_insert(tokio::time::Instant::now() + PIPE_DRAIN_GRACE);
             }
-            _ = &mut deadline, if !timed_out && !exited => {
+            _ = &mut deadline, if !timed_out => {
                 timed_out = true;
-                kill_tree(&mut child).await;
+                tree.kill();
+                let _ = child.start_kill();
+                drain_deadline.get_or_insert(tokio::time::Instant::now() + PIPE_DRAIN_GRACE);
+            }
+            _ = drain => {
+                drain_timed_out = true;
+                tree.kill();
+                let _ = child.start_kill();
+                break;
             }
             status = child.wait(), if !exited => {
                 exited = true;
                 exit_code = status.ok().and_then(|s| s.code());
+                drain_deadline.get_or_insert(tokio::time::Instant::now() + PIPE_DRAIN_GRACE);
             }
-            line = rx.recv() => {
+            line = rx.recv(), if !pipes_closed => {
                 match line {
-                    Some(l) => on_line(l),
-                    None => break, // both pipes closed
+                    Some(PipeEvent::Line(l)) => on_line(l),
+                    Some(PipeEvent::Truncated) => output_truncated = true,
+                    Some(PipeEvent::ReadError(e)) => { read_error.get_or_insert(e); },
+                    None => pipes_closed = true,
                 }
             }
         }
     }
+    tree.kill();
     if !exited {
-        exit_code = child.wait().await.ok().and_then(|s| s.code());
+        // Cleanup itself must remain bounded, even if the runtime or OS misbehaves.
+        exit_code =
+            tokio::time::timeout(PIPE_DRAIN_GRACE, child.wait()).await.ok().and_then(Result::ok).and_then(|s| s.code());
     }
-    let _ = out_task.await;
-    let _ = err_task.await;
+    drop(tasks);
+    if let Some(e) = read_error {
+        anyhow::bail!("reading subprocess output: {e}");
+    }
     Ok(CommandOutput {
         exit_code,
         stdout: String::new(),
         stderr: String::new(),
         timed_out,
         cancelled,
+        output_truncated,
+        drain_timed_out,
         duration: start.elapsed(),
     })
 }
@@ -384,5 +600,183 @@ mod tests {
         let env = scrubbed_env();
         assert!(env.iter().any(|(k, _)| k.eq_ignore_ascii_case("PATH")));
         assert!(!env.iter().any(|(k, _)| k == "LYRA_TEST_SECRET"));
+    }
+
+    fn fixture_spec(mode: &str, dir: &Path) -> CommandSpec {
+        CommandSpec::new(std::env::current_exe().unwrap().to_string_lossy(), dir)
+            .args(["--exact", "proc::tests::subprocess_fixture", "--ignored", "--nocapture"])
+            .env("LYRA_PROCESS_FIXTURE", mode)
+    }
+
+    // An inert, offline subprocess fixture. The ordinary test suite never executes it.
+    #[test]
+    #[ignore]
+    fn subprocess_fixture() {
+        use std::io::Write;
+        match std::env::var("LYRA_PROCESS_FIXTURE").as_deref() {
+            Ok("invalid-utf8") => {
+                std::io::stdout().write_all(b"invalid: \xff\nvalid again\n").unwrap();
+            }
+            Ok("huge-line") => {
+                std::io::stdout().write_all(&vec![b'x'; MAX_LINE_BYTES + 1]).unwrap();
+                println!("\nafter huge line");
+            }
+            Ok("capture-limit") => {
+                let line = vec![b'x'; 8192];
+                for _ in 0..1100 {
+                    std::io::stdout().write_all(&line).unwrap();
+                    println!();
+                }
+            }
+            Ok("descendant") => {
+                std::fs::write("descendant.pid", std::process::id().to_string()).unwrap();
+                std::thread::sleep(Duration::from_secs(30));
+            }
+            Ok("exit-with-descendant") => {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "proc::tests::subprocess_fixture", "--ignored", "--nocapture"])
+                    .env("LYRA_PROCESS_FIXTURE", "descendant")
+                    .spawn()
+                    .unwrap();
+                // Keep the descendant's inherited stdout/stderr open after this process exits.
+                let limit = Instant::now() + Duration::from_secs(5);
+                while !Path::new("descendant.pid").exists() && Instant::now() < limit {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if !Path::new("descendant.pid").exists() {
+                    let _ = child.kill();
+                    panic!("descendant did not initialize");
+                }
+                std::process::exit(0);
+            }
+            other => panic!("unexpected fixture mode {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_is_lossy_and_does_not_stop_pipe_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = run(&fixture_spec("invalid-utf8", dir.path()), Duration::from_secs(10), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(out.success(), "{out:?}");
+        assert!(out.stdout.contains("invalid: \u{fffd}\nvalid again"));
+    }
+
+    #[tokio::test]
+    async fn huge_lines_and_collected_output_are_bounded_and_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        for mode in ["huge-line", "capture-limit"] {
+            let out =
+                run(&fixture_spec(mode, dir.path()), Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+            assert!(out.output_truncated, "{mode}: {out:?}");
+            assert!(!out.success());
+            assert!(out.stdout.len() <= MAX_CAPTURE_BYTES);
+        }
+    }
+
+    async fn descendant_pid(dir: &Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(dir.join("descendant.pid")) {
+                if let Ok(pid) = text.parse() {
+                    return pid;
+                }
+            }
+            assert!(Instant::now() < deadline, "fixture descendant did not initialize");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn process_alive(pid: u32) -> bool {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+            use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+            // SAFETY: the PID is a fixture child; the checked handle is owned once.
+            unsafe {
+                let raw = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+                if raw.is_null() {
+                    return false;
+                }
+                let handle = OwnedHandle::from_raw_handle(raw);
+                WaitForSingleObject(handle.as_raw_handle(), 0) == windows_sys::Win32::Foundation::WAIT_TIMEOUT
+            }
+        }
+        #[cfg(unix)]
+        {
+            // Linux zombies have terminated, although the init process may not have reaped them yet.
+            #[cfg(target_os = "linux")]
+            if std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| s.rsplit_once(')').map(|(_, tail)| tail.trim_start().starts_with('Z')))
+                == Some(true)
+            {
+                return false;
+            }
+            // SAFETY: signal 0 only queries existence; PID came from our fixture.
+            unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+        }
+    }
+
+    async fn assert_descendant_stopped(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while process_alive(pid) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!process_alive(pid), "descendant {pid} survived runner cleanup");
+    }
+
+    #[tokio::test]
+    async fn deadline_remains_active_after_direct_child_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let out =
+            run(&fixture_spec("exit-with-descendant", dir.path()), Duration::from_secs(1), &CancellationToken::new())
+                .await
+                .unwrap();
+        assert!(out.timed_out, "{out:?}");
+        assert!(out.duration < Duration::from_secs(5));
+        assert_descendant_stopped(descendant_pid(dir.path()).await).await;
+    }
+
+    #[tokio::test]
+    async fn inherited_pipes_have_a_bounded_post_exit_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let out =
+            run(&fixture_spec("exit-with-descendant", dir.path()), Duration::from_secs(30), &CancellationToken::new())
+                .await
+                .unwrap();
+        assert!(out.drain_timed_out, "{out:?}");
+        assert!(!out.success());
+        assert!(out.duration < Duration::from_secs(6));
+        assert_descendant_stopped(descendant_pid(dir.path()).await).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_future_drop_kill_descendants_after_parent_exit() {
+        for abort in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let spec = fixture_spec("exit-with-descendant", dir.path());
+            let cancel = CancellationToken::new();
+            let child_cancel = cancel.clone();
+            let runner = tokio::spawn(async move { run(&spec, Duration::from_secs(30), &child_cancel).await });
+            let pid = descendant_pid(dir.path()).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if abort {
+                runner.abort();
+                assert!(runner.await.unwrap_err().is_cancelled());
+            } else {
+                cancel.cancel();
+                assert!(runner.await.unwrap().unwrap().cancelled);
+            }
+            assert_descendant_stopped(pid).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_bridge_works_inside_tokio() {
+        let out = run_blocking(&echo_spec("bridge"), Duration::from_secs(10), &CancellationToken::new()).unwrap();
+        assert!(out.success());
+        assert!(out.stdout.contains("bridge"));
     }
 }

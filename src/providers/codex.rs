@@ -3,11 +3,11 @@
 //! read back from the `-o <last-message file>` after exit.
 //!
 //! Every stdout line is appended to the transcript, parsed by [`parse_line`] and forwarded as
-//! normalised `AgentEvent`s. `turn.completed` marks success; `turn.failed` / `error` carry
-//! the failure message.
+//! normalised `AgentEvent`s. `turn.completed` marks success; `turn.failed` is terminal,
+//! while top-level `error` events may be followed by a successful runtime retry.
 
 use super::claude::{exit_str, fmt_duration, head, one_line, push_tail, tail, with_stderr, SUMMARY_CHARS};
-use super::{append_transcript, Agent, AgentOutput, AgentTask, Mode};
+use super::{append_transcript, validate_extra_args, validate_output, Agent, AgentOutput, AgentTask, Mode};
 use crate::config::ProviderConfig;
 use crate::events::{AgentEvent, EventSink, StageId};
 use crate::proc::{self, CommandOutput, CommandSpec, StreamLine};
@@ -33,20 +33,43 @@ impl CodexAgent {
         let mut spec = CommandSpec::new(self.cfg.bin.as_deref().unwrap_or("codex"), &task.cwd)
             .args(["exec", "--json", "-C"])
             .arg(task.cwd.to_string_lossy())
-            .arg("--add-dir")
-            .arg(task.artifacts.to_string_lossy())
-            .arg("--ephemeral");
+            .args(["--ephemeral", "--ignore-user-config", "--ignore-rules"]);
+        // Keep the authentication directory, but do not execute user/project hooks,
+        // external integrations, shell profiles, or inherited execution rules.
+        for setting in [
+            "approval_policy=\"never\"",
+            "features.hooks=false",
+            "features.apps=false",
+            "features.multi_agent=false",
+            "features.shell_snapshot=false",
+            "web_search=\"disabled\"",
+            "allow_login_shell=false",
+            "project_doc_max_bytes=0",
+            "shell_environment_policy.inherit=\"core\"",
+            "shell_environment_policy.ignore_default_excludes=false",
+            "sandbox_workspace_write.network_access=false",
+            "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+            "sandbox_workspace_write.exclude_slash_tmp=true",
+        ] {
+            spec = spec.args(["-c", setting]);
+        }
+        let path = toml::Value::String(task.cwd.to_string_lossy().into_owned()).to_string();
+        spec = spec.args(["-c".into(), format!("projects.{path}.trust_level=\"untrusted\"")]);
         if let Some(model) = &self.cfg.model {
             spec = spec.args(["-m", model.as_str()]);
         }
         spec = match task.mode {
-            Mode::ReadOnly => spec.args(["--sandbox", "read-only"]),
+            // Codex reads/searches via shell tools. Read-only stages instead receive
+            // bounded source evidence from the harness, so no model commands are needed.
+            Mode::ReadOnly => spec.args(["--sandbox", "read-only", "-c", "features.shell_tool=false"]),
             Mode::Edit => spec.args(["--sandbox", "workspace-write"]),
         };
         if task.schema.is_some() {
             spec = spec.arg("--output-schema").arg(schema_path(task).to_string_lossy());
         }
         spec = spec.arg("-o").arg(last_message_path(task).to_string_lossy());
+        spec.clear_env = true;
+        spec.env = proc::provider_env(&["CODEX_HOME", "CODEX_API_KEY", "OPENAI_API_KEY"]);
         spec.args(self.cfg.extra_args.iter().cloned()).arg("-").stdin(task.prompt.clone())
     }
 
@@ -74,6 +97,7 @@ impl Agent for CodexAgent {
         format!("Codex CLI ({})", self.cfg.model.clone().unwrap_or_else(|| "default".into()))
     }
     async fn run(&self, task: AgentTask, events: &EventSink) -> Result<AgentOutput> {
+        validate_extra_args(&self.cfg.extra_args, &[], &["--skip-git-repo-check"])?;
         let mut spec = self.build_command(&task);
         spec.program = proc::resolve_program(&spec.program)?.to_string_lossy().into_owned();
 
@@ -128,10 +152,19 @@ impl Agent for CodexAgent {
         if !started {
             self.emit(events, task.stage, AgentEvent::Started { session: None });
         }
-        let file_text = std::fs::read_to_string(&last_message).ok().filter(|s| !s.trim().is_empty());
+        // The final-message file is runtime output too; do not allocate an unbounded file.
+        let file_text = if let Ok(file) = std::fs::File::open(&last_message) {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+            anyhow::ensure!(bytes.len() <= 1024 * 1024, "Codex final message exceeds 1 MiB");
+            Some(String::from_utf8_lossy(&bytes).into_owned()).filter(|s| !s.trim().is_empty())
+        } else {
+            None
+        };
         let text = message.or_else(|| file_text.clone()).unwrap_or_default();
         let structured = if task.schema.is_some() { extract_json(file_text.as_deref().unwrap_or(&text)) } else { None };
-        let (ok, failure) = judge(
+        let (mut ok, mut failure) = judge(
             &out,
             turn_completed.is_some(),
             failure.as_deref(),
@@ -140,6 +173,12 @@ impl Agent for CodexAgent {
             &stderr_tail,
             task.timeout,
         );
+        if ok {
+            if let Err(e) = validate_output(task.schema.as_ref(), structured.as_ref()) {
+                ok = false;
+                failure = Some(e.to_string());
+            }
+        }
         let summary = finish_summary(&out, tool_calls, turn_completed.as_ref());
         self.emit(events, task.stage, AgentEvent::Finished { ok, summary });
 
@@ -163,7 +202,7 @@ pub(crate) enum Parsed {
     /// A completed `agent_message`; the last one is the final answer.
     Message(String),
     TurnCompleted(Usage),
-    /// `turn.failed` / `error`: the run is a failure with this message.
+    /// Only `turn.failed` is terminal; top-level errors may precede a successful retry.
     Failed(String),
 }
 
@@ -199,7 +238,7 @@ pub(crate) fn parse_line(line: &str) -> Vec<Parsed> {
         }
         "error" => {
             let msg = v["message"].as_str().unwrap_or("unknown error");
-            vec![Parsed::Event(AgentEvent::Error { message: msg.to_string() }), Parsed::Failed(format!("error: {msg}"))]
+            vec![Parsed::Event(AgentEvent::Error { message: msg.to_string() })]
         }
         _ => Vec::new(),
     }
@@ -318,6 +357,9 @@ pub(crate) fn judge(
     if out.cancelled {
         return (false, Some("cancelled".to_string()));
     }
+    if out.output_truncated || out.drain_timed_out {
+        return (false, Some("incomplete subprocess output (size limit or pipe drain timeout)".into()));
+    }
     if let Some(f) = runtime_failure {
         return (false, Some(f.to_string()));
     }
@@ -423,26 +465,18 @@ mod tests {
         let last = last_message_path(&t).to_string_lossy().into_owned();
         assert!(schema.ends_with("rca-schema.json"));
         assert!(last.ends_with("rca-last-message.txt"));
-        let expected: Vec<&str> = vec![
-            "exec",
-            "--json",
-            "-C",
-            "/wt",
-            "--add-dir",
-            "/art",
-            "--ephemeral",
-            "-m",
-            "gpt-5.5-codex",
-            "--sandbox",
-            "read-only",
-            "--output-schema",
-            &schema,
-            "-o",
-            &last,
-            "--skip-git-repo-check",
-            "-",
-        ];
-        assert_eq!(spec.args, expected);
+        let a = &spec.args;
+        assert_eq!(&a[..4], &["exec", "--json", "-C", "/wt"]);
+        assert!(a.windows(2).any(|p| p == ["--output-schema", schema.as_str()]));
+        assert!(a.windows(2).any(|p| p == ["-o", last.as_str()]));
+        assert!(a.windows(2).any(|p| p == ["--sandbox", "read-only"]));
+        assert!(a.contains(&"--ignore-user-config".into()));
+        assert!(a.contains(&"--ignore-rules".into()));
+        assert!(a.contains(&"features.hooks=false".into()));
+        assert!(a.contains(&"features.shell_tool=false".into()));
+        assert!(a.contains(&"projects.\"/wt\".trust_level=\"untrusted\"".into()));
+        assert!(!a.contains(&"--add-dir".into()));
+        assert!(spec.clear_env);
     }
 
     #[test]
@@ -453,7 +487,7 @@ mod tests {
         let spec = CodexAgent::new("codex", &c).build_command(&t);
         assert_eq!(spec.program, "/opt/codex.cmd");
         let a = &spec.args;
-        assert_eq!(&a[7..9], &["--sandbox", "workspace-write"]);
+        assert!(a.windows(2).any(|p| p == ["--sandbox", "workspace-write"]));
         assert!(!a.iter().any(|x| x == "--output-schema" || x == "-m"));
         assert_eq!(a[a.len() - 3], "-o");
         assert_eq!(a.last().map(String::as_str), Some("-"));
@@ -494,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_failed_and_error_lines_fail_the_run() {
+    fn turn_failed_is_terminal_but_transient_error_can_recover() {
         let failed = parse_all(
             "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n{\"type\":\"turn.failed\",\"error\":{\"message\":\"model quota exceeded\"}}\n",
         );
@@ -513,7 +547,23 @@ mod tests {
         assert_eq!(f.as_deref(), Some("turn.failed: model quota exceeded"));
 
         let err = parse_all("{\"type\":\"error\",\"message\":\"stream disconnected\"}\n");
-        assert_eq!(err.failure.as_deref(), Some("error: stream disconnected"));
+        assert_eq!(err.failure, None);
+        assert!(!judge(&ok_out(), false, None, false, false, &[], Duration::from_secs(1)).0);
+        let recovered = parse_all(
+            "{\"type\":\"error\",\"message\":\"stream disconnected\"}\n{\"type\":\"turn.completed\",\"usage\":{}}\n",
+        );
+        assert!(
+            judge(
+                &ok_out(),
+                recovered.usage.is_some(),
+                recovered.failure.as_deref(),
+                false,
+                false,
+                &[],
+                Duration::from_secs(1)
+            )
+            .0
+        );
         assert_eq!(err.events, vec![AgentEvent::Error { message: "stream disconnected".into() }]);
     }
 
@@ -677,7 +727,8 @@ mod tests {
         t.transcript = t.artifacts.join("transcripts").join("rca.jsonl");
         let out = CodexAgent::new("codex", &c).run(t, &EventSink::memory("r")).await.unwrap();
         // No -o file: falls back to the last agent message, which parses (fences stripped).
-        assert!(out.ok, "{out:?}");
+        assert!(!out.ok, "schema-mismatched fallback must fail: {out:?}");
+        assert!(out.failure.as_deref().unwrap().contains("schema validation"));
         assert_eq!(
             out.structured.as_ref().and_then(|s| s["root_cause"].as_str()),
             Some("lex() does not trim leading whitespace")

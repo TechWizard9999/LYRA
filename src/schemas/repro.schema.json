@@ -5,7 +5,7 @@
   "properties": {
     "reproduced": {
       "type": "boolean",
-      "description": "True only if the test was run and failed on the assertion that proves the bug."
+      "description": "True when a test has been prepared for the harness to execute and check against the expected assertion. The harness, not the agent, decides whether it reproduces."
     },
     "crate": {
       "type": "string",

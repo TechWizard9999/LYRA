@@ -55,7 +55,7 @@ pub struct ProviderConfig {
     pub auth: ClaudeAuth,
     /// Binary name or path; defaults to `claude` / `codex`.
     pub bin: Option<String>,
-    /// Extra arguments appended to every invocation.
+    /// Narrowly allowlisted presentation/effort arguments; execution-policy overrides are rejected.
     pub extra_args: Vec<String>,
 }
 

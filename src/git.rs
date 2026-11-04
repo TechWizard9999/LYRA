@@ -1,22 +1,56 @@
 //! Thin, synchronous wrappers over the `git` CLI. Every function takes the directory to run in.
 
+use crate::proc::{self, CommandSpec};
 use anyhow::{bail, Context, Result};
+use std::cell::RefCell;
 use std::path::Path;
-use std::process::Command;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+thread_local! {
+    static RUN_CONTEXT: RefCell<(Duration, CancellationToken)> = RefCell::new((Duration::from_secs(1800), CancellationToken::new()));
+}
+
+pub fn with_run_context<T>(timeout: Duration, cancel: CancellationToken, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<(Duration, CancellationToken)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(old) = self.0.take() {
+                RUN_CONTEXT.with(|ctx| *ctx.borrow_mut() = old);
+            }
+        }
+    }
+    let old = RUN_CONTEXT.with(|ctx| std::mem::replace(&mut *ctx.borrow_mut(), (timeout, cancel)));
+    let _restore = Restore(Some(old));
+    f()
+}
+
+pub(crate) fn command(spec: &CommandSpec) -> Result<String> {
+    let (timeout, cancel) = RUN_CONTEXT.with(|ctx| ctx.borrow().clone());
+    let out = proc::run_blocking(spec, timeout, &cancel)?;
+    if !out.success() {
+        bail!(
+            "{} failed (exit {:?}, timeout={}, cancelled={}): {}",
+            spec.display(),
+            out.exit_code,
+            out.timed_out,
+            out.cancelled,
+            out.combined()
+        );
+    }
+    Ok(out.stdout.trim_end_matches(['\r', '\n']).to_owned())
+}
 
 /// Runs `git <args>` in `dir` and returns trimmed stdout; non-zero exit is an error with stderr.
 pub fn run(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .with_context(|| format!("running git {} in {}", args.join(" "), dir.display()))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim_end().to_string();
-        bail!("git {} failed ({}): {}", args.join(" "), out.status, if stderr.is_empty() { stdout } else { stderr });
-    }
-    Ok(stdout)
+    let hooks = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let spec = CommandSpec::new("git", dir)
+        .args(["-c", &format!("core.hooksPath={hooks}"), "-c", "core.longpaths=true", "-c", "core.fsmonitor=false"])
+        .args(args.iter().copied())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+    command(&spec).with_context(|| format!("running git in {}", dir.display()))
 }
 
 /// Like `run` but returns stdout even on failure (for best-effort collectors).
@@ -52,7 +86,7 @@ pub fn is_clean(dir: &Path) -> Result<bool> {
 /// previous attempt created.
 pub fn reset_hard_clean(dir: &Path, commit: &str) -> Result<()> {
     run(dir, &["reset", "--hard", commit])?;
-    run(dir, &["clean", "-fd"])?;
+    run(dir, &["clean", "-fdx"])?;
     Ok(())
 }
 
@@ -84,6 +118,12 @@ pub fn worktree_remove(repo: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A fresh detached checkout makes verification independent of ignored files in the agent workspace.
+pub fn verification_worktree(repo: &Path, path: &Path, commit: &str) -> Result<()> {
+    run(repo, &["worktree", "add", "--detach", &path.to_string_lossy(), commit])?;
+    Ok(())
+}
+
 pub fn current_branch(dir: &Path) -> Result<String> {
     run(dir, &["rev-parse", "--abbrev-ref", "HEAD"])
 }
@@ -98,8 +138,8 @@ pub fn commit_all(dir: &Path, message: &str) -> Result<String> {
 /// `git diff <from>..<to>` (or working tree vs HEAD when `to` is None).
 pub fn diff(dir: &Path, from: &str, to: Option<&str>) -> Result<String> {
     match to {
-        Some(t) => run(dir, &["diff", "--no-color", from, t]),
-        None => run(dir, &["diff", "--no-color", from]),
+        Some(t) => run(dir, &["diff", "--no-color", "--no-ext-diff", "--no-textconv", from, t]),
+        None => run(dir, &["diff", "--no-color", "--no-ext-diff", "--no-textconv", from]),
     }
 }
 
@@ -107,17 +147,11 @@ pub fn diff(dir: &Path, from: &str, to: Option<&str>) -> Result<String> {
 /// Status is one of A/M/D/R/??.
 pub fn changed_files(dir: &Path, commit: &str) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
-    let tracked = run(dir, &["diff", "--name-status", commit])?;
-    for line in tracked.lines() {
-        let mut parts = line.split('\t');
-        let st = parts.next().unwrap_or("").chars().next().map(|c| c.to_string()).unwrap_or_default();
-        let path = parts.next_back().unwrap_or("").to_string();
-        if !path.is_empty() {
-            out.push((st, path.replace('\\', "/")));
-        }
-    }
-    let untracked = run(dir, &["ls-files", "--others", "--exclude-standard"])?;
-    for p in untracked.lines().filter(|l| !l.trim().is_empty()) {
+    let tracked = run(dir, &["diff", "--name-status", "--no-renames", "-z", commit])?;
+    out.extend(parse_name_status(&tracked));
+    // Deliberately include ignored files: an ignored .cargo/config.toml can change test behavior.
+    let untracked = run(dir, &["ls-files", "--others", "-z"])?;
+    for p in untracked.split('\0').filter(|l| !l.is_empty()) {
         out.push(("??".to_string(), p.replace('\\', "/")));
     }
     Ok(out)
@@ -125,16 +159,18 @@ pub fn changed_files(dir: &Path, commit: &str) -> Result<Vec<(String, String)>> 
 
 /// Files changed between two commits as `(status, path)`.
 pub fn changed_files_between(dir: &Path, from: &str, to: &str) -> Result<Vec<(String, String)>> {
-    let text = run(dir, &["diff", "--name-status", from, to])?;
-    Ok(text
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split('\t');
-            let st = parts.next()?.chars().next()?.to_string();
-            let path = parts.next_back()?.to_string();
-            Some((st, path.replace('\\', "/")))
-        })
-        .collect())
+    let text = run(dir, &["diff", "--name-status", "--no-renames", "-z", from, to])?;
+    Ok(parse_name_status(&text))
+}
+
+fn parse_name_status(text: &str) -> Vec<(String, String)> {
+    text.split('\0')
+        .collect::<Vec<_>>()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .filter_map(|pair| Some((pair[0].chars().next()?.to_string(), pair[1].replace('\\', "/"))))
+        .collect()
 }
 
 /// Contents of `path` at `commit`.
@@ -174,13 +210,12 @@ pub fn parse_github_slug(url: &str) -> Option<String> {
     let rest = if let Some(r) = url.strip_prefix("git@github.com:") {
         r
     } else {
-        let i = url.find("github.com/")?;
-        &url[i + "github.com/".len()..]
+        url.strip_prefix("https://github.com/").or_else(|| url.strip_prefix("ssh://git@github.com/"))?
     };
     let mut parts = rest.split('/');
     let owner = parts.next()?;
     let repo = parts.next()?;
-    if owner.is_empty() || repo.is_empty() {
+    if owner.is_empty() || repo.is_empty() || parts.next().is_some() {
         return None;
     }
     Some(format!("{owner}/{repo}"))
@@ -239,5 +274,42 @@ mod tests {
 
         assert_eq!(default_branch(repo.path()).unwrap(), "main");
         worktree_remove(repo.path(), &wt).unwrap();
+    }
+
+    #[test]
+    fn ignored_files_are_checked_and_removed_on_reset() {
+        let repo = init_repo();
+        let base = head(repo.path()).unwrap();
+        std::fs::write(repo.path().join(".gitignore"), ".cargo/\n").unwrap();
+        std::fs::create_dir(repo.path().join(".cargo")).unwrap();
+        std::fs::write(repo.path().join(".cargo/config.toml"), "[alias]\n").unwrap();
+        assert!(changed_files(repo.path(), &base).unwrap().iter().any(|(_, p)| p == ".cargo/config.toml"));
+        reset_hard_clean(repo.path(), &base).unwrap();
+        assert!(!repo.path().join(".cargo").exists());
+    }
+
+    #[test]
+    fn nul_status_preserves_unusual_paths() {
+        assert_eq!(
+            parse_name_status("M\0file\tname.rs\0A\0line\nname.rs\0"),
+            vec![("M".into(), "file\tname.rs".into()), ("A".into(), "line\nname.rs".into())]
+        );
+    }
+
+    #[test]
+    fn commit_does_not_run_repository_hooks() {
+        let repo = init_repo();
+        let hooks = repo.path().join("hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        let hook = hooks.join("pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        run(repo.path(), &["config", "core.hooksPath", &hooks.to_string_lossy()]).unwrap();
+        std::fs::write(repo.path().join("a.txt"), "changed").unwrap();
+        commit_all(repo.path(), "hooks disabled").unwrap();
     }
 }

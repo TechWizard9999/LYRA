@@ -16,18 +16,12 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
-futures = "0.3"
 async-trait = "0.1"
-axum = { version = "0.8", features = ["json"] }
-maud = "0.26"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 anyhow = "1"
-thiserror = "2"
-tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 jsonschema = "0.26"
 which = "7"
@@ -35,7 +29,14 @@ minijinja = "2"
 time = { version = "0.3", features = ["formatting", "macros", "serde"] }
 dirs = "6"
 regex = "1"
-open = "5"
+fs2 = "0.4"
+dunce = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Security"] }
 
 [dev-dependencies]
 tempfile = "3"
