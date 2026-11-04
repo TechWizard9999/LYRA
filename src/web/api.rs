@@ -170,7 +170,8 @@ pub async fn get_run(State(s): State<AppState>, Path(id): Path<String>) -> ApiRe
 }
 
 pub async fn cancel_run(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<serde_json::Value>> {
-    cancel(&s.engine, &id)?;
+    let cancel_id = id.clone();
+    blocking(move || cancel(&s.engine, &cancel_id)).await?;
     Ok(Json(json!({ "id": id, "cancelled": true })))
 }
 

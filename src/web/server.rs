@@ -183,7 +183,8 @@ async fn run_page(State(s): State<AppState>, Path(id): Path<String>, Query(q): Q
 }
 
 async fn cancel_form(State(s): State<AppState>, Path(id): Path<String>) -> Response {
-    back_to_run(&id, api::cancel(&s.engine, &id).err())
+    let cancel_id = id.clone();
+    back_to_run(&id, api::blocking(move || api::cancel(&s.engine, &cancel_id)).await.err())
 }
 
 #[derive(Default, Deserialize)]
@@ -367,6 +368,53 @@ mod tests {
         let (status, css) = call(&app, "GET", "/static/app.css").await;
         assert_eq!(status, StatusCode::OK);
         assert!(!css.is_empty());
+    }
+
+    #[test]
+    fn cancellation_routes_wait_for_the_blocking_pool() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let runtime =
+            tokio::runtime::Builder::new_current_thread().enable_all().max_blocking_threads(1).build().unwrap();
+        let (_home, engine, app) = app();
+        seed(&engine, "r1");
+        runtime.block_on(async {
+            for (uri, expected_status, expected_location) in [
+                ("/api/runs/r1/cancel", StatusCode::CONFLICT, None),
+                ("/runs/r1/cancel", StatusCode::SEE_OTHER, Some("/runs/r1?error=busy")),
+                ("/api/runs/missing/cancel", StatusCode::NOT_FOUND, None),
+                ("/runs/missing/cancel", StatusCode::SEE_OTHER, Some("/runs/missing?error=not_found")),
+            ] {
+                let (release, held) = std::sync::mpsc::channel();
+                let (started, ready) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    started.send(()).unwrap();
+                    let _ = held.recv();
+                });
+                ready.recv().unwrap();
+                let request = Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::HOST, "127.0.0.1:7700")
+                    .header(header::ORIGIN, "http://127.0.0.1:7700")
+                    .body(Body::empty())
+                    .unwrap();
+                let mut response = std::pin::pin!(app.clone().oneshot(request));
+                // With the blocking pool occupied, polling the route must yield
+                // before it reads run.json or attempts cancellation.
+                let pending = std::future::poll_fn(|cx| Poll::Ready(response.as_mut().poll(cx).is_pending())).await;
+                release.send(()).unwrap();
+                assert!(pending, "{uri} performed cancellation on the async worker");
+                blocker.await.unwrap();
+                let response = response.await.unwrap();
+                assert_eq!(response.status(), expected_status, "{uri}");
+                assert_eq!(
+                    response.headers().get(header::LOCATION).map(|value| value.to_str().unwrap()),
+                    expected_location
+                );
+            }
+        });
     }
 
     #[tokio::test]
