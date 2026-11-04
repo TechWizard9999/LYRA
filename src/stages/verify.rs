@@ -13,6 +13,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 pub struct VerifyStage;
 
@@ -64,14 +66,16 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
         ctx.state.attempt_count(StageId::Verify),
         time::OffsetDateTime::now_utc().unix_timestamp_nanos()
     );
-    let worktree = ctx.run_dir.root.join(format!("verify-{suffix}"));
-    let environment = ctx.run_dir.root.join(format!("verify-env-{suffix}"));
-    let cargo_home = environment.join("cargo-home");
-    let target = environment.join("target");
+    let root = verification_root(&ctx.run_dir.root, &suffix)?;
+    let worktree = root.join("checkout");
+    let cargo_home = root.join("cargo-home");
+    let target = root.join("target");
+    // Own the root before any fallible setup, including worktree creation.
+    let cleanup = VerificationWorktree { source: source.clone(), root, path: worktree.clone(), timeout: ctx.timeout() };
     std::fs::create_dir_all(&cargo_home).map_err(|e| StageError::new(ErrorKind::Io, e.to_string()))?;
     git::verification_worktree(&source, &worktree, &candidate)
         .map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
-    let cleanup = VerificationWorktree { source, path: worktree.clone() };
+    ctx.events.info(format!("verify: isolated checkout at {}", worktree.display()));
     let outcome = verify_checkout(ctx, &rec, &candidate, &worktree, &cargo_home, &target).await;
     drop(cleanup);
     outcome
@@ -79,13 +83,67 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
 
 struct VerificationWorktree {
     source: PathBuf,
+    root: PathBuf,
     path: PathBuf,
+    timeout: Duration,
 }
 
 impl Drop for VerificationWorktree {
     fn drop(&mut self) {
-        let _ = git::worktree_remove(&self.source, &self.path);
+        // The stage's token is already cancelled on the Cancel path. Cleanup must
+        // still remove Git's registration and all verification caches/outputs.
+        git::with_run_context(self.timeout, CancellationToken::new(), || {
+            let _ = git::worktree_remove(&self.source, &self.path);
+        });
+        let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+fn verification_root(preferred: &Path, suffix: &str) -> Result<PathBuf, StageError> {
+    let bases = vec![preferred.to_path_buf(), std::env::temp_dir()];
+    #[cfg(windows)]
+    let bases = {
+        let mut bases = bases;
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            bases.push(PathBuf::from(system_root).join("Temp"));
+        }
+        bases
+    };
+    let mut candidates = bases.clone();
+    for base in bases {
+        for parent in base.ancestors() {
+            if !candidates.iter().any(|candidate| candidate == parent) {
+                candidates.push(parent.to_path_buf());
+            }
+        }
+    }
+    let mut failures = Vec::new();
+    for parent in candidates {
+        let parent = match dunce::canonicalize(&parent) {
+            Ok(parent) => parent,
+            Err(error) => {
+                failures.push(format!("{}: {error}", parent.display()));
+                continue;
+            }
+        };
+        let root = parent.join(format!("lyra-verify-{}-{suffix}", std::process::id()));
+        // Cargo searches every ancestor, even HOME/.cargo when CARGO_HOME is
+        // overridden. Windows TEMP is commonly below HOME as well.
+        if ensure_no_ancestor_cargo_config(&root.join("checkout")).is_err() {
+            continue;
+        }
+        match std::fs::create_dir(&root) {
+            Ok(()) => return Ok(root),
+            Err(error) => failures.push(format!("{}: {error}", parent.display())),
+        }
+    }
+    Err(StageError::new(
+        ErrorKind::Config,
+        format!(
+            "cannot create a verification workspace outside inherited Cargo configuration; choose a writable LYRA_HOME outside those ancestors. {}",
+            failures.join("; ")
+        ),
+    ))
 }
 
 async fn verify_checkout(
@@ -101,8 +159,8 @@ async fn verify_checkout(
     let changes = git::changed_files(worktree, checkpoint).map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
     guards::check_fix_changes(&changes, rec, worktree, checkpoint)
         .map_err(|msg| StageError::new(ErrorKind::Guard, msg))?;
-    let snapshot = source_snapshot(worktree).map_err(|e| StageError::from_anyhow(ErrorKind::Io, e))?;
     ensure_empty_cargo_config(cargo_home)?;
+    let snapshot = prepare_lockfile(ctx, candidate, worktree, cargo_home, target).await?;
     let binding = CommandSpec::new("cargo", worktree).args(
         guards::repro_test_args(&rec.krate, &rec.test_name)
             .map_err(|message| StageError::new(ErrorKind::Guard, message))?,
@@ -204,6 +262,45 @@ fn controlled_cargo_environment(spec: CommandSpec, cargo_home: &Path, target: &P
     spec
 }
 
+/// Library repositories may intentionally omit Cargo.lock. Generate that one
+/// Cargo output before freezing the verification baseline, then protect it like
+/// every other file throughout discovery, build, tests and formatting.
+async fn prepare_lockfile(
+    ctx: &StageCtx,
+    candidate: &str,
+    worktree: &Path,
+    cargo_home: &Path,
+    target: &Path,
+) -> Result<SourceSnapshot, StageError> {
+    let before = source_snapshot(worktree).map_err(|e| StageError::from_anyhow(ErrorKind::Io, e))?;
+    if before.contains_key(Path::new("Cargo.lock")) {
+        return Ok(before);
+    }
+    let spec =
+        controlled_cargo_environment(CommandSpec::new("cargo", worktree).arg("generate-lockfile"), cargo_home, target);
+    ctx.events.info(format!("verify: preparing missing lockfile: `{}`", spec.display()));
+    let run =
+        proc::run(&spec, ctx.timeout(), &ctx.cancel).await.map_err(|e| StageError::from_anyhow(ErrorKind::Tool, e))?;
+    let log = write(ctx, "50-verify/lockfile.txt", run.combined())?;
+    if !run.success() {
+        let kind = if run.timed_out { ErrorKind::Timeout } else { ErrorKind::Tool };
+        return Err(StageError::new(kind, "preparing the verification Cargo.lock failed").with_details(log));
+    }
+    let mut after = source_snapshot(worktree).map_err(|e| StageError::from_anyhow(ErrorKind::Io, e))?;
+    let generated = after.remove(Path::new("Cargo.lock"));
+    if !matches!(generated, Some(SourceEntry::File(_))) || after != before {
+        return Err(StageError::new(
+            ErrorKind::Guard,
+            "lockfile preparation must only create Cargo.lock; candidate source or configuration changed",
+        )
+        .with_details(log));
+    }
+    after.insert(PathBuf::from("Cargo.lock"), generated.expect("checked generated regular lockfile"));
+    assert_checkout_unchanged(worktree, candidate, &after)?;
+    ensure_empty_cargo_config(cargo_home)?;
+    Ok(after)
+}
+
 fn repository_verify_overrides(repo: &Path) -> Result<bool, StageError> {
     let path = repo.join("lyra.toml");
     let text = match std::fs::read_to_string(&path) {
@@ -241,16 +338,16 @@ fn ensure_no_ancestor_cargo_config(worktree: &Path) -> Result<(), StageError> {
     Ok(())
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum SourceEntry {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SourceEntry {
     File(Vec<u8>),
     Symlink(PathBuf),
 }
 
-type SourceSnapshot = BTreeMap<PathBuf, SourceEntry>;
+pub(crate) type SourceSnapshot = BTreeMap<PathBuf, SourceEntry>;
 
 /// Includes ignored/untracked files; target and Cargo caches live outside this checkout.
-fn source_snapshot(root: &Path) -> anyhow::Result<SourceSnapshot> {
+pub(crate) fn source_snapshot(root: &Path) -> anyhow::Result<SourceSnapshot> {
     fn visit(root: &Path, directory: &Path, files: &mut SourceSnapshot) -> anyhow::Result<()> {
         for entry in std::fs::read_dir(directory)? {
             let entry = entry?;
@@ -367,6 +464,133 @@ mod tests {
         std::fs::create_dir(dir.path().join(".cargo")).unwrap();
         std::fs::write(dir.path().join(".cargo/config.toml"), "runner = 'fake'").unwrap();
         assert_ne!(source_snapshot(dir.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn generated_lockfile_remains_part_of_the_frozen_source_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.lock"), "version = 4\n").unwrap();
+        let before = source_snapshot(dir.path()).unwrap();
+        std::fs::write(dir.path().join("Cargo.lock"), "version = 4\n# changed by a command\n").unwrap();
+        assert_ne!(source_snapshot(dir.path()).unwrap(), before);
+        std::fs::remove_file(dir.path().join("Cargo.lock")).unwrap();
+        assert_ne!(source_snapshot(dir.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn cancelled_stage_still_cleans_worktree_registration_and_environment() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        git::run(&source, &["init", "-q"]).unwrap();
+        git::run(&source, &["config", "user.name", "LYRA test"]).unwrap();
+        git::run(&source, &["config", "user.email", "lyra-test@example.invalid"]).unwrap();
+        std::fs::write(source.join("file.txt"), "candidate").unwrap();
+        let candidate = git::commit_all(&source, "fixture").unwrap();
+        let root = temporary.path().join("verification");
+        let path = root.join("checkout");
+        std::fs::create_dir_all(root.join("cargo-home/registry")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("target/output"), "large build output").unwrap();
+        git::verification_worktree(&source, &path, &candidate).unwrap();
+        let cleanup = VerificationWorktree {
+            source: source.clone(),
+            root: root.clone(),
+            path: path.clone(),
+            timeout: Duration::from_secs(10),
+        };
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        git::with_run_context(Duration::from_secs(10), cancelled, || drop(cleanup));
+        assert!(!root.exists(), "verification Cargo home and target must also be removed");
+        assert!(!git::run(&source, &["worktree", "list", "--porcelain"])
+            .unwrap()
+            .contains(&path.to_string_lossy().replace('\\', "/")));
+    }
+
+    #[tokio::test]
+    async fn library_without_lockfile_verifies_outside_home_cargo_configuration() {
+        use crate::artifacts::RunDir;
+        use crate::config::Config;
+        use crate::events::EventSink;
+        use crate::state::{RunRequest, RunState};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let fake_home = temporary.path().join("home");
+        std::fs::create_dir_all(fake_home.join(".cargo")).unwrap();
+        std::fs::write(
+            fake_home.join(".cargo/config.toml"),
+            "[build]\nrustc-wrapper = 'this-ancestor-wrapper-must-not-run'\n",
+        )
+        .unwrap();
+        let run_dir = RunDir::new(fake_home.join(".lyra/run"));
+        run_dir.create().unwrap();
+        let repository = run_dir.worktree();
+        std::fs::create_dir_all(repository.join("src")).unwrap();
+        std::fs::create_dir_all(repository.join("tests")).unwrap();
+        std::fs::create_dir_all(repository.join(".cargo")).unwrap();
+        git::run(&repository, &["init", "-q"]).unwrap();
+        git::run(&repository, &["config", "user.name", "LYRA test"]).unwrap();
+        git::run(&repository, &["config", "user.email", "lyra-test@example.invalid"]).unwrap();
+        std::fs::write(
+            repository.join("Cargo.toml"),
+            "[package]\nname = 'lyra_verify_library'\nversion = '0.1.0'\nedition = '2021'\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join(".cargo/config.toml"), "[net]\noffline = true\n").unwrap();
+        std::fs::write(repository.join(".gitignore"), "/Cargo.lock\n/target\n").unwrap();
+        std::fs::write(repository.join("src/lib.rs"), "pub fn value() -> i32 {\n    0\n}\n").unwrap();
+        std::fs::write(
+            repository.join("tests/issue_7.rs"),
+            "#[test]\nfn issue_7_expected() {\n    assert_eq!(lyra_verify_library::value(), 1, \"issue remains\");\n}\n",
+        )
+        .unwrap();
+        let repro_commit = git::commit_all(&repository, "test: reproduce").unwrap();
+        std::fs::write(repository.join("src/lib.rs"), "pub fn value() -> i32 {\n    1\n}\n").unwrap();
+        let candidate = git::commit_all(&repository, "fix: expected value").unwrap();
+        let record: ReproRecord = serde_json::from_value(serde_json::json!({
+            "reproduced": true, "crate": "lyra_verify_library", "test_file": "tests/issue_7.rs",
+            "test_name": "issue_7_expected", "expected": "issue remains",
+            "command": guards::repro_test_command("lyra_verify_library", "issue_7_expected"),
+            "frozen_commit": repro_commit
+        }))
+        .unwrap();
+        let config = Config::default();
+        let agent = crate::providers::make_agent("claude", config.provider("claude").unwrap());
+        let mut state = RunState::new(
+            "library".into(),
+            RunRequest {
+                repo: repository.clone(),
+                issue: "7".into(),
+                issue_text: None,
+                provider: None,
+                policy_acknowledged: false,
+            },
+            "claude".into(),
+        );
+        state.checkpoints.insert(StageId::Repro, record.frozen_commit.clone().unwrap());
+        state.checkpoints.insert(StageId::Fix, candidate.clone());
+        state.frozen_repro = Some(record);
+        let mut ctx = StageCtx {
+            run_dir,
+            state,
+            config,
+            agent,
+            events: EventSink::memory("library"),
+            cancel: CancellationToken::new(),
+        };
+        assert!(ensure_no_ancestor_cargo_config(&repository).is_err());
+        assert_eq!(run_inner(&mut ctx).await.unwrap(), StageOutcome::Completed);
+        assert_eq!(ctx.state.verified_commit.as_deref(), Some(candidate.as_str()));
+        assert!(ctx.run_dir.read("50-verify/lockfile.txt").is_ok());
+        assert!(!repository.join("Cargo.lock").exists(), "the verified commit and agent checkout remain unchanged");
+        let result: VerifyResult = ctx.run_dir.read_json("50-verify/result.json").unwrap();
+        assert!(result.ok);
+        assert_eq!(result.steps.len(), 4);
+        assert_eq!(
+            git::run(&repository, &["worktree", "list", "--porcelain"]).unwrap().matches("worktree ").count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -494,13 +718,15 @@ mod tests {
             "#[test]\nfn issue_7_expected() { assert_eq!(super::value(), 1); }\n",
         )
         .unwrap();
-        let repro_commit = git::commit_all(&repository, "test: reproduce").unwrap();
-        std::fs::write(repository.join("src/lib.rs"), "#[path = \"replacement.rs\"]\npub mod parent;\n").unwrap();
+        // The replacement is already present but dormant at the repro checkpoint,
+        // so adding duplicate declarations is not what this fixture exercises.
         std::fs::write(
             repository.join("src/replacement.rs"),
             "#[cfg(test)]\nmod issue_7_tests { #[test] fn issue_7_expected() {} }\n",
         )
         .unwrap();
+        let repro_commit = git::commit_all(&repository, "test: reproduce").unwrap();
+        std::fs::write(repository.join("src/lib.rs"), "#[path = \"replacement.rs\"]\npub mod parent;\n").unwrap();
         let candidate = git::commit_all(&repository, "fix: redirect the parent module").unwrap();
         let record: ReproRecord = serde_json::from_value(serde_json::json!({
             "reproduced": true, "crate": "lyra_redirect_fixture", "test_file": "src/parent/issue_7_tests.rs",

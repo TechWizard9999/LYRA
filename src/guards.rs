@@ -607,6 +607,94 @@ fn registration_block(content: &str, issue: Option<u64>) -> Option<String> {
     Some(lines[start..=end].join("\n").trim_start_matches('\n').to_string())
 }
 
+fn registration_item(content: &str, issue: Option<u64>) -> Option<syn::ItemMod> {
+    let file = syn::parse_file(content).ok()?;
+    let mut modules = file.items.into_iter().filter_map(|item| match item {
+        syn::Item::Mod(module)
+            if mod_line_issue(&format!("mod {};", module.ident))
+                .is_some_and(|n| issue.is_none_or(|wanted| wanted == n)) =>
+        {
+            Some(module)
+        }
+        _ => None,
+    });
+    let module = modules.next()?;
+    (modules.next().is_none() && module.content.is_none() && module.semi.is_some()).then_some(module)
+}
+
+/// Inspect opaque macro bodies as tokens too: an AST visitor alone does not see
+/// declarations hidden inside macro_rules! definitions or generated include! calls.
+#[derive(Default)]
+struct RegistrationTokens {
+    modules: Vec<String>,
+    includes: Vec<syn::Macro>,
+}
+
+impl syn::parse::Parse for RegistrationTokens {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        use syn::parse::discouraged::Speculative;
+        let mut audit = Self::default();
+        while !input.is_empty() {
+            if input.peek(syn::Token![mod]) {
+                input.parse::<syn::Token![mod]>()?;
+                if input.peek(syn::Ident) {
+                    audit.modules.push(input.parse::<syn::Ident>()?.to_string().trim_start_matches("r#").to_string());
+                }
+                continue;
+            }
+            if input.peek(syn::Ident) {
+                let fork = input.fork();
+                if let Ok(mac) = fork.parse::<syn::Macro>() {
+                    if mac.path.segments.last().is_some_and(|segment| segment.ident == "include") {
+                        input.advance_to(&fork);
+                        audit.includes.push(mac);
+                        continue;
+                    }
+                }
+                input.parse::<syn::Ident>()?;
+                continue;
+            }
+            let nested;
+            if input.peek(syn::token::Brace) {
+                syn::braced!(nested in input);
+            } else if input.peek(syn::token::Bracket) {
+                syn::bracketed!(nested in input);
+            } else if input.peek(syn::token::Paren) {
+                syn::parenthesized!(nested in input);
+            } else {
+                input.step(|cursor| {
+                    cursor.token_tree().map(|(_, next)| ((), next)).ok_or_else(|| cursor.error("expected Rust token"))
+                })?;
+                continue;
+            }
+            let mut inner = nested.parse::<Self>()?;
+            audit.modules.append(&mut inner.modules);
+            audit.includes.append(&mut inner.includes);
+        }
+        Ok(audit)
+    }
+}
+
+fn include_may_load_test(mac: &syn::Macro, source: &str, test_file: &str) -> bool {
+    let Ok(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(path), .. })) = syn::parse2(mac.tokens.clone()) else {
+        // Computed include paths cannot establish which source will be compiled.
+        return true;
+    };
+    let path = path.value().replace('\\', "/");
+    let joined = format!("{}/{}", source.rsplit_once('/').map(|(parent, _)| parent).unwrap_or(""), path);
+    let mut parts = Vec::new();
+    for part in joined.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    parts.join("/") == test_file || path.ends_with(&format!("/{test_file}"))
+}
+
 /// True when `content` registers `issue_<n>_tests` under `#[cfg(test)]` (one line, or the
 /// attribute on the previous non-blank line). `issue = None` accepts any issue number.
 pub fn has_registration_line(content: &str, issue: Option<u64>) -> bool {
@@ -684,9 +772,13 @@ pub fn check_fix_changes_with(
 
     // 2. The entire registration attribute block is frozen, not merely cfg(test).
     if let Some(reg) = rec.registration_file.as_deref().map(norm_path).filter(|s| !s.is_empty()) {
-        let old = read_checkpoint(&reg).and_then(|c| registration_block(&c, issue));
-        let new = read_now(&reg).and_then(|c| registration_block(&c, issue));
-        if old.is_none() || old != new {
+        let old_source = read_checkpoint(&reg).unwrap_or_default();
+        let new_source = read_now(&reg).unwrap_or_default();
+        let old = registration_block(&old_source, issue);
+        let new = registration_block(&new_source, issue);
+        let old_item = registration_item(&old_source, issue);
+        let new_item = registration_item(&new_source, issue);
+        if old.is_none() || old != new || old_item.is_none() || old_item != new_item {
             violations.push(format!("{reg}: the frozen test registration line or its attribute block was changed"));
         }
     }
@@ -694,6 +786,32 @@ pub fn check_fix_changes_with(
     // 3. Per-file rules.
     for (status, raw) in changes {
         let path = norm_path(raw);
+        if path.ends_with(".rs") {
+            if let Some(current) = read_now(&path) {
+                let previous = read_checkpoint(&path).unwrap_or_default();
+                let old = syn::parse_str::<RegistrationTokens>(&previous).unwrap_or_default();
+                match syn::parse_str::<RegistrationTokens>(&current) {
+                    Ok(new) => {
+                        let name = issue.map(|n| format!("issue_{n}_tests"));
+                        if name.as_ref().is_some_and(|name| {
+                            new.modules.iter().filter(|m| *m == name).count()
+                                > old.modules.iter().filter(|m| *m == name).count()
+                        }) {
+                            violations.push(format!("{path}: another declaration of the frozen test module was added"));
+                        }
+                        let mut remaining = old.includes;
+                        for include in new.includes {
+                            if let Some(index) = remaining.iter().position(|old| old == &include) {
+                                remaining.remove(index);
+                            } else if include_may_load_test(&include, &path, &test_file) {
+                                violations.push(format!("{path}: a new include! may reload the frozen test source"));
+                            }
+                        }
+                    }
+                    Err(error) => violations.push(format!("{path}: cannot inspect changed Rust tokens: {error}")),
+                }
+            }
+        }
         if path.split('/').any(|c| c == ".cargo") {
             violations.push(format!("{status} {path}: .cargo/ configuration must not change"));
             continue;
@@ -1189,6 +1307,48 @@ test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; fini
             "pub fn production() {}\n",
             "#[cfg(test)]\npub fn production() {}\n#[cfg(test)] mod issue_123_tests;\n"
         ));
+    }
+
+    #[test]
+    fn fix_cannot_hide_registration_in_a_macro_and_reinclude_with_shadow_functions() {
+        let mut record = rec();
+        record.test_file = "src/issue_123_tests.rs".into();
+        record.registration_file = Some("src/lib.rs".into());
+        let original = "fn buggy_fn() -> bool { false }\n#[cfg(test)]\nmod issue_123_tests;\n";
+        let attack = "fn buggy_fn() -> bool { false }\nmacro_rules! hide { () => {\n#[cfg(test)]\nmod issue_123_tests;\n} }\n#[cfg(test)] mod issue_123_tests { fn buggy_fn() -> bool { true } include!(\"issue_123_tests.rs\"); }\n";
+        // The earlier line-based guard considered the unused macro's declaration frozen.
+        assert_eq!(registration_block(original, Some(123)), registration_block(attack, Some(123)));
+        let test = "use super::*; #[test] fn issue_123_rejects_short_frame() { assert!(buggy_fn()); }";
+        let frozen = HashMap::from([("src/lib.rs", original), ("src/issue_123_tests.rs", test)]);
+        let current = HashMap::from([("src/lib.rs", attack), ("src/issue_123_tests.rs", test)]);
+        let error =
+            check_fix_changes_with(&[("M".into(), "src/lib.rs".into())], &record, &reader(&frozen), &reader(&current))
+                .unwrap_err();
+        assert!(error.contains("registration line"), "{error}");
+    }
+
+    #[test]
+    fn fix_rejects_macro_duplicate_modules_and_new_includes_of_frozen_source() {
+        let mut record = rec();
+        record.test_file = "src/issue_123_tests.rs".into();
+        record.registration_file = Some("src/lib.rs".into());
+        let frozen = HashMap::from([("src/lib.rs", LIB_REG), ("src/issue_123_tests.rs", "#[test] fn regression() {}")]);
+        for (changed, expected) in [
+            (format!("{LIB_REG}\nmacro_rules! duplicate {{ () => {{ mod issue_123_tests {{}} }} }}"), "another declaration"),
+            (format!("{LIB_REG}\nmod shadow {{ include!(\"issue_123_tests.rs\"); }}"), "new include!"),
+            (format!("{LIB_REG}\nmod shadow {{ include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/issue_123_tests.rs\")); }}"), "new include!"),
+        ] {
+            let current = HashMap::from([("src/lib.rs", changed.as_str()), ("src/issue_123_tests.rs", "#[test] fn regression() {}")]);
+            let error = check_fix_changes_with(&[("M".into(), "src/lib.rs".into())], &record, &reader(&frozen), &reader(&current)).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+        let harmless = format!("{LIB_REG}\nfn fixed() {{ let _ = \"mod issue_123_tests; include!(other)\"; }}\ninclude!(\"generated.rs\");");
+        let current = HashMap::from([
+            ("src/lib.rs", harmless.as_str()),
+            ("src/issue_123_tests.rs", "#[test] fn regression() {}"),
+        ]);
+        check_fix_changes_with(&[("M".into(), "src/lib.rs".into())], &record, &reader(&frozen), &reader(&current))
+            .unwrap();
     }
 
     #[test]

@@ -42,6 +42,7 @@ impl CodexAgent {
             "features.apps=false",
             "features.multi_agent=false",
             "features.shell_snapshot=false",
+            "features.shell_tool=false",
             "web_search=\"disabled\"",
             "allow_login_shell=false",
             "project_doc_max_bytes=0",
@@ -62,7 +63,7 @@ impl CodexAgent {
         spec = match task.mode {
             // Codex reads/searches via shell tools. Read-only stages instead receive
             // bounded source evidence from the harness, so no model commands are needed.
-            Mode::ReadOnly => spec.args(["--sandbox", "read-only", "-c", "features.shell_tool=false"]),
+            Mode::ReadOnly => spec.args(["--sandbox", "read-only"]),
             Mode::Edit => spec.args(["--sandbox", "workspace-write"]),
         };
         if task.schema.is_some() {
@@ -490,6 +491,7 @@ mod tests {
         assert_eq!(spec.program, "/opt/codex.cmd");
         let a = &spec.args;
         assert!(a.windows(2).any(|p| p == ["--sandbox", "workspace-write"]));
+        assert!(a.windows(2).any(|p| p == ["-c", "features.shell_tool=false"]));
         assert!(!a.iter().any(|x| x == "--output-schema" || x == "-m"));
         assert_eq!(a[a.len() - 3], "-o");
         assert_eq!(a.last().map(String::as_str), Some("-"));

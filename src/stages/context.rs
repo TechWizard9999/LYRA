@@ -91,6 +91,7 @@ async fn context(ctx: &mut StageCtx) -> Result<(), StageError> {
         )
         .map_err(|e| StageError::from_anyhow(ErrorKind::Config, e))?;
     let head_before = git::head(&wt).map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
+    let before = readonly_snapshot(&wt)?;
     let out = run_readonly(ctx, StageId::Context, prompt, assets::CONTEXT_SCHEMA).await?;
     let summary = out.structured.unwrap_or(Value::Null);
     let rel = ctx
@@ -98,7 +99,7 @@ async fn context(ctx: &mut StageCtx) -> Result<(), StageError> {
         .write_json(format!("{DIR}/summary.json"), &summary)
         .map_err(|e| StageError::from_anyhow(ErrorKind::Io, e))?;
     ctx.events.artifact(rel);
-    readonly_guard(&wt, &head_before)?;
+    readonly_guard(&wt, &head_before, &before)?;
     if !summary.get("candidate_files").is_some_and(Value::is_array) {
         return Err(StageError::new(ErrorKind::Schema, "context summary has no candidate_files array"));
     }
@@ -141,12 +142,21 @@ pub(crate) async fn run_readonly(
     Ok(out)
 }
 
-/// Change detection for read-only stages: clean worktree and unchanged HEAD.
-pub(crate) fn readonly_guard(wt: &Path, head_before: &str) -> Result<(), StageError> {
-    let changes = git::changed_files(wt, head_before).map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
+pub(crate) type ReadonlySnapshot = (super::verify::SourceSnapshot, String);
+
+pub(crate) fn readonly_snapshot(wt: &Path) -> Result<ReadonlySnapshot, StageError> {
+    let files = super::verify::source_snapshot(wt).map_err(|e| StageError::from_anyhow(ErrorKind::Io, e))?;
+    // Preserve detection of tracked mode changes as well as file contents.
+    let diff = git::diff(wt, "HEAD", None).map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
+    Ok((files, diff))
+}
+
+/// Detect changes to existing files too, while allowing unchanged build outputs.
+pub(crate) fn readonly_guard(wt: &Path, head_before: &str, before: &ReadonlySnapshot) -> Result<(), StageError> {
+    let now = readonly_snapshot(wt)?;
     let head = git::head(wt).map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
-    if !changes.is_empty() || head != head_before {
-        let status = format!("{changes:?}");
+    if &now != before || head != head_before {
+        let status = "file contents or entries changed";
         return Err(StageError::new(
             ErrorKind::Guard,
             format!(
@@ -510,15 +520,24 @@ Also see crates/core/src/lib.rs and "expected a non-empty header line". `src/par
         git::run(p, &["config", "user.name", "T"]).unwrap();
         std::fs::write(p.join("a.txt"), "a").unwrap();
         let head = git::commit_all(p, "init").unwrap();
-        assert!(readonly_guard(p, &head).is_ok());
+        let before = readonly_snapshot(p).unwrap();
+        assert!(readonly_guard(p, &head, &before).is_ok());
         std::fs::write(p.join("b.txt"), "b").unwrap();
-        assert_eq!(readonly_guard(p, &head).unwrap_err().kind, ErrorKind::Guard);
+        assert_eq!(readonly_guard(p, &head, &before).unwrap_err().kind, ErrorKind::Guard);
+        // Cargo may have generated ignored files before RCA. Unchanged outputs
+        // are allowed, but modifying their contents must still be detected.
+        std::fs::write(p.join(".git/info/exclude"), ".cargo/\nCargo.lock\n").unwrap();
+        std::fs::write(p.join("Cargo.lock"), "generated before agent\n").unwrap();
+        let generated = readonly_snapshot(p).unwrap();
+        assert!(readonly_guard(p, &head, &generated).is_ok());
+        std::fs::write(p.join("Cargo.lock"), "changed by agent\n").unwrap();
+        assert_eq!(readonly_guard(p, &head, &generated).unwrap_err().kind, ErrorKind::Guard);
         git::reset_hard_clean(p, &head).unwrap();
         std::fs::write(p.join(".git/info/exclude"), ".cargo/\n").unwrap();
         std::fs::create_dir(p.join(".cargo")).unwrap();
         std::fs::write(p.join(".cargo/config.toml"), "[alias]\n").unwrap();
         assert!(git::is_clean(p).unwrap(), "the status-only check misses ignored files");
-        assert_eq!(readonly_guard(p, &head).unwrap_err().kind, ErrorKind::Guard);
+        assert_eq!(readonly_guard(p, &head, &before).unwrap_err().kind, ErrorKind::Guard);
     }
 
     #[test]

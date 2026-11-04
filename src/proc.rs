@@ -325,10 +325,11 @@ fn append_bounded(dst: &mut String, line: &str) -> bool {
         end -= 1;
     }
     dst.push_str(&line[..end]);
-    if dst.len() < MAX_CAPTURE_BYTES {
+    let terminator = usize::from(!line.ends_with('\0'));
+    if terminator != 0 && dst.len() < MAX_CAPTURE_BYTES {
         dst.push('\n');
     }
-    end < line.len() || line.len().saturating_add(1) > remaining
+    end < line.len() || line.len().saturating_add(terminator) > remaining
 }
 
 enum PipeEvent {
@@ -353,7 +354,10 @@ async fn read_pipe<R: AsyncRead + Unpin>(mut reader: R, tx: tokio::sync::mpsc::S
             }
         };
         for byte in &chunk[..n] {
-            if *byte == b'\n' {
+            if *byte == b'\n' || *byte == 0 {
+                if *byte == 0 && !discarding {
+                    pending.push(0);
+                }
                 if !discarding && !send_pipe_line(&tx, &pending, stdout).await {
                     return;
                 }
@@ -584,6 +588,22 @@ mod tests {
     fn display_quotes_spaces() {
         let s = CommandSpec::new("claude", ".").args(["-p", "hello world"]);
         assert_eq!(s.display(), "claude -p \"hello world\"");
+    }
+
+    #[tokio::test]
+    async fn nul_records_exceeding_line_limit_preserve_exact_output() {
+        let payload = format!("{}\0", "p".repeat(1024)).repeat(2048);
+        assert!(payload.len() > MAX_LINE_BYTES);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+        read_pipe(payload.as_bytes(), tx, true).await;
+        let mut captured = String::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                PipeEvent::Line(StreamLine::Stdout(record)) => assert!(!append_bounded(&mut captured, &record)),
+                _ => panic!("complete NUL records must not truncate"),
+            }
+        }
+        assert_eq!(captured, payload);
     }
 
     #[test]
