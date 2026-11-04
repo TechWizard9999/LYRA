@@ -7,7 +7,7 @@
 //! while top-level `error` events may be followed by a successful runtime retry.
 
 use super::claude::{exit_str, fmt_duration, head, one_line, push_tail, tail, with_stderr, SUMMARY_CHARS};
-use super::{append_transcript, validate_extra_args, validate_output, Agent, AgentOutput, AgentTask, Mode};
+use super::{validate_extra_args, validate_output, Agent, AgentOutput, AgentTask, Mode, Transcript};
 use crate::config::ProviderConfig;
 use crate::events::{AgentEvent, EventSink, StageId};
 use crate::proc::{self, CommandOutput, CommandSpec, StreamLine};
@@ -114,7 +114,10 @@ impl Agent for CodexAgent {
             std::fs::write(&path, serde_json::to_string_pretty(schema)?)
                 .with_context(|| format!("writing {}", path.display()))?;
         }
-        append_transcript(&task.transcript, &format!("# {}", spec.display()));
+        let mut transcript = Transcript::open(&task.transcript)?;
+        transcript.append(&format!("# {}", spec.display()))?;
+        let mut transcript_error = None;
+        let mut truncation_reported = false;
 
         let mut message: Option<String> = None;
         let mut turn_completed: Option<Usage> = None;
@@ -123,33 +126,49 @@ impl Agent for CodexAgent {
         let mut tool_calls = 0usize;
         let mut stderr_tail: Vec<String> = Vec::new();
 
-        let out = proc::run_streaming(&spec, task.timeout, &task.cancel, |line| match line {
-            StreamLine::Stdout(l) => {
-                append_transcript(&task.transcript, &l);
-                for parsed in parse_line(&l) {
-                    match parsed {
-                        Parsed::Event(ev) => {
-                            match &ev {
-                                AgentEvent::Started { .. } => started = true,
-                                AgentEvent::ToolCall { .. } => tool_calls += 1,
-                                _ => {}
+        let out = proc::run_streaming(&spec, task.timeout, &task.cancel, |line| {
+            let raw = match &line {
+                StreamLine::Stdout(line) => line.clone(),
+                StreamLine::Stderr(line) => format!("stderr: {line}"),
+            };
+            if transcript_error.is_none() {
+                if let Err(error) = transcript.append(&raw) {
+                    transcript_error = Some(error);
+                }
+            }
+            if transcript.truncated && !truncation_reported {
+                events.warn("provider transcript reached 8 MiB; remaining raw output omitted");
+                truncation_reported = true;
+            }
+            match line {
+                StreamLine::Stdout(l) => {
+                    for parsed in parse_line(&l) {
+                        match parsed {
+                            Parsed::Event(ev) => {
+                                match &ev {
+                                    AgentEvent::Started { .. } => started = true,
+                                    AgentEvent::ToolCall { .. } => tool_calls += 1,
+                                    _ => {}
+                                }
+                                self.emit(events, task.stage, ev);
                             }
-                            self.emit(events, task.stage, ev);
-                        }
-                        Parsed::Message(text) => message = Some(text),
-                        Parsed::TurnCompleted(usage) => turn_completed = Some(usage),
-                        Parsed::Failed(msg) => {
-                            failure.get_or_insert(msg);
+                            Parsed::Message(text) => message = Some(text),
+                            Parsed::TurnCompleted(usage) => turn_completed = Some(usage),
+                            Parsed::Failed(msg) => {
+                                failure.get_or_insert(msg);
+                            }
                         }
                     }
                 }
-            }
-            StreamLine::Stderr(l) => {
-                append_transcript(&task.transcript, &format!("stderr: {l}"));
-                push_tail(&mut stderr_tail, l);
+                StreamLine::Stderr(l) => {
+                    push_tail(&mut stderr_tail, l);
+                }
             }
         })
         .await?;
+        if let Some(error) = transcript_error {
+            return Err(error.context("writing provider transcript"));
+        }
 
         if !started {
             self.emit(events, task.stage, AgentEvent::Started { session: None });

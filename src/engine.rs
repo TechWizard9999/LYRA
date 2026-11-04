@@ -215,7 +215,13 @@ impl Engine {
         let mut out = Vec::new();
         if let Ok(rd) = std::fs::read_dir(runs_dir(&self.home)) {
             for e in rd.flatten() {
-                if let Ok(st) = RunState::load(&e.path()) {
+                let name = e.file_name();
+                let Some(id) = name.to_str() else { continue };
+                let Ok(directory) = self.run_dir(id) else { continue };
+                if !e.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    continue;
+                }
+                if let Ok(st) = RunState::load(&directory.root) {
                     out.push(st);
                 }
             }
@@ -527,6 +533,43 @@ mod tests {
         }
         drop(one);
         two.mark_interrupted().unwrap();
+    }
+
+    #[test]
+    fn list_rejects_invalid_directory_names() {
+        let home = tempfile::tempdir().unwrap();
+        let engine = Engine::new(home.path().into(), Config::default());
+        let directory = runs_dir(home.path()).join("invalid.name");
+        std::fs::create_dir_all(&directory).unwrap();
+        let request = RunRequest {
+            repo: PathBuf::from("."),
+            issue: "1".into(),
+            issue_text: None,
+            provider: None,
+            policy_acknowledged: false,
+        };
+        RunState::new("invalid.name".into(), request, "claude".into()).save(&directory).unwrap();
+        assert!(engine.list().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_does_not_follow_run_directory_symlinks() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let engine = Engine::new(home.path().into(), Config::default());
+        let request = RunRequest {
+            repo: PathBuf::from("."),
+            issue: "1".into(),
+            issue_text: None,
+            provider: None,
+            policy_acknowledged: false,
+        };
+        RunState::new("linked".into(), request, "claude".into()).save(outside.path()).unwrap();
+        std::fs::create_dir_all(runs_dir(home.path())).unwrap();
+        std::os::unix::fs::symlink(outside.path(), runs_dir(home.path()).join("linked")).unwrap();
+        assert!(engine.list().is_empty());
+        assert_eq!(engine.mark_interrupted().unwrap(), 0);
     }
 
     #[test]

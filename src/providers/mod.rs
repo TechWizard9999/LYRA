@@ -110,15 +110,45 @@ pub(crate) fn validate_extra_args(args: &[String], valued: &[&str], flags: &[&st
     Ok(())
 }
 
-/// Appends a raw line to the transcript file (best effort).
-pub(crate) fn append_transcript(path: &PathBuf, line: &str) {
-    use std::io::Write;
-    if let Some(p) = path.parent() {
-        let _ = std::fs::create_dir_all(p);
+const MAX_TRANSCRIPT_BYTES: u64 = 8 * 1024 * 1024;
+const TRANSCRIPT_TRUNCATED: &[u8] = b"# transcript truncated: remaining provider output omitted\n";
+
+/// Retain bounded raw evidence while continuing to parse the provider stream.
+pub(crate) struct Transcript {
+    file: std::fs::File,
+    written: u64,
+    pub truncated: bool,
+}
+
+impl Transcript {
+    pub fn open(path: &std::path::Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let written = file.metadata()?.len();
+        Ok(Self { file, written, truncated: false })
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = f.write_all(line.as_bytes());
-        let _ = f.write_all(b"\n");
+
+    pub fn append(&mut self, line: &str) -> Result<()> {
+        use std::io::Write;
+        if self.truncated {
+            return Ok(());
+        }
+        let limit = MAX_TRANSCRIPT_BYTES - TRANSCRIPT_TRUNCATED.len() as u64;
+        if self.written.saturating_add(line.len() as u64).saturating_add(1) > limit {
+            // Also bound transcripts left by older versions before resuming appends.
+            if self.written > limit {
+                self.file.set_len(limit)?;
+            }
+            self.file.write_all(TRANSCRIPT_TRUNCATED)?;
+            self.truncated = true;
+        } else {
+            self.file.write_all(line.as_bytes())?;
+            self.file.write_all(b"\n")?;
+            self.written += line.len() as u64 + 1;
+        }
+        Ok(())
     }
 }
 
@@ -126,6 +156,30 @@ pub(crate) fn append_transcript(path: &PathBuf, line: &str) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn transcript_retention_is_bounded_and_marks_truncation_once() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("transcript.jsonl");
+        let mut transcript = Transcript::open(&path).unwrap();
+        transcript.append("first record").unwrap();
+        let record = "x".repeat(1024 * 1024);
+        for _ in 0..20 {
+            transcript.append(&record).unwrap();
+        }
+        assert!(transcript.truncated);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.len() as u64 <= MAX_TRANSCRIPT_BYTES);
+        assert!(contents.starts_with("first record\n"));
+        assert_eq!(contents.matches("# transcript truncated:").count(), 1);
+    }
+
+    #[test]
+    fn transcript_creation_errors_are_returned() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file"), "not a directory").unwrap();
+        assert!(Transcript::open(&root.path().join("file/transcript.jsonl")).is_err());
+    }
 
     #[test]
     fn schema_validation_rejects_empty_wrong_types_and_unknown_enum() {

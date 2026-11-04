@@ -5,7 +5,7 @@
 //! as normalised `AgentEvent`s. The terminal `{"type":"result"}` line carries the final text,
 //! the structured output and the failure signals (`subtype`, `is_error`, `permission_denials`).
 
-use super::{append_transcript, validate_extra_args, validate_output, Agent, AgentOutput, AgentTask, Mode};
+use super::{validate_extra_args, validate_output, Agent, AgentOutput, AgentTask, Mode, Transcript};
 use crate::config::{ClaudeAuth, ProviderConfig};
 use crate::events::{AgentEvent, EventSink, StageId};
 use crate::proc::{self, CommandOutput, CommandSpec, StreamLine};
@@ -94,7 +94,10 @@ impl Agent for ClaudeAgent {
         validate_extra_args(&self.cfg.extra_args, &["--effort"], &[])?;
         let mut spec = self.build_command(&task);
         spec.program = proc::resolve_program(&spec.program)?.to_string_lossy().into_owned();
-        append_transcript(&task.transcript, &format!("# {}", spec.display()));
+        let mut transcript = Transcript::open(&task.transcript)?;
+        transcript.append(&format!("# {}", spec.display()))?;
+        let mut transcript_error = None;
+        let mut truncation_reported = false;
 
         let mut parser = ClaudeParser::default();
         let mut result: Option<ResultLine> = None;
@@ -102,29 +105,45 @@ impl Agent for ClaudeAgent {
         let mut tool_calls = 0usize;
         let mut stderr_tail: Vec<String> = Vec::new();
 
-        let out = proc::run_streaming(&spec, task.timeout, &task.cancel, |line| match line {
-            StreamLine::Stdout(l) => {
-                append_transcript(&task.transcript, &l);
-                for parsed in parser.parse_line(&l) {
-                    match parsed {
-                        Parsed::Event(ev) => {
-                            match &ev {
-                                AgentEvent::Started { .. } => started = true,
-                                AgentEvent::ToolCall { .. } => tool_calls += 1,
-                                _ => {}
-                            }
-                            self.emit(events, task.stage, ev);
-                        }
-                        Parsed::Result(r) => result = Some(r),
-                    }
+        let out = proc::run_streaming(&spec, task.timeout, &task.cancel, |line| {
+            let raw = match &line {
+                StreamLine::Stdout(line) => line.clone(),
+                StreamLine::Stderr(line) => format!("stderr: {line}"),
+            };
+            if transcript_error.is_none() {
+                if let Err(error) = transcript.append(&raw) {
+                    transcript_error = Some(error);
                 }
             }
-            StreamLine::Stderr(l) => {
-                append_transcript(&task.transcript, &format!("stderr: {l}"));
-                push_tail(&mut stderr_tail, l);
+            if transcript.truncated && !truncation_reported {
+                events.warn("provider transcript reached 8 MiB; remaining raw output omitted");
+                truncation_reported = true;
+            }
+            match line {
+                StreamLine::Stdout(l) => {
+                    for parsed in parser.parse_line(&l) {
+                        match parsed {
+                            Parsed::Event(ev) => {
+                                match &ev {
+                                    AgentEvent::Started { .. } => started = true,
+                                    AgentEvent::ToolCall { .. } => tool_calls += 1,
+                                    _ => {}
+                                }
+                                self.emit(events, task.stage, ev);
+                            }
+                            Parsed::Result(r) => result = Some(r),
+                        }
+                    }
+                }
+                StreamLine::Stderr(l) => {
+                    push_tail(&mut stderr_tail, l);
+                }
             }
         })
         .await?;
+        if let Some(error) = transcript_error {
+            return Err(error.context("writing provider transcript"));
+        }
 
         if !started {
             self.emit(events, task.stage, AgentEvent::Started { session: None });
