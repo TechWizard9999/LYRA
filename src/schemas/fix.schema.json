@@ -1,0 +1,21 @@
+{
+  "type": "object",
+  "description": "Result of the fix stage: what changed to make the locked test pass.",
+  "additionalProperties": false,
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "One or two sentences: what was wrong and what was changed. Goes into the pull request body."
+    },
+    "files_changed": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Repository-relative paths that were modified or added."
+    },
+    "notes": {
+      "type": "string",
+      "description": "What a reviewer should know: trade-offs, follow-ups, other tests touched and why."
+    }
+  },
+  "required": ["summary", "files_changed", "notes"]
+}

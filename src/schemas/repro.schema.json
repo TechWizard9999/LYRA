@@ -1,0 +1,44 @@
+{
+  "type": "object",
+  "description": "Result of the repro stage: one failing test that proves the issue.",
+  "additionalProperties": false,
+  "properties": {
+    "reproduced": {
+      "type": "boolean",
+      "description": "True when a test has been prepared for the harness to execute and check against the expected assertion. The harness, not the agent, decides whether it reproduces."
+    },
+    "crate": {
+      "type": "string",
+      "description": "Cargo package name of the crate holding the test, as accepted by `cargo test -p`."
+    },
+    "test_file": {
+      "type": "string",
+      "description": "Repository-relative path of the new test file, forward slashes (e.g. tests/issue_123.rs or src/parser/issue_123_tests.rs)."
+    },
+    "test_name": {
+      "type": "string",
+      "description": "The test's name exactly as cargo prints it: the bare function name for an integration test, the module path for a unit-test module (e.g. parser::issue_123_tests::issue_123_rejects_short_frame)."
+    },
+    "command": {
+      "type": "string",
+      "description": "cargo test -p <crate> <test_name> -- --exact"
+    },
+    "expected": {
+      "type": "string",
+      "description": "Short verbatim substring of the failing output that proves the bug (assertion message or panic text). No paths, line numbers or timings. Must be non-empty when reproduced is true."
+    },
+    "observed": {
+      "type": "string",
+      "description": "What actually happened when the command was run (key output lines)."
+    },
+    "registration_file": {
+      "type": ["string", "null"],
+      "description": "For a unit-test module: the existing source file that received the `#[cfg(test)] mod issue_<n>_tests;` line. Null for an integration test."
+    },
+    "notes": {
+      "type": "string",
+      "description": "What the fixer should know; when reproduced is false, why the issue could not be reproduced."
+    }
+  },
+  "required": ["reproduced", "crate", "test_file", "test_name", "command", "expected", "observed", "registration_file", "notes"]
+}

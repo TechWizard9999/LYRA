@@ -1,0 +1,36 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["result", "culprits", "mechanism", "evidence", "introduced_by", "fix_sketch", "confidence"],
+  "properties": {
+    "result": { "type": "string", "enum": ["supported", "unresolved"] },
+    "culprits": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "symbol", "lines"],
+        "properties": {
+          "file": { "type": "string" },
+          "symbol": { "type": "string" },
+          "lines": { "type": "array", "items": { "type": "integer" } }
+        }
+      }
+    },
+    "mechanism": { "type": "string" },
+    "evidence": { "type": "array", "items": { "type": "string" } },
+    "introduced_by": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["commit"],
+          "properties": { "commit": { "type": "string" } }
+        },
+        { "type": "null" }
+      ]
+    },
+    "fix_sketch": { "type": "string" },
+    "confidence": { "type": "number" }
+  }
+}
