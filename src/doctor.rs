@@ -164,12 +164,21 @@ pub async fn run(config: &Config) -> Report {
         Ok(v) => r.push(true, format!("git: {v}")),
         Err(e) => r.push(false, format!("git: {e}")),
     }
-    // Each built-in execution profile names the tools it runs on the target repository.
+    // Each built-in execution profile names the tools it runs on the target repository. A
+    // machine only needs the tools of the repositories it works on, so a missing tool is
+    // reported but does not fail the check; Intake refuses a run whose profile lacks them.
     for profile in crate::profile::builtin() {
         for tool in profile.required_tools() {
             match version(tool).await {
                 Ok(v) => r.push(true, format!("{tool} ({} profile): {v}", profile.id())),
-                Err(e) => r.push(false, format!("{tool} ({} profile): {e}", profile.id())),
+                Err(e) => r.push(
+                    true,
+                    format!(
+                        "{tool} ({} profile): not available, needed only for {} repositories ({e})",
+                        profile.id(),
+                        profile.id()
+                    ),
+                ),
             }
         }
     }

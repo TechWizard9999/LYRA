@@ -98,7 +98,20 @@ fn intake(ctx: &mut StageCtx) -> Result<(), StageError> {
     ctx.events.info(format!("worktree {} on {branch} from {default} @ {}", wt.display(), git::short(&base)));
 
     // Execution profile (PLAN §13): resolved once from the worktree, frozen for the run.
-    let (resolved, _) = crate::profile::resolve(&wt).map_err(|reason| StageError::fatal(ErrorKind::Config, reason))?;
+    let (resolved, profile) =
+        crate::profile::resolve(&wt).map_err(|reason| StageError::fatal(ErrorKind::Config, reason))?;
+    let missing = crate::profile::missing_tools(&*profile);
+    if !missing.is_empty() {
+        // Retryable: installing the tool or activating the right environment fixes it.
+        return Err(StageError::new(
+            ErrorKind::Config,
+            format!(
+                "the {} profile needs {} on PATH; install it (or activate the environment that has it) and retry",
+                resolved.id,
+                missing.join(", ")
+            ),
+        ));
+    }
     let p = ctx.run_dir.write_json("profile.json", &resolved).map_err(io_err)?;
     ctx.events.artifact(p);
     ctx.events.info(format!("execution profile: {} ({})", resolved.id, resolved.evidence.join(", ")));

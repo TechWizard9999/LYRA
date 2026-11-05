@@ -555,19 +555,39 @@ mod tests {
 
     #[test]
     fn prompt_renders_with_and_without_context() {
-        let mut env = minijinja::Environment::new();
-        env.add_template("repro.md", assets::REPRO_PROMPT).unwrap();
-        let t = env.get_template("repro.md").unwrap();
-        let full = t
-            .render(json!({"issue": "# Bug", "context_summary": "{\"crate\":\"foo\"}", "instructions": "use fmt", "repo_json": "{}", "issue_number": 7}))
-            .unwrap();
+        use crate::profile::python_pytest::PythonPytest;
+        use crate::stages::render_prompt;
+        let render = |profile: &dyn ExecutionProfile, values| {
+            render_prompt(profile, "repro.md", assets::REPRO_PROMPT, values).unwrap()
+        };
+        let full = render(
+            &RustCargo,
+            json!({"issue": "# Bug", "context_summary": "{\"crate\":\"foo\"}", "instructions": "use fmt", "repo_json": "{}", "issue_number": 7}),
+        );
+        assert!(full.contains("in the Rust repository"));
         assert!(full.contains("tests/issue_7.rs"));
         assert!(full.contains("mod issue_7_tests;"));
         assert!(full.contains("Repository instructions"));
         assert!(full.contains("use fmt"));
-        let bare = t.render(json!({"issue": "# Bug", "context_summary": "", "instructions": "", "repo_json": "", "issue_number": 7})).unwrap();
+        assert!(full.contains("the crate most likely involved"));
+        let bare = render(
+            &RustCargo,
+            json!({"issue": "# Bug", "context_summary": "", "instructions": "", "repo_json": "", "issue_number": 7}),
+        );
         assert!(!bare.contains("Repository instructions"));
         assert!(!bare.contains("Repository facts"));
         assert!(bare.contains("-- --exact"));
+
+        let python = render(
+            &PythonPytest,
+            json!({"issue": "# Bug", "context_summary": "{}", "instructions": "", "repo_json": "{}", "issue_number": 7}),
+        );
+        assert!(python.contains("in the Python repository"));
+        assert!(python.contains("`test_issue_7.py`"));
+        assert!(python.contains("tests/test_issue_7.py::test_issue_7_rejects_short_frame"));
+        assert!(python.contains("registration_file`: null"));
+        for rust in ["cargo", "Cargo.toml", "#[test]", "crate most likely"] {
+            assert!(!python.contains(rust), "{rust} leaked into the Python prompt");
+        }
     }
 }

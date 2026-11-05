@@ -4,7 +4,7 @@
 //! that used to live in the stages and guards lives here (PLAN §13).
 
 use super::{Discovery, ExecutionProfile, FileReader, Preparation, RegressionOutcome, ResolvedProfile, VerifyStep};
-use crate::config::VerifyConfig;
+use crate::config::{VerifyCommands, VerifyConfig};
 use crate::guards::{self, ReproRecord};
 use crate::proc::{self, CommandOutput, CommandSpec};
 use async_trait::async_trait;
@@ -38,6 +38,12 @@ impl ExecutionProfile for RustCargo {
     }
     fn required_tools(&self) -> &'static [&'static str] {
         &["cargo", "rustfmt"]
+    }
+    fn language(&self) -> &'static str {
+        "Rust"
+    }
+    fn prompt_macros(&self) -> &'static str {
+        include_str!("../prompts/profiles/rust-cargo.md")
     }
 
     fn is_source_file(&self, path: &Path) -> bool {
@@ -166,10 +172,18 @@ impl ExecutionProfile for RustCargo {
     }
     fn verification_steps(
         &self,
-        verify: &VerifyConfig,
+        verify: &VerifyCommands,
         rec: &ReproRecord,
         worktree: &Path,
     ) -> Result<Vec<VerifyStep>, String> {
+        // `None` falls back to the historical defaults, which the operator's top-level
+        // `[verify]` table normally supplies already (Config::verify_commands).
+        let defaults = VerifyConfig::default();
+        let verify = VerifyConfig {
+            build: verify.build.clone().unwrap_or(defaults.build),
+            test: verify.test.clone().unwrap_or(defaults.test),
+            fmt: verify.fmt.clone().unwrap_or(defaults.fmt),
+        };
         let line = |name: &str, line: &str| {
             CommandSpec::from_line(line, worktree).map_err(|_| format!("verify step '{name}' has an empty command"))
         };
@@ -1125,11 +1139,11 @@ test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; fini
         let repro = p.reproduction_environment(CommandSpec::new("cargo", "wt"), Path::new("run"));
         assert!(repro.clear_env);
         assert!(repro.env.iter().any(|(k, v)| k == "CARGO_TARGET_DIR" && v.ends_with("repro-target")));
-        let steps = p.verification_steps(&VerifyConfig::default(), &r, Path::new("wt")).unwrap();
+        let steps = p.verification_steps(&VerifyCommands::default(), &r, Path::new("wt")).unwrap();
         assert_eq!(steps.iter().map(|s| s.name).collect::<Vec<_>>(), vec!["build", "repro", "tests", "fmt"]);
         assert!(steps[1].regression && !steps[0].regression);
         assert_eq!(steps[1].spec.args, spec.args);
-        let empty = VerifyConfig { build: String::new(), ..VerifyConfig::default() };
+        let empty = VerifyCommands { build: Some(String::new()), ..VerifyCommands::default() };
         assert!(p.verification_steps(&empty, &r, Path::new("wt")).err().unwrap().contains("build"));
         let dir = tempfile::tempdir().unwrap();
         assert!(p.preparation(dir.path(), &|_| true).is_none());

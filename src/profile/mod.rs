@@ -2,8 +2,8 @@
 //! repository's toolchain and test runner, behind one runner-neutral contract. The
 //! engine, the seven stages and the guards call this contract; they never name Cargo.
 //!
-//! Two concerns live behind the same trait object because one built-in profile serves
-//! both today, but they are kept distinct in the method groups below: the
+//! Two concerns live behind the same trait object because each built-in profile pairs one
+//! toolchain with one runner today, but they are kept distinct in the method groups below: the
 //! **project/toolchain profile** (source and manifest patterns, repository description,
 //! environment preparation, verification commands) and the **test-runner integration**
 //! (exact test identity, selection, discovery binding, evidence classification, the
@@ -12,11 +12,12 @@
 //! Resolution happens once, in intake, from files that exist in the worktree. The
 //! result is saved as [`ResolvedProfile`] in `run.json` and `artifacts/profile.json`
 //! and is frozen for the run. Saved runs from before this contract carry no profile;
-//! [`for_state`] maps them explicitly to the only profile that ever existed.
+//! [`for_state`] maps them explicitly to `rust-cargo`, the only profile that existed then.
 
+pub mod python_pytest;
 pub mod rust_cargo;
 
-use crate::config::VerifyConfig;
+use crate::config::VerifyCommands;
 use crate::guards::ReproRecord;
 use crate::proc::{CommandOutput, CommandSpec};
 use crate::state::RunState;
@@ -95,8 +96,13 @@ pub type FileReader<'a> = &'a dyn Fn(&str) -> Option<String>;
 #[async_trait]
 pub trait ExecutionProfile: Send + Sync {
     fn id(&self) -> &'static str;
-    /// Executables `lyra doctor` checks for this profile.
+    /// Executables Intake requires for a run with this profile; `lyra doctor` reports them.
     fn required_tools(&self) -> &'static [&'static str];
+    /// The target language as prompts name it ("Rust", "Python").
+    fn language(&self) -> &'static str;
+    /// The profile's prompt passages: a minijinja file of macros from `src/prompts/profiles/`
+    /// that every stage prompt imports as `profile` (see PLAN §13.4).
+    fn prompt_macros(&self) -> &'static str;
 
     // --- project / toolchain -------------------------------------------------------
 
@@ -174,10 +180,11 @@ pub trait ExecutionProfile: Send + Sync {
     /// An optional baseline preparation when the checkout lacks a generated input;
     /// `present(path)` tells whether a worktree-relative file exists.
     fn preparation(&self, worktree: &Path, present: &dyn Fn(&Path) -> bool) -> Option<Preparation>;
-    /// The verification commands, in order, built in `worktree`.
+    /// The verification commands, in order, built in `worktree`. `verify` holds the configured
+    /// commands for this profile (`None` = the profile's default; see `Config::verify_commands`).
     fn verification_steps(
         &self,
-        verify: &VerifyConfig,
+        verify: &VerifyCommands,
         rec: &ReproRecord,
         worktree: &Path,
     ) -> Result<Vec<VerifyStep>, String>;
@@ -187,7 +194,7 @@ pub trait ExecutionProfile: Send + Sync {
 
 /// All built-in profiles, in detection order.
 pub fn builtin() -> Vec<Box<dyn ExecutionProfile>> {
-    vec![Box::new(rust_cargo::RustCargo)]
+    vec![Box::new(rust_cargo::RustCargo), Box::new(python_pytest::PythonPytest)]
 }
 
 /// The built-in profile with this id.
@@ -195,19 +202,29 @@ pub fn by_id(id: &str) -> Option<Box<dyn ExecutionProfile>> {
     builtin().into_iter().find(|p| p.id() == id)
 }
 
-/// Detects the profile of an existing worktree from the files present. Explicit
-/// repository/operator configuration takes precedence in later phases; today the
-/// built-in detectors are the only source, and nothing is executed.
+/// Detects the profile of an existing worktree from the files present, in [`builtin`]
+/// order: a root `Cargo.toml` wins over pytest evidence, so a Rust project that also ships
+/// Python tooling keeps its Rust behaviour. Explicit repository/operator selection comes in a
+/// later phase; today the built-in detectors are the only source, and nothing is executed.
 pub fn resolve(worktree: &Path) -> Result<(ResolvedProfile, Box<dyn ExecutionProfile>), String> {
     if let Some(resolved) = rust_cargo::detect(worktree) {
         return Ok((resolved, Box::new(rust_cargo::RustCargo)));
     }
+    if let Some(resolved) = python_pytest::detect(worktree) {
+        return Ok((resolved, Box::new(python_pytest::PythonPytest)));
+    }
     Err(format!(
-        "no built-in execution profile matches this repository (looked for {}); supported profiles: {}. \
+        "no built-in execution profile matches this repository (looked for {}; or {}); supported profiles: {}. \
          Other languages onboard through a profile, see docs/PLAN.md §13",
         rust_cargo::DETECTION,
+        python_pytest::DETECTION,
         builtin().iter().map(|p| p.id()).collect::<Vec<_>>().join(", ")
     ))
+}
+
+/// Executables from `profile.required_tools()` that cannot be found on `PATH`.
+pub fn missing_tools(profile: &dyn ExecutionProfile) -> Vec<&'static str> {
+    profile.required_tools().iter().copied().filter(|tool| crate::proc::resolve_program(tool).is_err()).collect()
 }
 
 /// The profile a saved run was resolved with. Runs written before this contract have
@@ -284,13 +301,20 @@ mod tests {
         assert!(st.profile.is_none());
         assert_eq!(for_state(&st).unwrap().id(), "rust-cargo");
         st.profile = Some(ResolvedProfile {
-            id: "python-pytest".into(),
+            id: "go-test".into(),
             version: CONTRACT_VERSION,
             project_dir: String::new(),
             evidence: vec![],
         });
         let error = for_state(&st).err().unwrap();
-        assert!(error.contains("python-pytest"), "{error}");
+        assert!(error.contains("go-test"), "{error}");
+        st.profile = Some(ResolvedProfile {
+            id: "python-pytest".into(),
+            version: CONTRACT_VERSION,
+            project_dir: String::new(),
+            evidence: vec!["pytest.ini".into()],
+        });
+        assert_eq!(for_state(&st).unwrap().id(), "python-pytest");
         st.profile = Some(ResolvedProfile {
             id: "rust-cargo".into(),
             version: CONTRACT_VERSION,

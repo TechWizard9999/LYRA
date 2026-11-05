@@ -90,13 +90,29 @@ impl StageCtx {
         paths
     }
 
-    /// Renders a prompt template from `src/prompts/` with the given values.
+    /// Renders a prompt template from `src/prompts/` with the given values and this run's
+    /// execution profile (its prompt macros and language).
     pub fn render(&self, template_name: &str, template: &str, values: serde_json::Value) -> anyhow::Result<String> {
-        let mut env = minijinja::Environment::new();
-        env.add_template(template_name, template)?;
-        let tmpl = env.get_template(template_name)?;
-        Ok(tmpl.render(values)?)
+        let profile = self.profile()?;
+        render_prompt(&*profile, template_name, template, values)
     }
+}
+
+/// Renders a stage prompt: the profile's macro file is importable as `profile.md` and
+/// `language` names the target language. Both are harness-authored, never untrusted input.
+pub fn render_prompt(
+    profile: &dyn ExecutionProfile,
+    template_name: &str,
+    template: &str,
+    mut values: serde_json::Value,
+) -> anyhow::Result<String> {
+    let mut env = minijinja::Environment::new();
+    env.add_template("profile.md", profile.prompt_macros())?;
+    env.add_template(template_name, template)?;
+    if let Some(object) = values.as_object_mut() {
+        object.insert("language".into(), serde_json::Value::from(profile.language()));
+    }
+    Ok(env.get_template(template_name)?.render(values)?)
 }
 
 /// Line-numbered source evidence for the agent: the relevant files completely (with the

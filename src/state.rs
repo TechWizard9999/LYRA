@@ -364,14 +364,14 @@ mod tests {
         state.frozen_repro = Some(frozen_record());
         assert!(state.require_frozen_repro().is_ok());
         state.profile = Some(ResolvedProfile {
-            id: "python-pytest".into(),
+            id: "go-test".into(),
             version: profile::CONTRACT_VERSION,
             project_dir: String::new(),
             evidence: vec![],
         });
         let error = state.require_frozen_repro().unwrap_err();
         assert_eq!(error.kind, ErrorKind::Config);
-        assert!(error.message.contains("python-pytest"), "{error:?}");
+        assert!(error.message.contains("go-test"), "{error:?}");
     }
 
     #[test]
