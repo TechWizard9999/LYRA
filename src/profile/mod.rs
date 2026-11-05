@@ -215,12 +215,21 @@ pub fn resolve(worktree: &Path) -> Result<(ResolvedProfile, Box<dyn ExecutionPro
 pub fn for_state(state: &RunState) -> Result<Box<dyn ExecutionProfile>, String> {
     match &state.profile {
         None => Ok(Box::new(rust_cargo::RustCargo)),
-        Some(resolved) => by_id(&resolved.id).ok_or_else(|| {
-            format!(
-                "run was resolved with execution profile '{}' (contract v{}), which this LYRA does not provide",
-                resolved.id, resolved.version
-            )
-        }),
+        Some(resolved) => {
+            if resolved.version != CONTRACT_VERSION {
+                return Err(format!(
+                    "run was resolved with execution profile contract v{} ('{}'); this LYRA implements v{CONTRACT_VERSION} \
+                     and does not apply its rules to a run saved under another contract",
+                    resolved.version, resolved.id
+                ));
+            }
+            by_id(&resolved.id).ok_or_else(|| {
+                format!(
+                    "run was resolved with execution profile '{}' (contract v{}), which this LYRA does not provide",
+                    resolved.id, resolved.version
+                )
+            })
+        }
     }
 }
 
@@ -289,6 +298,31 @@ mod tests {
             evidence: vec!["Cargo.toml".into()],
         });
         assert_eq!(for_state(&st).unwrap().id(), "rust-cargo");
+    }
+
+    #[test]
+    fn unsupported_saved_contract_versions_are_rejected_even_for_known_ids() {
+        let mut st = state();
+        for version in [0, CONTRACT_VERSION + 1, 999] {
+            st.profile = Some(ResolvedProfile {
+                id: "rust-cargo".into(),
+                version,
+                project_dir: String::new(),
+                evidence: vec!["Cargo.toml".into()],
+            });
+            let error = for_state(&st).err().unwrap();
+            assert!(error.contains(&format!("contract v{version}")), "{error}");
+            assert!(error.contains(&format!("implements v{CONTRACT_VERSION}")), "{error}");
+        }
+        // The version check runs before the id lookup, so a foreign id under a foreign version
+        // reports the contract mismatch first.
+        st.profile = Some(ResolvedProfile {
+            id: "python-pytest".into(),
+            version: CONTRACT_VERSION + 1,
+            project_dir: String::new(),
+            evidence: vec![],
+        });
+        assert!(for_state(&st).err().unwrap().contains("contract v2"));
     }
 
     #[test]
