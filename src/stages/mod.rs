@@ -11,8 +11,9 @@ pub mod verify;
 
 use crate::artifacts::RunDir;
 use crate::config::Config;
-use crate::error::StageOutcome;
+use crate::error::{ErrorKind, StageError, StageOutcome};
 use crate::events::{EventSink, StageId};
+use crate::profile::ExecutionProfile;
 use crate::providers::{AgentTask, Mode, SharedAgent};
 use crate::state::RunState;
 use async_trait::async_trait;
@@ -35,6 +36,12 @@ impl StageCtx {
         self.config.timeout()
     }
 
+    /// The execution profile this run was resolved with (PLAN §13). Fails visibly when the
+    /// saved run names a profile this binary does not provide.
+    pub fn profile(&self) -> Result<Box<dyn ExecutionProfile>, StageError> {
+        self.state.profile().map_err(|reason| StageError::fatal(ErrorKind::Config, reason))
+    }
+
     /// Builds an `AgentTask` for this run with the standard paths filled in.
     pub fn agent_task(
         &self,
@@ -42,12 +49,13 @@ impl StageCtx {
         mut prompt: String,
         mode: Mode,
         schema: Option<serde_json::Value>,
-    ) -> AgentTask {
+    ) -> Result<AgentTask, StageError> {
         let attempt = self.state.attempt_count(stage).max(1);
         // Codex command tools are disabled in both modes. Supply source evidence
         // for apply_patch as well as analysis; Claude can also use native file tools.
-        prompt.push_str(&readonly_source_snapshot(&self.run_dir.worktree(), &self.relevant_source_paths()));
-        AgentTask {
+        let profile = self.profile()?;
+        prompt.push_str(&readonly_source_snapshot(&self.run_dir.worktree(), &self.relevant_source_paths(), &*profile));
+        Ok(AgentTask {
             stage,
             cwd: self.run_dir.worktree(),
             artifacts: self.run_dir.artifacts(),
@@ -61,7 +69,7 @@ impl StageCtx {
             )),
             timeout: self.timeout(),
             cancel: self.cancel.clone(),
-        }
+        })
     }
 
     fn relevant_source_paths(&self) -> Vec<String> {
@@ -91,7 +99,9 @@ impl StageCtx {
     }
 }
 
-fn readonly_source_snapshot(root: &std::path::Path, relevant: &[String]) -> String {
+/// Line-numbered source evidence for the agent: the relevant files completely (with the
+/// profile's ancestor manifests), then a bounded overview of the profile's source files.
+fn readonly_source_snapshot(root: &std::path::Path, relevant: &[String], profile: &dyn ExecutionProfile) -> String {
     use std::io::Read;
     const FILE_LIMIT: usize = 24_000;
     const TOTAL_LIMIT: usize = 240_000;
@@ -116,7 +126,12 @@ fn readonly_source_snapshot(root: &std::path::Path, relevant: &[String]) -> Stri
             snapshot.push_str(&format!("{}: {}\n", index + 1, line));
         }
     }
-    fn collect(dir: &std::path::Path, depth: usize, paths: &mut Vec<std::path::PathBuf>) {
+    fn collect(
+        dir: &std::path::Path,
+        depth: usize,
+        paths: &mut Vec<std::path::PathBuf>,
+        profile: &dyn ExecutionProfile,
+    ) {
         if depth > 16 || paths.len() >= 2000 {
             return;
         }
@@ -133,12 +148,11 @@ fn readonly_source_snapshot(root: &std::path::Path, relevant: &[String]) -> Stri
             let path = entry.path();
             if kind.is_dir() {
                 let name = entry.file_name();
-                if !name.to_string_lossy().starts_with('.') && name != "target" && name != "node_modules" {
-                    collect(&path, depth + 1, paths);
+                let name = name.to_string_lossy();
+                if !name.starts_with('.') && !profile.generated_dirs().contains(&name.as_ref()) {
+                    collect(&path, depth + 1, paths, profile);
                 }
-            } else if kind.is_file()
-                && (path.extension().is_some_and(|s| s == "rs") || entry.file_name() == "Cargo.toml")
-            {
+            } else if kind.is_file() && profile.is_source_file(&path) {
                 paths.push(path);
             }
             if paths.len() >= 2000 {
@@ -147,7 +161,7 @@ fn readonly_source_snapshot(root: &std::path::Path, relevant: &[String]) -> Stri
         }
     }
     let mut paths = Vec::new();
-    collect(root, 0, &mut paths);
+    collect(root, 0, &mut paths, profile);
     paths.sort();
     let mut snapshot = String::new();
     let canonical_root = dunce::canonicalize(root).ok();
@@ -158,9 +172,11 @@ fn readonly_source_snapshot(root: &std::path::Path, relevant: &[String]) -> Stri
                 Some(path) => {
                     complete.insert(path.clone());
                     for ancestor in path.parent().into_iter().flat_map(std::path::Path::ancestors) {
-                        let manifest = ancestor.join("Cargo.toml");
-                        if let Some(manifest) = safe_source(canonical_root, &manifest.to_string_lossy()) {
-                            complete.insert(manifest);
+                        for name in profile.manifest_names() {
+                            let manifest = ancestor.join(name);
+                            if let Some(manifest) = safe_source(canonical_root, &manifest.to_string_lossy()) {
+                                complete.insert(manifest);
+                            }
                         }
                     }
                 }
@@ -272,7 +288,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("target")).unwrap();
         std::fs::write(dir.path().join("src/lib.rs"), "pub fn culprit() {}\n").unwrap();
         std::fs::write(dir.path().join("target/generated.rs"), "DO_NOT_INCLUDE").unwrap();
-        let snapshot = readonly_source_snapshot(dir.path(), &[]);
+        let snapshot = readonly_source_snapshot(dir.path(), &[], &crate::profile::rust_cargo::RustCargo);
         assert!(snapshot.contains("1: pub fn culprit() {}"));
         assert!(!snapshot.contains("DO_NOT_INCLUDE"));
         assert!(snapshot.contains("untrusted_repository_source"));
@@ -315,7 +331,7 @@ mod tests {
             agent: crate::providers::make_agent("codex", &crate::config::ProviderConfig::default()),
             cancel: CancellationToken::new(),
         };
-        let task = ctx.agent_task(StageId::Fix, "Fix the issue".into(), Mode::Edit, None);
+        let task = ctx.agent_task(StageId::Fix, "Fix the issue".into(), Mode::Edit, None).unwrap();
         assert!(task.prompt.contains("1: pub fn edit_me() {}"));
         assert!(
             task.prompt.contains("4002: fn complete_tail() {}"),
@@ -336,7 +352,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::write(dir.path().join("secret.rs"), "SYMLINK_OUTSIDE_SECRET").unwrap();
         std::os::unix::fs::symlink(dir.path().join("secret.rs"), root.join("linked.rs")).unwrap();
-        let snapshot = readonly_source_snapshot(&root, &["linked.rs".into()]);
+        let snapshot = readonly_source_snapshot(&root, &["linked.rs".into()], &crate::profile::rust_cargo::RustCargo);
         assert!(!snapshot.contains("SYMLINK_OUTSIDE_SECRET"));
         assert!(snapshot.contains("Relevant source omitted"));
     }

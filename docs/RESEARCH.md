@@ -75,3 +75,11 @@ Leaderboards: swebench.com evaluates every model with mini‑swe‑agent and req
 - Multi‑model: https://zenodo.org/records/20519585 · https://arxiv.org/abs/2602.01011 · anchoring https://arxiv.org/abs/2608.25869 · RCA failures https://dl.acm.org/doi/10.1145/3793655.3793732 · juries https://orq.ai/blog/llm-juries-in-practice · Claude+Codex week https://dev.to/brianmello/i-let-claude-and-codex-argue-about-my-code-for-a-week-heres-what-they-caught-gg0
 - Reproduction/test hacking: ORACLE‑SWE https://arxiv.org/html/2604.07789v1 · UTBoost https://arxiv.org/abs/2506.09289 · ImpossibleBench https://arxiv.org/abs/2510.20270 · EvilGenie https://arxiv.org/abs/2511.21654 · CoHarden https://arxiv.org/abs/2607.19843 · SWT‑Bench https://arxiv.org/html/2406.12952v3
 - Runtime gotchas: https://dev.to/gabrielanhaia/headless-mode-in-5-agents-claude-p-codex-exec-gemini-p-copilot-p-opencode-run-4816 · https://github.com/anthropics/claude-code/issues/53068
+
+## 6. Test-runner evidence references
+
+Background for PLAN.md §13. Each runner differs in exit-code semantics, exact-test selector syntax and machine-readable report format, which is why a profile integrates one runner rather than substituting command strings:
+
+- **pytest exit codes** https://docs.pytest.org/en/stable/reference/exit-codes.html — distinct codes for tests failed (1), interrupted (2), internal error (3), usage error (4) and **no tests collected (5)**; a selector that matches nothing is a different outcome from a failing test, and skip/xfail results never fail the run, so the report (junit-xml or `-rA` summary) must be parsed, not the exit code alone.
+- **Jest CLI** https://jestjs.io/docs/30.0/cli — `--json`/`--outputFile` for a machine-readable report, `-t`/`--testNamePattern` is a regex rather than an exact name and `--findRelatedTests`/`--listTests` drive discovery; exact selection and source binding need the JSON report's per-assertion status and file paths.
+- **Go `test2json`** https://go.dev/src/cmd/test2json/main.go — `go test -json` streams one event per line (`run`, `pass`, `fail`, `skip`, `output`) per package and test; `-run` takes an anchored regex, so exactness is proven from the event stream's test names and counts rather than from the selector.
