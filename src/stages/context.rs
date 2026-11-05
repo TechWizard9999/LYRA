@@ -4,7 +4,6 @@
 use super::{assets, Stage, StageCtx};
 use crate::error::{ErrorKind, StageError, StageOutcome};
 use crate::events::StageId;
-use crate::proc::{self, CommandSpec};
 use crate::providers::{AgentOutput, Mode};
 use crate::{git, github};
 use async_trait::async_trait;
@@ -34,6 +33,7 @@ const DIR: &str = "10-context";
 
 async fn context(ctx: &mut StageCtx) -> Result<(), StageError> {
     let wt = ctx.run_dir.worktree();
+    let profile = ctx.profile()?;
     let issue_md = ctx.run_dir.read("00-issue.md").unwrap_or_default();
     let issue: github::Issue = ctx.run_dir.read_json("00-issue.json").unwrap_or_default();
 
@@ -61,12 +61,13 @@ async fn context(ctx: &mut StageCtx) -> Result<(), StageError> {
     write(ctx, "related.json", &related_json);
 
     // Git history for what the issue mentions.
-    let needles = extract_needles(&issue_md);
+    let needles = extract_needles(&issue_md, profile.source_extensions());
     let git_history = git_history(&wt, &needles);
     write(ctx, "git-history.md", &git_history);
 
-    // Workspace layout.
-    let repo_json = serde_json::to_string_pretty(&cargo_metadata(&wt, ctx).await).unwrap_or_default();
+    // Workspace layout, as the execution profile describes it (best effort).
+    let described = profile.describe_repository(&wt, Duration::from_secs(120), &ctx.cancel).await;
+    let repo_json = serde_json::to_string_pretty(&described).unwrap_or_default();
     write(ctx, "repo.json", &repo_json);
 
     let instructions = instructions(&wt)?;
@@ -125,7 +126,7 @@ pub(crate) async fn run_readonly(
     prompt: String,
     schema: &str,
 ) -> Result<AgentOutput, StageError> {
-    let task = ctx.agent_task(stage, prompt, Mode::ReadOnly, Some(assets::schema(schema)));
+    let task = ctx.agent_task(stage, prompt, Mode::ReadOnly, Some(assets::schema(schema)))?;
     let transcript = task.transcript.clone();
     let out = ctx.agent.run(task, &ctx.events).await.map_err(|e| StageError::from_anyhow(ErrorKind::Provider, e))?;
     let details = transcript.strip_prefix(&ctx.run_dir.root).unwrap_or(&transcript).to_path_buf();
@@ -264,16 +265,19 @@ fn push_unique(v: &mut Vec<String>, s: &str) {
     }
 }
 
-/// Paths (`*.rs`, with optional `:line`), backticked identifiers and error lines from issue text.
-pub fn extract_needles(issue_text: &str) -> Needles {
-    let path_re = Regex::new(r"([\w./-]+\.rs)(?::(\d+))?").unwrap();
+/// Paths (the profile's source extensions, with optional `:line`), backticked identifiers
+/// and error lines from issue text.
+pub fn extract_needles(issue_text: &str, extensions: &[&str]) -> Needles {
+    let alternatives = extensions.iter().map(|e| regex::escape(e)).collect::<Vec<_>>().join("|");
+    let path_re = Regex::new(&format!(r"([\w./-]+\.({alternatives}))(?::(\d+))?")).unwrap();
     let sym_re = Regex::new(r"`([A-Za-z_][\w:]*(?:\(\))?)`").unwrap();
     let quoted_re = Regex::new(r#""([^"\n]{13,})""#).unwrap();
+    let is_source = |s: &str| extensions.iter().any(|e| s.ends_with(&format!(".{e}")));
     let mut n = Needles::default();
     for c in path_re.captures_iter(issue_text) {
         let p = c[1].trim_start_matches("./").to_string();
         push_unique(&mut n.paths, &p);
-        if let Some(line) = c.get(2).and_then(|m| m.as_str().parse::<u32>().ok()) {
+        if let Some(line) = c.get(3).and_then(|m| m.as_str().parse::<u32>().ok()) {
             if n.lines.len() < 10 && !n.lines.contains(&(p.clone(), line)) {
                 n.lines.push((p, line));
             }
@@ -281,7 +285,7 @@ pub fn extract_needles(issue_text: &str) -> Needles {
     }
     for c in sym_re.captures_iter(issue_text) {
         let s = c[1].trim_end_matches("()");
-        if !s.ends_with(".rs") {
+        if !is_source(s) {
             push_unique(&mut n.symbols, s);
         }
     }
@@ -340,35 +344,6 @@ fn resolve_path(wt: &Path, p: &str) -> String {
         }
     }
     p.to_string()
-}
-
-async fn cargo_metadata(wt: &Path, ctx: &StageCtx) -> Value {
-    let spec = CommandSpec::new("cargo", wt).args(["metadata", "--format-version", "1", "--no-deps"]).scrubbed();
-    match proc::run(&spec, Duration::from_secs(120), &ctx.cancel).await {
-        Ok(out) if out.success() => parse_cargo_metadata(&out.stdout),
-        Ok(out) => json!({ "error": cap(&out.combined(), 4000) }),
-        Err(e) => json!({ "error": format!("{e:#}") }),
-    }
-}
-
-/// `{workspace_root, members:[{name, manifest_path, has_tests_dir}]}` from `cargo metadata`.
-pub fn parse_cargo_metadata(text: &str) -> Value {
-    let Ok(v) = serde_json::from_str::<Value>(text) else {
-        return json!({ "error": "cargo metadata printed invalid JSON" });
-    };
-    let members: Vec<Value> = v["packages"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .map(|p| {
-                    let manifest = p["manifest_path"].as_str().unwrap_or_default();
-                    let has_tests = Path::new(manifest).parent().is_some_and(|d| d.join("tests").is_dir());
-                    json!({ "name": p["name"], "manifest_path": manifest, "has_tests_dir": has_tests })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    json!({ "workspace_root": v["workspace_root"], "members": members })
 }
 
 fn is_policy_file(path: &Path) -> bool {
@@ -475,33 +450,25 @@ called `Option::unwrap()` on a `None` value
 
 Also see crates/core/src/lib.rs and "expected a non-empty header line". `src/parser.rs` again.
 "#;
-        let n = extract_needles(text);
+        let n = extract_needles(text, &["rs"]);
         assert_eq!(n.paths, vec!["src/parser.rs", "crates/core/src/lib.rs"]);
         assert_eq!(n.lines, vec![("src/parser.rs".to_string(), 120)]);
         assert_eq!(n.symbols, vec!["parse_header", "Option::unwrap", "None"]);
         assert_eq!(n.errors[0], "thread 'main' panicked at src/parser.rs:120:9:");
         assert!(n.errors.contains(&"expected a non-empty header line".to_string()));
+        // The extensions come from the execution profile.
+        let py = extract_needles("see pkg/mod.py:12 and `helper()` and src/x.rs", &["py"]);
+        assert_eq!(py.paths, vec!["pkg/mod.py"]);
+        assert_eq!(py.lines, vec![("pkg/mod.py".to_string(), 12)]);
+        assert_eq!(py.symbols, vec!["helper"]);
     }
 
     #[test]
     fn needles_are_capped() {
         let text: String = (0..30).map(|i| format!("f{i}.rs `sym{i}`\n")).collect();
-        let n = extract_needles(&text);
+        let n = extract_needles(&text, &["rs"]);
         assert_eq!(n.paths.len(), 10);
         assert_eq!(n.symbols.len(), 10);
-    }
-
-    #[test]
-    fn cargo_metadata_parsing() {
-        let d = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(d.path().join("a/tests")).unwrap();
-        let manifest = d.path().join("a/Cargo.toml").to_string_lossy().to_string();
-        let text = json!({ "workspace_root": "/w", "packages": [{ "name": "a", "manifest_path": manifest }, { "name": "b", "manifest_path": "/nope/Cargo.toml" }] }).to_string();
-        let v = parse_cargo_metadata(&text);
-        assert_eq!(v["workspace_root"], "/w");
-        assert_eq!(v["members"][0]["has_tests_dir"], true);
-        assert_eq!(v["members"][1]["has_tests_dir"], false);
-        assert!(parse_cargo_metadata("nope")["error"].is_string());
     }
 
     #[test]

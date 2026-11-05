@@ -8,7 +8,7 @@ If Windows execution policy blocks the script, run `powershell -ExecutionPolicy 
 
 | Tool | Why | Install / check |
 |---|---|---|
-| Rust stable | builds LYRA; LYRA also runs `cargo` on the target repo | [rustup](https://rustup.rs), then `rustup default stable` |
+| Rust stable | builds LYRA; the built-in `rust-cargo` profile also runs `cargo`/`rustfmt` on the target repo | [rustup](https://rustup.rs), then `rustup default stable` |
 | A linker (Windows) | Rust needs one | either the GNU toolchain: `rustup toolchain install stable-x86_64-pc-windows-gnu` + `rustup default stable-x86_64-pc-windows-gnu` with [WinLibs](https://winlibs.com) gcc (MinGW-w64) on `PATH`; or the MSVC toolchain with **Visual Studio Build Tools** ("Desktop development with C++") |
 | git | worktrees, branches, checkpoints | `git --version` |
 | GitHub CLI | reads issues, pushes, opens draft PRs | [cli.github.com](https://cli.github.com), then `gh auth login` and `gh auth status` |
@@ -39,11 +39,11 @@ LYRA reads `~/.lyra/config.toml`. Set `LYRA_HOME` to use another directory (conf
 lyra doctor
 ```
 
-It checks that the selected runtime is on `PATH` and has a local login or a nonempty configured API key, that `gh auth status` succeeds, and that `cargo` is present. Runtime credentials are not remotely validated, and the check does not send a model prompt. Missing optional runtimes do not fail the report. Fix every line marked `!!` before the first run. The same report is available at `POST /api/doctor` with a matching Origin header, for example `curl -X POST -H "Origin: http://127.0.0.1:7700" http://127.0.0.1:7700/api/doctor`.
+It checks that the selected runtime is on `PATH` and has a local login or a nonempty configured API key, that `gh auth status` succeeds, that `git` is present, and that each built-in execution profile's tools are present (`cargo` and `rustfmt` for `rust-cargo`), labelled with the profile id. Runtime credentials are not remotely validated, and the check does not send a model prompt. Missing optional runtimes do not fail the report. Fix every line marked `!!` before the first run. The same report is available at `POST /api/doctor` with a matching Origin header, for example `curl -X POST -H "Origin: http://127.0.0.1:7700" http://127.0.0.1:7700/api/doctor`.
 
 ## First run
 
-1. Clone the repository you want to fix and make sure it builds: `git clone https://github.com/owner/repo && cd repo && cargo build`. LYRA never clones; it works in its own git worktree of that clone, on a new branch `lyra/issue-<n>-<run-id>`, so your checkout is left alone.
+1. Clone the repository you want to fix and make sure it builds: `git clone https://github.com/owner/repo && cd repo && cargo build`. LYRA never clones; it works in its own git worktree of that clone, on a new branch `lyra/issue-<n>-<run-id>`, so your checkout is left alone. The repository must match a built-in execution profile; today that means a `Cargo.toml` at the repository root (`rust-cargo`). Otherwise Intake fails with a message naming what was looked for and the supported profile ids (see Troubleshooting).
 2. Start the dashboard: `lyra serve`. It prints the URL (`http://127.0.0.1:7700` by default) and opens the browser (`[server] open_browser = false` turns that off).
 3. Fill in the repository path and the issue (URL, `#123` or `123`; or paste the issue text to run without GitHub access), pick the runtime, tick the policy box if you read the repository's contribution / AI policy, press **Run**.
 4. Watch the run page: each stage turns blue while running and green when done; the live log shows the agent's tool calls (`[Read] src/x.rs`), text and file edits. Artifact links appear as files are written; you can open them, including any `policy.md` excerpts, while the run continues.
@@ -63,6 +63,7 @@ Use one writer process per `LYRA_HOME`: stop the dashboard before running CLI `r
 
 - **`link.exe` not found** (Windows, MSVC toolchain without Build Tools): install Visual Studio Build Tools, or switch to the GNU toolchain (`rustup default stable-x86_64-pc-windows-gnu`) with WinLibs gcc on `PATH`.
 - **Linker errors only from Git Bash** (Windows): Git Bash puts its own `link` (coreutils) ahead of the real linker on `PATH`. Run `cargo` from PowerShell or cmd.
+- **"no built-in execution profile matches this repository"**: Intake found no `Cargo.toml` at the worktree root. Only the `rust-cargo` profile is built in; a manifest in a subdirectory does not count as a root project. Point LYRA at the Cargo project's root, or wait for the profile for that language ([docs/PLAN.md](docs/PLAN.md) §13). This is not a check of the repository's language, only of the profiles this binary provides.
 - **`gh` not authenticated**: intake fails with the `gh` message. Run `gh auth login`, check `gh auth status`, and make sure the account can read the issue and push to the repo or a fork. With no push rights the PR stage stops and shows the `gh repo fork` command to run.
 - **`claude` / `codex` not found on Windows**: npm installs `.cmd` shims (`claude.cmd`, `codex.cmd`). LYRA resolves them through `PATH`; check `where claude`. If they are elsewhere, set `bin = "C:\\path\\to\\claude.cmd"` in the provider table.
 - **Auth errors from the runtime**: `auth = "api_key"` needs `ANTHROPIC_API_KEY` in the environment `lyra serve` was started from; `auth = "login"` needs a prior `claude` login. For Codex use `codex login` or `CODEX_API_KEY`.

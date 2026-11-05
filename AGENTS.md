@@ -4,7 +4,7 @@ This is the canonical guide for anyone (human or coding agent) changing this rep
 
 ## Purpose
 
-LYRA is a Rust harness around a coding-agent CLI (Claude Code or Codex). Given a path to an already-cloned Rust repository and a GitHub issue, it runs one fixed pipeline (intake → context → repro → rca → fix → verify → draft PR), enforces guards between the stages, saves every step under `~/.lyra/runs/<id>/`, and streams progress to a local dashboard. The design is [docs/PLAN.md](docs/PLAN.md); deferred designs are in [docs/RESEARCH.md](docs/RESEARCH.md).
+LYRA is a Rust harness around a coding-agent CLI (Claude Code or Codex). Given a path to an already-cloned repository (Rust via the built-in `rust-cargo` profile today; other languages through execution profiles, PLAN §13) and a GitHub issue, it runs one fixed pipeline (intake → context → repro → rca → fix → verify → draft PR), enforces guards between the stages, saves every step under `~/.lyra/runs/<id>/`, and streams progress to a local dashboard. The design is [docs/PLAN.md](docs/PLAN.md); deferred designs are in [docs/RESEARCH.md](docs/RESEARCH.md).
 
 ## Architecture map
 
@@ -17,7 +17,8 @@ LYRA is a Rust harness around a coding-agent CLI (Claude Code or Codex). Given a
 | `src/error.rs` | `StageError`, `ErrorKind`, `StopReason`, `StageOutcome` |
 | `src/engine.rs` | fixed pipeline driver, one active run, retry-from-stage, cancel, interrupted marking |
 | `src/stages/` | S0..S6: `intake`, `context`, `repro`, `rca`, `fix`, `verify`, `pr` (`mod.rs` = `Stage` trait + `StageCtx`) |
-| `src/guards.rs` | repro diff rules, expected-assertion match, test lock, verify output parsing |
+| `src/guards.rs` | universal repro/fix rules, expected-assertion match, scope accounting; runner rules live in the profile |
+| `src/profile/` | the `ExecutionProfile` contract, resolution and legacy mapping (`mod.rs`); the built-in `rust-cargo` profile (`rust_cargo.rs`): Cargo/libtest commands, output parsing, Cargo-specific guards and verification environment |
 | `src/providers/` | the `Agent` trait (`mod.rs`) and the Claude Code / Codex adapters |
 | `src/proc.rs` | subprocesses: hang-guard timeout, cancellation, process-tree kill, Windows `.cmd` shims |
 | `src/git.rs`, `src/github.rs` | git worktrees/checkpoints; `gh` calls |
@@ -52,6 +53,7 @@ Run directory (PLAN §7):
 12. **Artifacts follow the PLAN §7 layout** (`artifacts/<NN-stage>/...`). A new artifact goes under its stage's directory and is announced with an `artifact_written` event.
 13. **Read-only stages stay read-only** (file reading and search only; the harness supplies command output). Guards are not weakened to make a run pass.
 14. **Follow the target repository's own rules** (CONTRIBUTING, AI policy, AGENTS.md) as written; no blanket skip rules.
+15. **Target-language and test-runner logic lives in `src/profile/`**; stages, guards, engine and dashboard stay runner-neutral and call the `ExecutionProfile` contract. A new profile is a built-in module plus tests, not a runtime plugin.
 
 ## Running tests
 

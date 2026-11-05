@@ -6,7 +6,8 @@
 //! - `state`     : `run.json` (status, stage, checkpoints, attempts)
 //! - `engine`    : fixed pipeline driver, retry-from-stage, cancel, hang guard
 //! - `stages`    : S0..S6 implementations
-//! - `guards`    : repro / fix / verify rules
+//! - `guards`    : universal repro / fix / verify rules
+//! - `profile`   : execution profiles: the target repository's toolchain and test runner
 //! - `providers` : the `Agent` trait and the Claude Code / Codex adapters
 //! - `proc`, `git`, `github`, `artifacts`, `doctor`: plumbing
 
@@ -20,6 +21,7 @@ pub mod git;
 pub mod github;
 pub mod guards;
 pub mod proc;
+pub mod profile;
 pub mod providers;
 pub mod stages;
 pub mod state;

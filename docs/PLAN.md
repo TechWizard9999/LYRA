@@ -1,6 +1,6 @@
 # LYRA — plan
 
-v5 · 2026-11-04 · Rust. Review corrections applied; later work is listed in §11 and designed in `docs/RESEARCH.md`.
+v6 · 2026-11-05 · Rust. Review corrections applied; execution profiles in §13; later work is listed in §11 and designed in `docs/RESEARCH.md`.
 
 LYRA is a harness around an off‑the‑shelf coding agent. From a local dashboard you give it a cloned Rust repository and a GitHub issue; it gathers context, writes a failing regression test, finds the root cause, fixes it, verifies, and opens a draft PR. Every step is saved and streamed live.
 
@@ -16,7 +16,7 @@ LYRA is a harness around an off‑the‑shelf coding agent. From a local dashboa
 - Draft PR only, created for the exact commit that passed verification.
 - Stops only for genuine failures (cannot reproduce, RCA unresolved, verification failed), always with the evidence and a retry button.
 
-Later (§11): multi‑model RCA, more runtimes (OpenCode/NVIDIA, Copilot, generic command), cost display, automatic resume and fix‑retry loop, GitHub triggers, eval set, web search, container sandbox, non‑Rust repos.
+Later (§11): multi‑model RCA, more runtimes (OpenCode/NVIDIA, Copilot, generic command), cost display, automatic resume and fix‑retry loop, GitHub triggers, eval set, web search, container sandbox, non‑Rust repos through execution profiles (§13).
 
 ## 2. Flow
 
@@ -45,6 +45,8 @@ S6 draft PR  body from template + artifacts ; push verified SHA ; find-or-create
 ```
 
 ## 3. Stages
+
+The Cargo specifics described in §3.1 and §3.4 (test file locations, `cargo test -p <crate> <name> -- --exact`, `--list` discovery, `rustfmt`, `CARGO_HOME`/target handling, lockfile and manifest rules) are the `rust-cargo` profile's implementation of the runner-neutral contract in §13; the stages themselves call that contract.
 
 | Stage | Agent | Outputs in `artifacts/` | Notes |
 |---|---|---|---|
@@ -206,7 +208,8 @@ src/
   engine.rs          run state, fixed stage order, retry-from-stage, cancel, hang guard
   events.rs          Event enum, jsonl writer, broadcast
   stages/            intake.rs context.rs repro.rs rca.rs fix.rs verify.rs pr.rs
-  guards.rs          repro diff rules, expected-assertion match, test lock, verify output parsing
+  guards.rs          universal repro/fix rules, expected-assertion match, scope accounting
+  profile/           mod.rs (contract, resolution) rust_cargo.rs
   providers/         mod.rs (trait) claude.rs codex.rs
   web/               server.rs api.rs sse.rs views.rs static/
   git.rs github.rs proc.rs artifacts.rs doctor.rs
@@ -240,7 +243,7 @@ Core crates include `tokio`, `clap`, `serde`, `serde_json`, `toml`, `anyhow`, `a
 
 ## 11. After the first release
 
-In rough order: multi‑model RCA with blind parallel runs and adjudication (RESEARCH.md §1) · OpenCode (NVIDIA / any OpenAI‑compatible key), Copilot CLI, generic command adapter · cost display where the runtime reports it · automatic fix‑retry loop · automatic resume of interrupted runs · GitHub label/comment trigger and pre‑work issue comment · eval set on closed issues with known fixes · web search in context · container sandbox · non‑Rust repos · richer UI (Dioxus) or distributed execution (Temporal / Restate) if ever needed.
+In rough order: multi‑model RCA with blind parallel runs and adjudication (RESEARCH.md §1) · OpenCode (NVIDIA / any OpenAI‑compatible key), Copilot CLI, generic command adapter · cost display where the runtime reports it · automatic fix‑retry loop · automatic resume of interrupted runs · GitHub label/comment trigger and pre‑work issue comment · eval set on closed issues with known fixes · web search in context · container sandbox · non‑Rust repos through further execution profiles (§13, Phases 2–4) · richer UI (Dioxus) or distributed execution (Temporal / Restate) if ever needed.
 
 ## 12. Review hardening and compatibility
 
@@ -259,3 +262,90 @@ Additional review corrections preserve the fixed pipeline and draft-only publica
 Fresh Cargo homes deliberately do not import global registry settings, cache or credentials. Repositories needing an offline/vendor or mirror setup must declare a self-contained repository configuration; global-only setups remain unsupported. Discovery uses a different lint cap and may compile dependencies separately from real verification; the per-command hang guard remains the only timeout. Temporary data cleanup addresses disk retention, not that compilation cost. Artifact serving validates and reads the same file handle, rejects symlink/reparse traversal and multiply linked files. This does not prevent an unsandboxed local process copying private bytes into an ordinary file; OS isolation remains outside this MVP.
 
 Follow-up automated comments: run listing validates each directory id through run_dir before loading state; unreadable intake policy candidates fail visibly. Raw provider transcripts retain at most 8 MiB per attempt with a truncation marker and a visible warning; structured stream parsing continues, while transcript I/O failures fail the provider call. This is evidence retention, not a time or cost budget. Both dashboard cancellation routes dispatch filesystem-backed state lookup through the blocking pool. Existing run/event formats and pipeline order are unchanged.
+
+## 13. Execution profiles
+
+LYRA is written in Rust; that is the implementation choice for the harness, not a restriction on the repositories it can work on. An **execution profile** holds everything the harness must know about the *target* repository's toolchain and test runner, behind one runner-neutral contract. The engine, the seven stages, `guards.rs` and the dashboard call that contract and never name Cargo. Today one built-in profile exists, `rust-cargo`; adding a language means adding a profile module, not changing the pipeline driver (GitHub issue #4).
+
+Two concepts stay distinct even though one trait object serves both:
+
+- **Project/toolchain profile**: project directory, source/manifest/generated-file patterns, repository description, environment preparation and ownership, build and quality commands.
+- **Test-runner integration**: exact test identity and selection, discovery for source binding, execution evidence classification, the repro and fix guards that depend on the runner. A language alone never picks a runner (Python may be pytest or unittest; JavaScript has several runners).
+
+### 13.1 Contract
+
+`src/profile/mod.rs` defines `trait ExecutionProfile` (`id`, `required_tools` for `lyra doctor`) with four method groups:
+
+| Group | Methods | Used by |
+|---|---|---|
+| project / toolchain | `is_source_file`, `source_extensions`, `manifest_names`, `generated_dirs`, `is_test_path`, `describe_repository` | S1 Context (`repo.json`, issue-text path needles), source snapshots for S3/S4 |
+| regression identity and evidence | `validate_record`, `regression_command_line`, `regression_command`, `discovery`, `format_test`, `classify`, `describe_outcome`, `confirm_failure`, `assert_passed`, `assert_absent_from_discovery` | S2 Repro, S5 Verify |
+| guards | `check_repro_changes`, `check_fix_changes` | S2 and S4 diff checks |
+| environments | `reproduction_environment`, `check_environment_root`, `create_environment`, `check_environment`, `command_environment`, `preparation`, `verification_steps`, `explain_failure` | S2 build outputs, S5 owned environment and command list |
+
+Every method is string/path logic or builds a `CommandSpec` (program + argv, validated working directory; substituted test identifiers stay separate arguments). The harness runs the commands and owns timeouts, cancellation, output retention and evidence files. Supporting types: `Discovery` (the discovery-only command whose output must not contain the selected test once its source is emptied), `Preparation` (an optional pre-baseline step with the only files it may create), `VerifyStep` (one ordered verification command, flagged when it is the regression itself).
+
+`RegressionOutcome` is the neutral classification of running the one selected test:
+
+| Variant | Meaning | S2 Repro | S5 Verify |
+|---|---|---|---|
+| `Failed` | ran and failed on an assertion or panic | the only acceptable result; `confirm_failure` additionally requires exactly one failing case and the runner's test-failure exit status | verification failed |
+| `Passed` | ran and passed | not a reproduction → failed (retryable) | required (`assert_passed`: the selected test passed and exactly one test ran) |
+| `Skipped` | skipped, ignored or expected-failure | not a reproduction | not a pass |
+| `NotDiscovered` | nothing ran: wrong selector or not collected | not a reproduction | fail |
+| `SetupFailed` | compilation, collection or setup failed before the test could run | not a reproduction | fail |
+| `Other(reason)` | runner error, crashed binary, missing summary | not a reproduction | fail |
+
+Truncated or incompletely drained output is rejected by the harness before classification and never counts as evidence. An LLM's claim or an exit code alone is never proof; the profile parses the runner's own output.
+
+### 13.2 Resolution and precedence
+
+- Resolution happens once, in S0 Intake, after the worktree is created, from files present in the worktree. Nothing is executed to detect. Today the only source is built-in detection: `Cargo.toml` at the worktree root → `rust-cargo`, project directory `""` (root), evidence `["Cargo.toml"]`. A manifest below the root is not a root project.
+- Later phases add, in precedence order: explicit operator/repository configuration, then repository CI and contribution documentation as evidence for defaults, then built-in detection; each resolved setting records its source and conflicting evidence is shown rather than silently chosen. Repository configuration can never override harness safety or publication policy.
+- No matching profile → Intake fails with an actionable message naming what was looked for (`Cargo.toml at the repository root`) and the supported profile ids. This is a missing-profile diagnostic, not a language-based rejection; an unknown runner is never marked verified.
+- The result is saved as the optional `run.json.profile` (`ResolvedProfile { id, version, project_dir, evidence }`, names and paths only, never file contents or secrets), written to `artifacts/profile.json` with an `artifact_written` event, and announced with an info event `execution profile: rust-cargo (Cargo.toml)`. It is frozen for the run: later stages load it with `profile::for_state`, never re-detect. `CONTRACT_VERSION` (1) is bumped when the saved shape or the evidence contract changes.
+- **Invalidation**: Retry from Intake re-resolves the profile; retries from later stages keep it. Config-change-driven re-resolution belongs to the later onboarding flow.
+- `lyra doctor` checks `git` plus each built-in profile's `required_tools` (`cargo`, `rustfmt` for `rust-cargo`), labelled with the profile id.
+
+### 13.3 Legacy runs
+
+`run.json` files written before this contract have no `profile`; every one of them was a Cargo run, so `for_state` maps them explicitly to `rust-cargo`. A saved `profile.id` this binary does not provide fails visibly (the run is not reinterpreted). `20-repro/repro.json` and `run.json.frozen_repro` gain an optional `profile` field; the existing `crate` field is the `rust-cargo` project identifier, kept for compatibility (the neutral contract calls it the project id). Pipeline order, guard semantics, draft-only PR and the on-disk `events.jsonl` format are unchanged.
+
+### 13.4 Rust assumptions mapped to profile responsibilities
+
+The "Current gap" list from issue #4, and where each item lives after this PR:
+
+| Rust assumption (issue #4) | Profile responsibility | Status |
+|---|---|---|
+| `config.rs`: default build/test/fmt are Cargo commands; `lyra.toml` overrides verify only | profile supplies `verification_steps` from `[verify]`; defaults and per-profile applicability of build/formatter | **Phase 2**: defaults still Cargo strings in config |
+| `stages/context.rs`: `cargo metadata`, Rust project discovery | `describe_repository` → `repo.json`; `source_extensions` for issue-text path needles | moved (`rust_cargo.rs`) |
+| `stages/mod.rs`: source evidence focused on `.rs` and Cargo manifests | `is_source_file`, `manifest_names`, `generated_dirs`, `is_test_path` | moved |
+| `guards.rs`: Cargo selectors and output parsing, Rust test-file conventions, module registration / `syn` AST checks, Cargo dependency rules | `validate_record`, `classify`/`confirm_failure`/`assert_passed`, `check_repro_changes`, `check_fix_changes` (Cargo.toml dev-dependencies, Cargo.lock additions-only, registration attribute block and AST audit, `.cargo/` lock, `[[test]]`/`autotests`) | moved; universal rules stay in `guards.rs` (repository-relative path validation, frozen-test byte lock, expected-text match, change-scope accounting, symlink/escape checks) |
+| `stages/repro.rs`: Cargo execution and `rustfmt` | `regression_command`, `discovery`, `format_test`, `reproduction_environment` | moved |
+| `stages/verify.rs`: Cargo home/target, lockfile preparation, Cargo environment checks | `check_environment_root` (ancestor `.cargo/config`), `create_environment` (`cargo-home`, `target`), `command_environment` (`CARGO_HOME`/`CARGO_TARGET_DIR`), `preparation` (`cargo generate-lockfile`, may create only `Cargo.lock`), `explain_failure` | moved; fresh detached checkout, snapshots, timeouts, cancellation, cleanup and evidence files remain in the harness |
+| `prompts/*.md`, `schemas/*.json`: Rust/crate wording, `crate` field | profile-supplied prompt fragments and a neutral project-id field | **Phase 2** |
+| PR body template wording | profile-neutral wording of the verification section | **Phase 2** |
+
+### 13.5 Roadmap
+
+- **Phase 0 — contracts and documentation** and **Phase 1 — extract existing Rust support**: this PR. Contract, resolution, `run.json.profile`/`profile.json`, legacy mapping, Rust behaviour and regressions preserved; no new language.
+- **Phase 2 — prove the abstraction with Python**: pytest discovery, exact-case selection, structured evidence and source-binding checks; explicitly configured dependency preparation and applicable quality checks; an end-to-end Rust issue and Python issue with the same engine/provider interfaces; define the custom command/report contract from both runners. Also moves the remaining Rust wording in prompts, schemas, config defaults and the PR template behind the profile.
+- **Phase 3 — JavaScript / TypeScript**: package-manager/lockfile evidence and an explicitly supported runner (Jest or Vitest first); runner-specific report parsing, exact selectors, lock/config guards and source-binding tests; one selected workspace package, then affected dependency scope.
+- **Phase 4 — broader coverage**: Go, then Java, .NET, C/C++ by repository demand; exercise the custom profile with a language outside the built-in set; mixed-language coordination and cross-project checks; evaluate container execution and automatic setup only after execution contracts are stable.
+
+Acceptance criteria (from issue #4):
+
+- LYRA remains a Rust application and the outer pipeline remains unchanged.
+- Rust, Python and JS/TS fixtures complete the same failure-before/fix/pass-after workflow.
+- A further language can onboard through the documented custom contract without rewriting the pipeline driver.
+- Offline unit/fixture tests cover every parser and profile contract; runner integration tests use provisioned toolchains explicitly.
+- Negative cases cover no tests, skip/xfail, wrong selector, stale/malformed reports, compilation/setup failure and incomplete output.
+- Guards reject changed tests, registration, fixtures, verification commands, manifests/configuration and source redirection as applicable.
+- Cancellation, retry, interrupted-run recovery and cleanup work without mixing profile/attempt evidence.
+- Existing saved Rust runs remain readable; incompatible verification evidence cannot certify a new PR.
+- Target-repository contribution and AI policies remain enforced with scope.
+- CI covers harness Rust checks and dashboard JS tests on supported operating systems; provisioned runner fixtures cover the added ecosystems.
+- At least one real end-to-end issue per initial ecosystem is validated, with declared environment and provider; draft head equals the verified commit.
+- README/SETUP document onboarding examples, supported capabilities, custom-profile requirements and honest environment limits.
+
+Out of scope here, as in the issue: multi-model RCA, LangGraph, distributed scheduling, automatic merge, cloning and dynamic runtime plugins. A profile is a built-in module plus tests, not a plugin, and a language profile does not by itself isolate hostile code (§12).

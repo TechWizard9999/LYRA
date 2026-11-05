@@ -160,10 +160,17 @@ pub async fn run(config: &Config) -> Report {
         }
         Err(e) => r.push(false, format!("gh: {e}")),
     }
-    for tool in ["git", "cargo"] {
-        match version(tool).await {
-            Ok(v) => r.push(true, format!("{tool}: {v}")),
-            Err(e) => r.push(false, format!("{tool}: {e}")),
+    match version("git").await {
+        Ok(v) => r.push(true, format!("git: {v}")),
+        Err(e) => r.push(false, format!("git: {e}")),
+    }
+    // Each built-in execution profile names the tools it runs on the target repository.
+    for profile in crate::profile::builtin() {
+        for tool in profile.required_tools() {
+            match version(tool).await {
+                Ok(v) => r.push(true, format!("{tool} ({} profile): {v}", profile.id())),
+                Err(e) => r.push(false, format!("{tool} ({} profile): {e}", profile.id())),
+            }
         }
     }
     r

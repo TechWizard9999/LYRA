@@ -1,6 +1,6 @@
 # LYRA
 
-LYRA is a local harness around an off-the-shelf coding agent (Claude Code or Codex CLI). You point it at a Rust repository you have already cloned and a GitHub issue; it gathers context, has the agent write a failing regression test in its own file, finds the root cause in a read-only pass, has the agent fix the production code while the test is locked, verifies the fix by actually running the test and the workspace checks, and opens a **draft** PR for the exact commit that passed. Every step is checkpointed, written to disk and streamed live to a dashboard on `localhost`. When it cannot finish (the bug does not reproduce, the root cause stays unresolved, verification fails) it stops with the evidence and a Retry button.
+LYRA is a local harness around an off-the-shelf coding agent (Claude Code or Codex CLI). You point it at a repository you have already cloned (Rust via the built-in `rust-cargo` profile today) and a GitHub issue; it gathers context, has the agent write a failing regression test in its own file, finds the root cause in a read-only pass, has the agent fix the production code while the test is locked, verifies the fix by actually running the test and the workspace checks, and opens a **draft** PR for the exact commit that passed. Every step is checkpointed, written to disk and streamed live to a dashboard on `localhost`. When it cannot finish (the bug does not reproduce, the root cause stays unresolved, verification fails) it stops with the evidence and a Retry button.
 
 ## Flow
 
@@ -28,7 +28,7 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1   # Windows; policy applies
 The setup script checks your tools, builds `target/release/lyra` with `--locked`, and runs `lyra doctor`, which creates `~/.lyra/config.toml` if it does not exist. Full prerequisites and troubleshooting are in [SETUP.md](SETUP.md).
 
 ```sh
-lyra doctor          # runtime + local auth status, gh auth status, cargo
+lyra doctor          # runtime + local auth status, gh auth status, git, profile tools (cargo, rustfmt)
 lyra serve           # dashboard on http://127.0.0.1:7700 (opens the browser)
 ```
 
@@ -76,6 +76,10 @@ fmt   = "cargo fmt --all -- --check"
 ```
 
 Each `[providers.<id>]` table needs `kind`; `bin = "..."` and `extra_args = [...]` are optional. A repository can ship a `lyra.toml` with a `[verify]` table to override the verify commands; nothing else can be overridden per repository.
+
+### Execution profiles
+
+Everything LYRA knows about the target repository's toolchain and test runner lives in an execution profile; the stages and guards are runner-neutral. Intake detects the profile from files in the worktree without executing anything: today the only built-in profile is `rust-cargo`, chosen when `Cargo.toml` is at the repository root. The resolved profile (`id`, contract `version`, project directory, evidence) is saved in `run.json` and as `artifacts/profile.json`, and is frozen for the run; Retry from Intake re-resolves it. A repository with no matching profile fails Intake with a message naming what was looked for and the supported profile ids; it is a missing-profile diagnostic, not a language rejection, and other languages are onboarded through new profiles ([issue #4](https://github.com/TechWizard9999/LYRA/issues/4), [docs/PLAN.md](docs/PLAN.md) §13). Runs saved before this field existed are read as `rust-cargo`. `lyra doctor` reports each profile's required tools (`cargo`, `rustfmt` for `rust-cargo`) next to the profile id.
 
 ## Stages and guards
 
@@ -126,7 +130,7 @@ SSE reconnects resume with `Last-Event-ID`. After all saved events for a termina
 
 ## Limitations of this release
 
-- Rust repositories on GitHub only; one active run at a time; one runtime per run.
+- GitHub-hosted repositories matching a built-in execution profile; the only built-in profile is `rust-cargo` (`Cargo.toml` at the repository root), so Python, JavaScript and other targets are not supported yet. They onboard through new profiles behind the same contract ([issue #4](https://github.com/TechWizard9999/LYRA/issues/4), [docs/PLAN.md](docs/PLAN.md) §13). One active run at a time; one runtime per run.
 - Draft PRs only, never merged.
 - LYRA builds and tests repositories on your machine without a container sandbox. The harness runs `cargo`, which executes the target repository's build scripts and tests; only run LYRA on repositories you are willing to build locally.
 - The dashboard supports loopback addresses only (`127.0.0.1`, `localhost`, or `::1`). Non-loopback binds are rejected; remote hosting is outside this release.
