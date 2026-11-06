@@ -1,6 +1,6 @@
 # LYRA
 
-LYRA is a local harness around an off-the-shelf coding agent (Claude Code or Codex CLI). You point it at a repository you have already cloned (Rust via the built-in `rust-cargo` profile today) and a GitHub issue; it gathers context, has the agent write a failing regression test in its own file, finds the root cause in a read-only pass, has the agent fix the production code while the test is locked, verifies the fix by actually running the test and the workspace checks, and opens a **draft** PR for the exact commit that passed. Every step is checkpointed, written to disk and streamed live to a dashboard on `localhost`. When it cannot finish (the bug does not reproduce, the root cause stays unresolved, verification fails) it stops with the evidence and a Retry button.
+LYRA is a local harness around an off-the-shelf coding agent (Claude Code or Codex CLI). You point it at a repository you have already cloned (Rust via the built-in `rust-cargo` profile, Python via `python-pytest`) and a GitHub issue; it gathers context, has the agent write a failing regression test in its own file, finds the root cause in a read-only pass, has the agent fix the production code while the test is locked, verifies the fix by actually running the test and the workspace checks, and opens a **draft** PR for the exact commit that passed. Every step is checkpointed, written to disk and streamed live to a dashboard on `localhost`. When it cannot finish (the bug does not reproduce, the root cause stays unresolved, verification fails) it stops with the evidence and a Retry button.
 
 ## Flow
 
@@ -28,7 +28,7 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1   # Windows; policy applies
 The setup script checks your tools, builds `target/release/lyra` with `--locked`, and runs `lyra doctor`, which creates `~/.lyra/config.toml` if it does not exist. Full prerequisites and troubleshooting are in [SETUP.md](SETUP.md).
 
 ```sh
-lyra doctor          # runtime + local auth status, gh auth status, git, profile tools (cargo, rustfmt)
+lyra doctor          # runtime + local auth status, gh auth status, git, profile tools (cargo, rustfmt, python3)
 lyra serve           # dashboard on http://127.0.0.1:7700 (opens the browser)
 ```
 
@@ -39,6 +39,7 @@ From a terminal instead:
 ```sh
 lyra run --repo /path/to/cloned/repo --issue https://github.com/owner/repo/issues/123
 lyra run --repo . --issue 42 --issue-file issue.md     # offline: issue text from a file
+lyra run --repo . --issue 42 --profile python-pytest    # choose the profile in a repo that matches several
 lyra runs                                              # list runs
 lyra retry <run-id> --from fix                         # intake|context|repro|rca|fix|verify|pr
 lyra retry <run-id> --from pr --ack-policy             # acknowledge a discovered policy and retry
@@ -79,7 +80,11 @@ Each `[providers.<id>]` table needs `kind`; `bin = "..."` and `extra_args = [...
 
 ### Execution profiles
 
-Everything LYRA knows about the target repository's toolchain and test runner lives in an execution profile; the stages and guards are runner-neutral. Intake detects the profile from files in the worktree without executing anything: today the only built-in profile is `rust-cargo`, chosen when `Cargo.toml` is at the repository root. The resolved profile (`id`, contract `version`, project directory, evidence) is saved in `run.json` and as `artifacts/profile.json`, and is frozen for the run; Retry from Intake re-resolves it. A repository with no matching profile fails Intake with a message naming what was looked for and the supported profile ids; it is a missing-profile diagnostic, not a language rejection, and other languages are onboarded through new profiles ([issue #4](https://github.com/TechWizard9999/LYRA/issues/4), [docs/PLAN.md](docs/PLAN.md) §13). Runs saved before this field existed are read as `rust-cargo`. `lyra doctor` reports each profile's required tools (`cargo`, `rustfmt` for `rust-cargo`) next to the profile id.
+Everything LYRA knows about the target repository's toolchain and test runner lives in an execution profile; the stages and guards are runner-neutral. Intake detects the profile from files in the worktree without executing anything. Two profiles are built in: `rust-cargo`, chosen when `Cargo.toml` is at the repository root, and `python-pytest`, chosen otherwise when the root has pytest evidence (`pytest.ini`, `pytest.toml`, `[tool.pytest...]` in `pyproject.toml`, `[tool:pytest]` in `setup.cfg`, `[pytest]` in `tox.ini`, a `conftest.py`, or pytest declared in `pyproject.toml` / `requirements*.txt`). The resolved profile (`id`, contract `version`, project directory, evidence) is saved in `run.json` and as `artifacts/profile.json`, and is frozen for the run; Retry from Intake re-resolves it. A repository with no matching profile fails Intake with a message naming what was looked for and the supported profile ids; it is a missing-profile diagnostic, not a language rejection, and other languages are onboarded through new profiles ([issue #4](https://github.com/TechWizard9999/LYRA/issues/4), [docs/PLAN.md](docs/PLAN.md) §13). Runs saved before this field existed are read as `rust-cargo`. `lyra doctor` reports each profile's required tools (`cargo`, `rustfmt` for `rust-cargo`; `python3` for `python-pytest`) next to the profile id; Intake refuses a run whose profile tools are missing.
+
+**Python repositories.** LYRA runs the `python3` on `PATH` (Windows: `python`) and installs nothing, so start `lyra serve` / `lyra run` from an environment that has pytest and the project's dependencies, for example `source .venv/bin/activate`. The regression test is a new `test_issue_<n>.py` module selected by its pytest node id; LYRA runs it with the repository's `addopts` neutralised and the cache provider off, so nothing is written into the checkout. Imports are bound to the checkout under test (`PYTHONPATH` = checkout and `src/`), and verification first checks that the project's packages resolve there, so an editable install of another clone cannot stand in for the fix. Verification then runs the node and `python3 -m pytest`, plus `build` / `fmt` only if configured. `conftest.py`, pytest configuration, plugin entry points and the test directory's helpers, package initializers and data are locked like Cargo's test registration (PLAN §13.6). A repository that matches both profiles uses `rust-cargo` unless you pick one with `--profile` or the dashboard's *Execution profile* select; the run log names the other match.
+
+**Verify commands per profile.** The top-level `[verify]` table applies to `rust-cargo` repositories; other profiles use `[profiles.<id>.verify]` (for example `[profiles.python-pytest.verify]` with `fmt = "ruff format --check ."`) or their built-in defaults. A repository's own `lyra.toml [verify]` overrides either.
 
 ## Stages and guards
 
@@ -130,7 +135,7 @@ SSE reconnects resume with `Last-Event-ID`. After all saved events for a termina
 
 ## Limitations of this release
 
-- GitHub-hosted repositories matching a built-in execution profile; the only built-in profile is `rust-cargo` (`Cargo.toml` at the repository root), so Python, JavaScript and other targets are not supported yet. They onboard through new profiles behind the same contract ([issue #4](https://github.com/TechWizard9999/LYRA/issues/4), [docs/PLAN.md](docs/PLAN.md) §13). One active run at a time; one runtime per run.
+- GitHub-hosted repositories matching a built-in execution profile: `rust-cargo` (`Cargo.toml` at the repository root) or `python-pytest` (pytest evidence at the root). Python support needs a pre-provisioned environment; LYRA does not create virtual environments or install dependencies, and a repro test may not add dependencies. Projects in a subdirectory, unittest-only Python projects, JavaScript and other targets are not supported yet. They onboard through new profiles behind the same contract ([issue #4](https://github.com/TechWizard9999/LYRA/issues/4), [docs/PLAN.md](docs/PLAN.md) §13). One active run at a time; one runtime per run.
 - Draft PRs only, never merged.
 - LYRA builds and tests repositories on your machine without a container sandbox. The harness runs `cargo`, which executes the target repository's build scripts and tests; only run LYRA on repositories you are willing to build locally.
 - The dashboard supports loopback addresses only (`127.0.0.1`, `localhost`, or `::1`). Non-loopback binds are rejected; remote hosting is outside this release.

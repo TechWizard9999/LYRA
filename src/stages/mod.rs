@@ -90,18 +90,38 @@ impl StageCtx {
         paths
     }
 
-    /// Renders a prompt template from `src/prompts/` with the given values.
+    /// Renders a prompt template from `src/prompts/` with the given values and this run's
+    /// execution profile (its prompt macros and language).
     pub fn render(&self, template_name: &str, template: &str, values: serde_json::Value) -> anyhow::Result<String> {
-        let mut env = minijinja::Environment::new();
-        env.add_template(template_name, template)?;
-        let tmpl = env.get_template(template_name)?;
-        Ok(tmpl.render(values)?)
+        let profile = self.profile()?;
+        render_prompt(&*profile, template_name, template, values)
     }
+}
+
+/// Renders a stage prompt: the profile's macro file is importable as `profile.md` and
+/// `language` names the target language. Both are harness-authored, never untrusted input.
+pub fn render_prompt(
+    profile: &dyn ExecutionProfile,
+    template_name: &str,
+    template: &str,
+    mut values: serde_json::Value,
+) -> anyhow::Result<String> {
+    let mut env = minijinja::Environment::new();
+    env.add_template("profile.md", profile.prompt_macros())?;
+    env.add_template(template_name, template)?;
+    if let Some(object) = values.as_object_mut() {
+        object.insert("language".into(), serde_json::Value::from(profile.language()));
+    }
+    Ok(env.get_template(template_name)?.render(values)?)
 }
 
 /// Line-numbered source evidence for the agent: the relevant files completely (with the
 /// profile's ancestor manifests), then a bounded overview of the profile's source files.
-fn readonly_source_snapshot(root: &std::path::Path, relevant: &[String], profile: &dyn ExecutionProfile) -> String {
+pub(crate) fn readonly_source_snapshot(
+    root: &std::path::Path,
+    relevant: &[String],
+    profile: &dyn ExecutionProfile,
+) -> String {
     use std::io::Read;
     const FILE_LIMIT: usize = 24_000;
     const TOTAL_LIMIT: usize = 240_000;
@@ -121,12 +141,14 @@ fn readonly_source_snapshot(root: &std::path::Path, relevant: &[String], profile
         (resolved.starts_with(root) && resolved.is_file()).then_some(relative.to_path_buf())
     }
     fn append_source(snapshot: &mut String, relative: &std::path::Path, source: &str) {
-        snapshot.push_str(&format!("\nFile: {}\n", relative.display()));
+        // Repository-relative paths use `/` on every platform, as everywhere else in LYRA.
+        snapshot.push_str(&format!("\nFile: {}\n", relative.to_string_lossy().replace('\\', "/")));
         for (index, line) in source.lines().enumerate() {
             snapshot.push_str(&format!("{}: {}\n", index + 1, line));
         }
     }
     fn collect(
+        root: &std::path::Path,
         dir: &std::path::Path,
         depth: usize,
         paths: &mut Vec<std::path::PathBuf>,
@@ -149,8 +171,9 @@ fn readonly_source_snapshot(root: &std::path::Path, relevant: &[String], profile
             if kind.is_dir() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if !name.starts_with('.') && !profile.generated_dirs().contains(&name.as_ref()) {
-                    collect(&path, depth + 1, paths, profile);
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                if !name.starts_with('.') && !profile.is_generated_dir(relative, &path) {
+                    collect(root, &path, depth + 1, paths, profile);
                 }
             } else if kind.is_file() && profile.is_source_file(&path) {
                 paths.push(path);
@@ -161,7 +184,7 @@ fn readonly_source_snapshot(root: &std::path::Path, relevant: &[String], profile
         }
     }
     let mut paths = Vec::new();
-    collect(root, 0, &mut paths, profile);
+    collect(root, root, 0, &mut paths, profile);
     paths.sort();
     let mut snapshot = String::new();
     let canonical_root = dunce::canonicalize(root).ok();
@@ -187,9 +210,10 @@ fn readonly_source_snapshot(root: &std::path::Path, relevant: &[String], profile
         for path in &complete {
             match std::fs::read_to_string(canonical_root.join(path)) {
                 Ok(source) => append_source(&mut snapshot, path, &source),
-                Err(error) => {
-                    snapshot.push_str(&format!("\n[Relevant source omitted: {}: {error}.]\n", path.display()))
-                }
+                Err(error) => snapshot.push_str(&format!(
+                    "\n[Relevant source omitted: {}: {error}.]\n",
+                    path.to_string_lossy().replace('\\', "/")
+                )),
             }
         }
     }
@@ -322,6 +346,7 @@ mod tests {
             issue_text: None,
             provider: None,
             policy_acknowledged: false,
+            profile: None,
         };
         let ctx = StageCtx {
             events: EventSink::open("fixture", &dir.path().join("events.jsonl")).unwrap(),

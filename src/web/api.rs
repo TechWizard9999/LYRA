@@ -123,6 +123,13 @@ pub fn submit(engine: &std::sync::Arc<Engine>, mut req: RunRequest) -> ApiResult
     }
     req.repo = normalize_repo(req.repo);
     req.issue = req.issue.trim().to_string();
+    req.profile = req.profile.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
+    if let Some(id) = req.profile.as_deref() {
+        if crate::profile::by_id(id).is_none() {
+            let supported = crate::profile::builtin().iter().map(|p| p.id()).collect::<Vec<_>>().join(", ");
+            return Err(ApiError::bad_request(format!("unknown execution profile '{id}'; supported: {supported}")));
+        }
+    }
     if engine.is_busy() {
         return Err(ApiError::conflict("a run is already active; wait for it to finish or cancel it"));
     }
@@ -401,6 +408,7 @@ mod tests {
             issue_text: None,
             provider: None,
             policy_acknowledged: false,
+            profile: None,
         };
         RunState::new("r1".into(), req, "claude".into()).save(&rd.root).unwrap();
         (home, engine)
@@ -523,6 +531,7 @@ mod tests {
             issue_text: None,
             provider: None,
             policy_acknowledged: false,
+            profile: None,
         };
         RunState::new("r1".into(), req, "claude".into()).save(&rd.root).unwrap();
         std::fs::write(outside.path().join("secret.txt"), "secret-not-an-artifact").unwrap();

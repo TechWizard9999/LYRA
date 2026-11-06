@@ -135,6 +135,7 @@ async fn create_run_form(State(s): State<AppState>, Form(f): Form<NewRunForm>) -
         issue_text: (!text.is_empty()).then(|| text.to_string()),
         provider: (!f.provider.is_empty()).then(|| f.provider.clone()),
         policy_acknowledged: f.policy_acknowledged.is_some(),
+        profile: (!f.profile.trim().is_empty()).then(|| f.profile.trim().to_string()),
     };
     let engine = s.engine.clone();
     match api::blocking(move || api::submit(&engine, req)).await {
@@ -276,6 +277,7 @@ mod tests {
             issue_text: None,
             provider: None,
             policy_acknowledged: false,
+            profile: None,
         };
         let mut st = RunState::new(id.into(), req, "claude".into());
         st.status = Status::Failed;

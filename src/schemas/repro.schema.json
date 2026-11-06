@@ -9,19 +9,19 @@
     },
     "crate": {
       "type": "string",
-      "description": "Cargo package name of the crate holding the test, as accepted by `cargo test -p`."
+      "description": "Project the test belongs to, as the execution profile selects it: the Cargo package name (`cargo test -p`) for rust-cargo; an empty string for python-pytest."
     },
     "test_file": {
       "type": "string",
-      "description": "Repository-relative path of the new test file, forward slashes (e.g. tests/issue_123.rs or src/parser/issue_123_tests.rs)."
+      "description": "Repository-relative path of the new test file, forward slashes (e.g. tests/issue_123.rs, src/parser/issue_123_tests.rs or tests/test_issue_123.py)."
     },
     "test_name": {
       "type": "string",
-      "description": "The test's name exactly as cargo prints it: the bare function name for an integration test, the module path for a unit-test module (e.g. parser::issue_123_tests::issue_123_rejects_short_frame)."
+      "description": "The exact test identity the runner prints: for rust-cargo the bare function name of an integration test or the module path of a unit-test module (e.g. parser::issue_123_tests::issue_123_rejects_short_frame); for python-pytest the node id (e.g. tests/test_issue_123.py::test_issue_123_rejects_short_frame)."
     },
     "command": {
       "type": "string",
-      "description": "cargo test -p <crate> <test_name> -- --exact"
+      "description": "The command that runs exactly this test, as the prompt describes it. Informational: the harness rebuilds it from the execution profile."
     },
     "expected": {
       "type": "string",
@@ -33,7 +33,7 @@
     },
     "registration_file": {
       "type": ["string", "null"],
-      "description": "For a unit-test module: the existing source file that received the `#[cfg(test)] mod issue_<n>_tests;` line. Null for an integration test."
+      "description": "For a rust-cargo unit-test module: the existing source file that received the `#[cfg(test)] mod issue_<n>_tests;` line. Null for an integration test and for profiles without registration (python-pytest)."
     },
     "notes": {
       "type": "string",

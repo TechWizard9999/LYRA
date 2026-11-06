@@ -1,5 +1,10 @@
 //! Configuration: `~/.lyra/config.toml` (or `$LYRA_HOME/config.toml`) plus an optional
 //! `<repo>/lyra.toml` that can override the verify commands.
+//!
+//! Verify commands are per execution profile ([`Config::verify_commands`]): the repository's
+//! `lyra.toml [verify]` wins, then the operator's `[profiles.<id>.verify]`, then (for
+//! `rust-cargo` only) the operator's historical top-level `[verify]`, then the profile's
+//! built-in default.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -12,7 +17,33 @@ pub struct Config {
     pub run: RunConfig,
     pub server: ServerConfig,
     pub providers: BTreeMap<String, ProviderConfig>,
+    /// The `rust-cargo` verify commands (the table predates execution profiles).
     pub verify: VerifyConfig,
+    /// Per-profile settings, `[profiles.<profile id>]`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, ProfileConfig>,
+    /// `[verify]` from the target repository's `lyra.toml`, applied to whichever profile the
+    /// repository resolves to. Never read from or written to `config.toml`.
+    #[serde(skip)]
+    pub repository_verify: VerifyCommands,
+}
+
+/// Verify commands for one profile; `None` means "not set at this level".
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VerifyCommands {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fmt: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfileConfig {
+    pub verify: VerifyCommands,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -102,7 +133,14 @@ impl Default for Config {
             "codex".to_string(),
             ProviderConfig { kind: ProviderKind::Codex, model: None, ..Default::default() },
         );
-        Self { run: RunConfig::default(), server: ServerConfig::default(), providers, verify: VerifyConfig::default() }
+        Self {
+            run: RunConfig::default(),
+            server: ServerConfig::default(),
+            providers,
+            verify: VerifyConfig::default(),
+            profiles: BTreeMap::new(),
+            repository_verify: VerifyCommands::default(),
+        }
     }
 }
 
@@ -110,15 +148,7 @@ impl Default for Config {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RepoOverrides {
-    verify: Option<PartialVerify>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct PartialVerify {
-    build: Option<String>,
-    test: Option<String>,
-    fmt: Option<String>,
+    verify: Option<VerifyCommands>,
 }
 
 /// `$LYRA_HOME` or `~/.lyra`.
@@ -173,25 +203,42 @@ impl Config {
         Ok(())
     }
 
-    /// Applies `<repo>/lyra.toml` overrides (verify commands only).
+    /// Records `<repo>/lyra.toml` overrides (verify commands only) for [`Self::verify_commands`].
     pub fn with_repo_overrides(mut self, repo: &Path) -> Result<Self> {
         let path = repo.join("lyra.toml");
         if path.exists() {
             let text = std::fs::read_to_string(&path)?;
             let o: RepoOverrides = toml::from_str(&text).context("parsing lyra.toml")?;
             if let Some(v) = o.verify {
-                if let Some(b) = v.build {
-                    self.verify.build = b;
-                }
-                if let Some(t) = v.test {
-                    self.verify.test = t;
-                }
-                if let Some(f) = v.fmt {
-                    self.verify.fmt = f;
-                }
+                self.repository_verify = v;
             }
         }
         Ok(self)
+    }
+
+    /// The verify commands for a run with this execution profile; `None` leaves the step to
+    /// the profile's default. Precedence: repository `lyra.toml`, operator
+    /// `[profiles.<id>.verify]`, operator `[verify]` (`rust-cargo` only).
+    pub fn verify_commands(&self, profile_id: &str) -> VerifyCommands {
+        let operator = self.profiles.get(profile_id).map(|p| p.verify.clone()).unwrap_or_default();
+        let legacy = if profile_id == crate::profile::rust_cargo::ID {
+            VerifyCommands {
+                build: Some(self.verify.build.clone()),
+                test: Some(self.verify.test.clone()),
+                fmt: Some(self.verify.fmt.clone()),
+            }
+        } else {
+            VerifyCommands::default()
+        };
+        let pick = |repo: &Option<String>, operator: &Option<String>, legacy: &Option<String>| {
+            repo.clone().or_else(|| operator.clone()).or_else(|| legacy.clone())
+        };
+        let repo = &self.repository_verify;
+        VerifyCommands {
+            build: pick(&repo.build, &operator.build, &legacy.build),
+            test: pick(&repo.test, &operator.test, &legacy.test),
+            fmt: pick(&repo.fmt, &operator.fmt, &legacy.fmt),
+        }
     }
 
     pub fn provider(&self, id: &str) -> Result<&ProviderConfig> {
@@ -222,10 +269,16 @@ model = "opus"
 kind = "codex"
 # model = "gpt-5.5-codex"
 
-[verify]                       # <repo>/lyra.toml can override these
+[verify]                       # rust-cargo repositories; <repo>/lyra.toml [verify] overrides any profile
 build = "cargo build --workspace"
 test  = "cargo test --workspace"
 fmt   = "cargo fmt --all -- --check"
+
+# python-pytest repositories: the regression test and `python3 -m pytest` always run;
+# build and fmt run only when set. LYRA uses the python3 on PATH (activate your venv first).
+# [profiles.python-pytest.verify]
+# test = "python3 -m pytest"
+# fmt  = "ruff format --check ."
 "#;
 
 #[cfg(test)]
@@ -258,9 +311,38 @@ mod tests {
         )
         .unwrap();
         let cfg = Config::default().with_repo_overrides(dir.path()).unwrap();
-        assert_eq!(cfg.verify.test, "cargo test -p core");
-        assert_eq!(cfg.verify.build, "cargo build --workspace");
+        let rust = cfg.verify_commands("rust-cargo");
+        assert_eq!(rust.test.as_deref(), Some("cargo test -p core"));
+        assert_eq!(rust.build.as_deref(), Some("cargo build --workspace"));
         assert_eq!(cfg.run.provider, "claude");
+        // The repository's table applies to whichever profile the repository resolves to,
+        // and the Cargo defaults never leak into another profile.
+        let python = cfg.verify_commands("python-pytest");
+        assert_eq!(python.test.as_deref(), Some("cargo test -p core"));
+        assert_eq!((python.build, python.fmt), (None, None));
+    }
+
+    #[test]
+    fn profile_tables_sit_between_repository_and_legacy_settings() {
+        let cfg = Config::parse(
+            "[verify]\ntest = \"cargo nextest run\"\n\
+             [profiles.python-pytest.verify]\ntest = \"python3 -m pytest -q tests\"\nfmt = \"ruff format --check .\"\n\
+             [profiles.rust-cargo.verify]\nfmt = \"true\"\n",
+        )
+        .unwrap();
+        let python = cfg.verify_commands("python-pytest");
+        assert_eq!(python.test.as_deref(), Some("python3 -m pytest -q tests"));
+        assert_eq!(python.fmt.as_deref(), Some("ruff format --check ."));
+        assert_eq!(python.build, None);
+        let rust = cfg.verify_commands("rust-cargo");
+        assert_eq!(rust.test.as_deref(), Some("cargo nextest run"));
+        assert_eq!(rust.fmt.as_deref(), Some("true"), "a profile table beats the legacy table");
+        assert_eq!(rust.build.as_deref(), Some("cargo build --workspace"));
+        // The default file still parses and, with a repository override, the repository wins.
+        let mut with_repo = cfg.clone();
+        with_repo.repository_verify.test = Some("python3 -m pytest tests/unit".into());
+        assert_eq!(with_repo.verify_commands("python-pytest").test.as_deref(), Some("python3 -m pytest tests/unit"));
+        assert!(Config::parse(DEFAULT_CONFIG_TOML).unwrap().profiles.is_empty());
     }
 
     #[test]

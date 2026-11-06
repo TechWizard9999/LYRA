@@ -26,6 +26,10 @@ pub struct RunRequest {
     /// The user ticked "I read the repository's contribution policy".
     #[serde(default)]
     pub policy_acknowledged: bool,
+    /// Execution profile id chosen by the operator for a repository that matches more than one
+    /// built-in profile. None = detection order (PLAN §13.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +297,7 @@ mod tests {
             issue_text: None,
             provider: None,
             policy_acknowledged: false,
+            profile: None,
         }
     }
 
@@ -364,14 +369,14 @@ mod tests {
         state.frozen_repro = Some(frozen_record());
         assert!(state.require_frozen_repro().is_ok());
         state.profile = Some(ResolvedProfile {
-            id: "python-pytest".into(),
+            id: "go-test".into(),
             version: profile::CONTRACT_VERSION,
             project_dir: String::new(),
             evidence: vec![],
         });
         let error = state.require_frozen_repro().unwrap_err();
         assert_eq!(error.kind, ErrorKind::Config);
-        assert!(error.message.contains("python-pytest"), "{error:?}");
+        assert!(error.message.contains("go-test"), "{error:?}");
     }
 
     #[test]

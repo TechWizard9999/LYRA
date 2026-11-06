@@ -184,7 +184,7 @@ async fn verify_checkout(
     guard(profile.check_environment(env_root))?;
 
     let steps = profile
-        .verification_steps(&ctx.config.verify, rec, worktree)
+        .verification_steps(&ctx.config.verify_commands(profile.id()), rec, worktree)
         .map_err(|message| StageError::fatal(ErrorKind::Config, message))?;
     let mut result = VerifyResult {
         repository_overrides: repository_verify_overrides(&ctx.state.request.repo)?,
@@ -461,6 +461,7 @@ mod tests {
                 issue_text: None,
                 provider: None,
                 policy_acknowledged: false,
+                profile: None,
             },
             "claude".into(),
         );

@@ -242,17 +242,25 @@ mod tests {
 
     #[test]
     fn prompt_renders() {
-        let mut env = minijinja::Environment::new();
-        env.add_template("fix.md", assets::FIX_PROMPT).unwrap();
-        let text = env
-            .get_template("fix.md")
-            .unwrap()
-            .render(json!({"issue": "# Bug", "rca_json": "{}", "repro_json": "{}", "instructions": "", "test_file": "tests/issue_3.rs",
+        use crate::profile::{python_pytest::PythonPytest, rust_cargo::RustCargo};
+        use crate::stages::render_prompt;
+        let text = render_prompt(&RustCargo, "fix.md", assets::FIX_PROMPT,
+            json!({"issue": "# Bug", "rca_json": "{}", "repro_json": "{}", "instructions": "", "test_file": "tests/issue_3.rs",
                 "test_name": "issue_3_x", "command": "cargo test -p foo issue_3_x -- --exact", "crate_name": "foo", "issue_number": 3}))
             .unwrap();
+        assert!(text.contains("in the Rust repository"));
         assert!(text.contains("Do NOT modify `tests/issue_3.rs`"));
         assert!(text.contains("mod issue_3_tests;"));
         assert!(text.contains("cargo test -p foo"));
         assert!(!text.contains("Repository instructions"));
+
+        let text = render_prompt(&PythonPytest, "fix.md", assets::FIX_PROMPT,
+            json!({"issue": "# Bug", "rca_json": "{}", "repro_json": "{}", "instructions": "", "test_file": "tests/test_issue_3.py",
+                "test_name": "tests/test_issue_3.py::test_issue_3_x", "command": "python3 -m pytest", "issue_number": 3}))
+            .unwrap();
+        assert!(text.contains("in the Python repository"));
+        assert!(text.contains("Do NOT modify `tests/test_issue_3.py`, anything else in its test directory"));
+        assert!(text.contains("any `conftest.py`"));
+        assert!(!text.contains("Cargo") && !text.contains("cfg(test)"), "{text}");
     }
 }
