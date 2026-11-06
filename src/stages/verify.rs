@@ -461,6 +461,7 @@ mod tests {
                 issue_text: None,
                 provider: None,
                 policy_acknowledged: false,
+                profile: None,
             },
             "claude".into(),
         );

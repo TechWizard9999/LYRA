@@ -96,6 +96,10 @@ pub type FileReader<'a> = &'a dyn Fn(&str) -> Option<String>;
 #[async_trait]
 pub trait ExecutionProfile: Send + Sync {
     fn id(&self) -> &'static str;
+    /// This profile's evidence in an existing worktree, read from files only; `None` when absent.
+    fn detect(&self, worktree: &Path) -> Option<ResolvedProfile>;
+    /// What [`Self::detect`] looks for, quoted in diagnostics.
+    fn detection(&self) -> &'static str;
     /// Executables Intake requires for a run with this profile; `lyra doctor` reports them.
     fn required_tools(&self) -> &'static [&'static str];
     /// The target language as prompts name it ("Rust", "Python").
@@ -114,6 +118,12 @@ pub trait ExecutionProfile: Send + Sync {
     fn manifest_names(&self) -> &'static [&'static str];
     /// Directory names of build outputs, skipped in source overviews.
     fn generated_dirs(&self) -> &'static [&'static str];
+    /// Whether the directory at `path` (`relative` to the repository root) holds generated
+    /// output rather than source. The default matches [`Self::generated_dirs`] by name;
+    /// profiles whose tooling uses common words as output names decide by markers instead.
+    fn is_generated_dir(&self, relative: &Path, _path: &Path) -> bool {
+        relative.file_name().and_then(|n| n.to_str()).is_some_and(|name| self.generated_dirs().contains(&name))
+    }
     /// A path the toolchain or convention treats as test code.
     fn is_test_path(&self, path: &str) -> bool;
     /// Workspace/project layout for `10-context/repo.json` (best effort: errors are values).
@@ -202,24 +212,68 @@ pub fn by_id(id: &str) -> Option<Box<dyn ExecutionProfile>> {
     builtin().into_iter().find(|p| p.id() == id)
 }
 
-/// Detects the profile of an existing worktree from the files present, in [`builtin`]
-/// order: a root `Cargo.toml` wins over pytest evidence, so a Rust project that also ships
-/// Python tooling keeps its Rust behaviour. Explicit repository/operator selection comes in a
-/// later phase; today the built-in detectors are the only source, and nothing is executed.
-pub fn resolve(worktree: &Path) -> Result<(ResolvedProfile, Box<dyn ExecutionProfile>), String> {
-    if let Some(resolved) = rust_cargo::detect(worktree) {
-        return Ok((resolved, Box::new(rust_cargo::RustCargo)));
+/// The outcome of profile resolution: the chosen profile plus every other built-in profile
+/// whose evidence was also found, so an ambiguous repository is visible rather than silent.
+pub struct Resolution {
+    pub resolved: ResolvedProfile,
+    pub profile: Box<dyn ExecutionProfile>,
+    /// `"detection"` (first matching built-in profile) or `"request"` (chosen by the operator).
+    pub selected_by: &'static str,
+    /// Other built-in profiles whose evidence was found, in detection order.
+    pub alternatives: Vec<ResolvedProfile>,
+}
+
+impl Resolution {
+    /// `artifacts/profile.json`: the saved [`ResolvedProfile`] plus how it was selected and
+    /// which alternatives were detected. `run.json` keeps only the [`ResolvedProfile`].
+    pub fn artifact(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(&self.resolved).unwrap_or_default();
+        value["selected_by"] = serde_json::Value::from(self.selected_by);
+        value["alternatives"] = serde_json::to_value(&self.alternatives).unwrap_or_default();
+        value
     }
-    if let Some(resolved) = python_pytest::detect(worktree) {
-        return Ok((resolved, Box::new(python_pytest::PythonPytest)));
-    }
-    Err(format!(
-        "no built-in execution profile matches this repository (looked for {}; or {}); supported profiles: {}. \
-         Other languages onboard through a profile, see docs/PLAN.md §13",
-        rust_cargo::DETECTION,
-        python_pytest::DETECTION,
-        builtin().iter().map(|p| p.id()).collect::<Vec<_>>().join(", ")
-    ))
+}
+
+/// Resolves the profile of an existing worktree from the files present. Nothing is executed.
+///
+/// - `requested = Some(id)`: the operator's explicit choice (`lyra run --profile`, the
+///   dashboard, `POST /api/runs`). The id must be a built-in profile and its evidence must be
+///   present; a choice is never a way to run a runner the repository does not use.
+/// - `requested = None`: the first built-in profile in [`builtin`] order whose evidence is
+///   present. A root `Cargo.toml` therefore wins over pytest evidence, which keeps existing Rust
+///   runs unchanged; the other matches are reported as `alternatives`.
+pub fn resolve(worktree: &Path, requested: Option<&str>) -> Result<Resolution, String> {
+    let mut matches: Vec<(ResolvedProfile, Box<dyn ExecutionProfile>)> =
+        builtin().into_iter().filter_map(|p| p.detect(worktree).map(|r| (r, p))).collect();
+    let supported = builtin().iter().map(|p| p.id()).collect::<Vec<_>>().join(", ");
+    let index = match requested.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => {
+            let Some(wanted) = by_id(id) else {
+                return Err(format!("unknown execution profile '{id}'; supported profiles: {supported}"));
+            };
+            matches.iter().position(|(r, _)| r.id == id).ok_or_else(|| {
+                format!(
+                    "execution profile '{id}' was requested but this repository has none of its evidence (looked for {})",
+                    wanted.detection()
+                )
+            })?
+        }
+        None if matches.is_empty() => {
+            let looked_for = builtin().iter().map(|p| p.detection()).collect::<Vec<_>>().join("; or ");
+            return Err(format!(
+                "no built-in execution profile matches this repository (looked for {looked_for}); supported profiles: {supported}. \
+                 Other languages onboard through a profile, see docs/PLAN.md §13"
+            ));
+        }
+        None => 0,
+    };
+    let (resolved, profile) = matches.remove(index);
+    Ok(Resolution {
+        resolved,
+        profile,
+        selected_by: if requested.is_some_and(|id| !id.trim().is_empty()) { "request" } else { "detection" },
+        alternatives: matches.into_iter().map(|(r, _)| r).collect(),
+    })
 }
 
 /// Executables from `profile.required_tools()` that cannot be found on `PATH`.
@@ -264,6 +318,7 @@ mod tests {
                 issue_text: None,
                 provider: None,
                 policy_acknowledged: false,
+                profile: None,
             },
             "claude".into(),
         )
@@ -273,26 +328,59 @@ mod tests {
     fn cargo_manifest_at_the_root_resolves_to_rust_cargo() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
-        let (resolved, profile) = resolve(dir.path()).unwrap();
+        let resolution = resolve(dir.path(), None).unwrap();
+        let resolved = &resolution.resolved;
         assert_eq!(resolved.id, "rust-cargo");
         assert_eq!(resolved.version, CONTRACT_VERSION);
         assert_eq!(resolved.project_dir, "");
         assert_eq!(resolved.evidence, vec!["Cargo.toml".to_string()]);
-        assert_eq!(profile.id(), "rust-cargo");
+        assert_eq!(resolution.profile.id(), "rust-cargo");
+        assert_eq!(resolution.selected_by, "detection");
+        assert!(resolution.alternatives.is_empty());
+    }
+
+    #[test]
+    fn mixed_repositories_default_to_cargo_report_alternatives_and_accept_an_explicit_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        std::fs::write(dir.path().join("pytest.ini"), "[pytest]\n").unwrap();
+
+        // Unchanged default for legacy and unambiguous behaviour, with the other match visible.
+        let default = resolve(dir.path(), None).unwrap();
+        assert_eq!((default.resolved.id.as_str(), default.selected_by), ("rust-cargo", "detection"));
+        assert_eq!(default.alternatives.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["python-pytest"]);
+        let artifact = default.artifact();
+        assert_eq!(artifact["alternatives"][0]["evidence"], serde_json::json!(["pytest.ini"]));
+        assert_eq!(artifact["selected_by"], "detection");
+        // The saved run.json shape is unchanged: only ResolvedProfile is stored there.
+        assert!(serde_json::to_value(&default.resolved).unwrap().get("alternatives").is_none());
+
+        // Either supported runner can be targeted explicitly.
+        let python = resolve(dir.path(), Some("python-pytest")).unwrap();
+        assert_eq!((python.resolved.id.as_str(), python.selected_by), ("python-pytest", "request"));
+        assert_eq!(python.alternatives.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["rust-cargo"]);
+        assert_eq!(resolve(dir.path(), Some("rust-cargo")).unwrap().resolved.id, "rust-cargo");
+        assert_eq!(resolve(dir.path(), Some(" ")).unwrap().selected_by, "detection", "blank means auto-detect");
+
+        // A choice needs that profile's evidence and a known id.
+        std::fs::remove_file(dir.path().join("pytest.ini")).unwrap();
+        let error = resolve(dir.path(), Some("python-pytest")).err().unwrap();
+        assert!(error.contains("none of its evidence") && error.contains("pytest.ini"), "{error}");
+        assert!(resolve(dir.path(), Some("go-test")).err().unwrap().contains("unknown execution profile"));
     }
 
     #[test]
     fn unsupported_repository_fails_with_an_actionable_message() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.json"), "{}").unwrap();
-        let error = resolve(dir.path()).err().unwrap();
+        let error = resolve(dir.path(), None).err().unwrap();
         assert!(error.contains("Cargo.toml"), "{error}");
         assert!(error.contains("rust-cargo"), "{error}");
         assert!(error.contains("PLAN.md"), "{error}");
         // A manifest below the root is not a root project.
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub/Cargo.toml"), "").unwrap();
-        assert!(resolve(dir.path()).is_err());
+        assert!(resolve(dir.path(), None).is_err());
     }
 
     #[test]

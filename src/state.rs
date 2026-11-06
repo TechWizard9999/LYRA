@@ -26,6 +26,10 @@ pub struct RunRequest {
     /// The user ticked "I read the repository's contribution policy".
     #[serde(default)]
     pub policy_acknowledged: bool,
+    /// Execution profile id chosen by the operator for a repository that matches more than one
+    /// built-in profile. None = detection order (PLAN §13.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +297,7 @@ mod tests {
             issue_text: None,
             provider: None,
             policy_acknowledged: false,
+            profile: None,
         }
     }
 

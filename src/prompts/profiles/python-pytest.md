@@ -45,5 +45,5 @@ Also allowed: new non-Python fixture files under a `tests/` or `fixtures/` direc
 {%- endmacro %}
 
 {%- macro fix_lock(issue_number, test_file) -%}
-- Do NOT modify `{{ test_file }}`, any `conftest.py`, the pytest configuration (`pytest.ini`, `pytest.toml`, `[tool.pytest...]` in `pyproject.toml`, `[tool:pytest]` in `setup.cfg`, `[pytest]` in `tox.ini`), `sitecustomize.py`, `usercustomize.py` or `*.pth` files. Do not add `skip` or `xfail` markers or collection hooks anywhere. The harness compares these with their frozen form and rejects the fix if any of them changed.
+- Do NOT modify `{{ test_file }}`, anything else in its test directory except other `test_*.py` modules (package `__init__.py` files, helper modules and data files are locked, and no new modules may be added there), any `conftest.py`, the pytest configuration (`pytest.ini`, `pytest.toml`, `[tool.pytest...]` in `pyproject.toml`, `[tool:pytest]` in `setup.cfg`, `[pytest]` in `tox.ini`), `sitecustomize.py`, `usercustomize.py` or `*.pth` files. Do not add `skip` or `xfail` markers or collection hooks anywhere. The harness compares these with their frozen form and rejects the fix if any of them changed.
 {%- endmacro %}

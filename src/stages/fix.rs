@@ -259,7 +259,8 @@ mod tests {
                 "test_name": "tests/test_issue_3.py::test_issue_3_x", "command": "python3 -m pytest", "issue_number": 3}))
             .unwrap();
         assert!(text.contains("in the Python repository"));
-        assert!(text.contains("Do NOT modify `tests/test_issue_3.py`, any `conftest.py`"));
+        assert!(text.contains("Do NOT modify `tests/test_issue_3.py`, anything else in its test directory"));
+        assert!(text.contains("any `conftest.py`"));
         assert!(!text.contains("Cargo") && !text.contains("cfg(test)"), "{text}");
     }
 }

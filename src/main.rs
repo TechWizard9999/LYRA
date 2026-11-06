@@ -32,6 +32,10 @@ enum Cmd {
         /// Acknowledge the repository's contribution policy (required to push when one exists).
         #[arg(long)]
         ack_policy: bool,
+        /// Execution profile for a repository that matches more than one (`rust-cargo` | `python-pytest`).
+        /// Default: the first match in detection order.
+        #[arg(long)]
+        profile: Option<String>,
     },
     /// Retry a finished run from a stage (intake|context|repro|rca|fix|verify|pr).
     Retry {
@@ -99,7 +103,7 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Cmd::Run { repo, issue, issue_file, provider, ack_policy } => {
+        Cmd::Run { repo, issue, issue_file, provider, ack_policy, profile } => {
             let issue_text = match issue_file {
                 Some(p) => Some(std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?),
                 None => None,
@@ -112,6 +116,7 @@ async fn main() -> Result<()> {
                 issue_text,
                 provider,
                 policy_acknowledged: ack_policy,
+                profile,
             };
             let id = engine.submit(req)?;
             println!("run {id}");
@@ -374,6 +379,7 @@ mod tests {
             issue_text: None,
             provider: None,
             policy_acknowledged: false,
+            profile: None,
         };
         let mut st = lyra::state::RunState::new("finished".into(), req, "claude".into());
         st.status = Status::Failed;

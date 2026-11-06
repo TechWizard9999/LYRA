@@ -56,6 +56,11 @@ pub struct ReproRecord {
     /// absent in records written before profiles existed (all of them `rust-cargo`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// Every other file the repro stage created (fixtures, package initializers), frozen with
+    /// the test through Fix and Verify. Set by the harness from the S2 diff; empty in records
+    /// written before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frozen_inputs: Vec<String>,
 }
 
 fn validate_repro_path(path: &str) -> Result<(), String> {
@@ -180,25 +185,33 @@ fn normalise_text(s: &str) -> String {
     s.replace("\r\n", "\n").trim_end().to_string()
 }
 
-/// The universal part of every test lock: the frozen test file is byte-for-byte its S2 form
-/// (git's own comparison first, then the content after newline normalisation, because
-/// `git show` trims and autocrlf may differ). Returns the violations for the profile to extend.
+/// The universal part of every test lock: the frozen test file and every input the repro
+/// stage created with it (`frozen_inputs`: fixtures, package initializers) are byte-for-byte
+/// their S2 form (git's own comparison first, then the content after newline normalisation,
+/// because `git show` trims and autocrlf may differ). A fix cannot make the locked test pass
+/// by changing the data it reads. Returns the violations for the profile to extend.
 pub fn frozen_test_violations(
     changes: &[(String, String)],
     rec: &ReproRecord,
     read_checkpoint: &dyn Fn(&str) -> Option<String>,
     read_now: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<String> {
-    let test_file = norm_path(&rec.test_file);
     let mut violations = Vec::new();
-    if changes.iter().any(|(_, p)| norm_path(p) == test_file) {
-        violations.push(format!("{test_file}: the repro test file was modified or removed (it is locked)"));
-    } else {
-        match (read_checkpoint(&test_file), read_now(&test_file)) {
+    let frozen = std::iter::once((norm_path(&rec.test_file), "the repro test file"))
+        .chain(rec.frozen_inputs.iter().map(|p| (norm_path(p), "a repro input")));
+    for (path, what) in frozen {
+        if path.is_empty() {
+            continue;
+        }
+        if changes.iter().any(|(_, p)| norm_path(p) == path) {
+            violations.push(format!("{path}: {what} was modified, replaced or removed (it is locked)"));
+            continue;
+        }
+        match (read_checkpoint(&path), read_now(&path)) {
             (Some(frozen), Some(now)) if normalise_text(&frozen) != normalise_text(&now) => {
-                violations.push(format!("{test_file}: content differs from its frozen form"));
+                violations.push(format!("{path}: content of {what} differs from its frozen form"));
             }
-            (Some(_), None) => violations.push(format!("{test_file}: the repro test file was deleted")),
+            (Some(_), None) => violations.push(format!("{path}: {what} was deleted")),
             _ => {}
         }
     }
@@ -318,6 +331,7 @@ mod tests {
             frozen_commit: None,
             frozen_len: None,
             profile: None,
+            frozen_inputs: Vec::new(),
         }
     }
 
@@ -525,6 +539,78 @@ new file mode 100644
         let changes = git::changed_files(wt, &checkpoint).unwrap();
         let err = check_fix_changes(&changes, &rec(), wt, &checkpoint, &RustCargo).unwrap_err();
         assert!(err.contains("tests/issue_123.rs"), "{err}");
+    }
+
+    /// A fix must not make the locked test pass by changing the data it reads: every file the
+    /// repro stage created is frozen with the test, for every profile.
+    #[test]
+    fn repro_created_fixtures_are_locked_through_fix_for_every_profile() {
+        use crate::git;
+        use crate::profile::{python_pytest::PythonPytest, ExecutionProfile};
+        let cases: [(&dyn ExecutionProfile, &str, &str, &str); 2] = [
+            (&RustCargo, "Cargo.toml", "tests/issue_123.rs", "tests/fixtures/frame.bin"),
+            (&PythonPytest, "pytest.ini", "tests/test_issue_123.py", "tests/fixtures/input.json"),
+        ];
+        for (profile, manifest, test_file, fixture) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let wt = dir.path();
+            git::run(wt, &["init", "-q", "-b", "main"]).unwrap();
+            git::run(wt, &["config", "user.email", "t@example.com"]).unwrap();
+            git::run(wt, &["config", "user.name", "T"]).unwrap();
+            std::fs::write(wt.join(manifest), "[package]\nname = \"foo\"\nversion = \"0.1.0\"\n").unwrap();
+            std::fs::create_dir_all(wt.join("src")).unwrap();
+            std::fs::write(wt.join("src/core.txt"), "buggy\n").unwrap();
+            git::commit_all(wt, "init").unwrap();
+
+            // S2: the test plus a fixture holding the input that triggers the bug.
+            std::fs::create_dir_all(wt.join("tests/fixtures")).unwrap();
+            std::fs::write(wt.join(test_file), "reads tests/fixtures and fails on the buggy input\n").unwrap();
+            std::fs::write(wt.join(fixture), "{\"frame\": [1, 2]}\n").unwrap();
+            let mut record = rec();
+            record.test_file = test_file.into();
+            record.test_name = if profile.id() == "python-pytest" {
+                format!("{test_file}::test_issue_123_rejects_short_frame")
+            } else {
+                "issue_123_rejects_short_frame".into()
+            };
+            record.command = profile.regression_command_line(&record);
+            record.frozen_inputs = vec![fixture.into()];
+            let checkpoint = git::commit_all(wt, "test: failing repro for #123").unwrap();
+
+            // A real production fix passes the lock.
+            std::fs::write(wt.join("src/core.txt"), "fixed\n").unwrap();
+            let changes = git::changed_files(wt, &checkpoint).unwrap();
+            assert_eq!(check_fix_changes(&changes, &record, wt, &checkpoint, profile), Ok(()), "{}", profile.id());
+
+            // Changing only the fixture to a non-triggering input is rejected...
+            std::fs::write(wt.join("src/core.txt"), "buggy\n").unwrap();
+            std::fs::write(wt.join(fixture), "{\"frame\": [1, 2, 3, 4]}\n").unwrap();
+            let changes = git::changed_files(wt, &checkpoint).unwrap();
+            let err = check_fix_changes(&changes, &record, wt, &checkpoint, profile).unwrap_err();
+            assert!(err.contains(fixture) && err.contains("repro input"), "{}: {err}", profile.id());
+            // ...as is deleting it...
+            std::fs::remove_file(wt.join(fixture)).unwrap();
+            let changes = git::changed_files(wt, &checkpoint).unwrap();
+            assert!(check_fix_changes(&changes, &record, wt, &checkpoint, profile).unwrap_err().contains(fixture));
+            // ...or replacing it, even alongside a production change.
+            std::fs::write(wt.join(fixture), "[]\n").unwrap();
+            std::fs::write(wt.join("src/core.txt"), "fixed\n").unwrap();
+            let changes = git::changed_files(wt, &checkpoint).unwrap();
+            assert!(check_fix_changes(&changes, &record, wt, &checkpoint, profile).unwrap_err().contains(fixture));
+        }
+    }
+
+    #[test]
+    fn frozen_inputs_round_trip_and_old_records_load_without_them() {
+        let mut record = rec();
+        record.frozen_inputs = vec!["tests/fixtures/a.json".into()];
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(json["frozen_inputs"], serde_json::json!(["tests/fixtures/a.json"]));
+        let mut old = json.clone();
+        old.as_object_mut().unwrap().remove("frozen_inputs");
+        let loaded: ReproRecord = serde_json::from_value(old).unwrap();
+        assert!(loaded.frozen_inputs.is_empty());
+        assert!(serde_json::to_value(&loaded).unwrap().get("frozen_inputs").is_none());
     }
 
     #[cfg(unix)]

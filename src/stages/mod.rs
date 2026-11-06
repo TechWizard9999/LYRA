@@ -117,7 +117,11 @@ pub fn render_prompt(
 
 /// Line-numbered source evidence for the agent: the relevant files completely (with the
 /// profile's ancestor manifests), then a bounded overview of the profile's source files.
-fn readonly_source_snapshot(root: &std::path::Path, relevant: &[String], profile: &dyn ExecutionProfile) -> String {
+pub(crate) fn readonly_source_snapshot(
+    root: &std::path::Path,
+    relevant: &[String],
+    profile: &dyn ExecutionProfile,
+) -> String {
     use std::io::Read;
     const FILE_LIMIT: usize = 24_000;
     const TOTAL_LIMIT: usize = 240_000;
@@ -143,6 +147,7 @@ fn readonly_source_snapshot(root: &std::path::Path, relevant: &[String], profile
         }
     }
     fn collect(
+        root: &std::path::Path,
         dir: &std::path::Path,
         depth: usize,
         paths: &mut Vec<std::path::PathBuf>,
@@ -165,8 +170,9 @@ fn readonly_source_snapshot(root: &std::path::Path, relevant: &[String], profile
             if kind.is_dir() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if !name.starts_with('.') && !profile.generated_dirs().contains(&name.as_ref()) {
-                    collect(&path, depth + 1, paths, profile);
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                if !name.starts_with('.') && !profile.is_generated_dir(relative, &path) {
+                    collect(root, &path, depth + 1, paths, profile);
                 }
             } else if kind.is_file() && profile.is_source_file(&path) {
                 paths.push(path);
@@ -177,7 +183,7 @@ fn readonly_source_snapshot(root: &std::path::Path, relevant: &[String], profile
         }
     }
     let mut paths = Vec::new();
-    collect(root, 0, &mut paths, profile);
+    collect(root, root, 0, &mut paths, profile);
     paths.sort();
     let mut snapshot = String::new();
     let canonical_root = dunce::canonicalize(root).ok();
@@ -338,6 +344,7 @@ mod tests {
             issue_text: None,
             provider: None,
             policy_acknowledged: false,
+            profile: None,
         };
         let ctx = StageCtx {
             events: EventSink::open("fixture", &dir.path().join("events.jsonl")).unwrap(),

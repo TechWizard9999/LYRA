@@ -478,6 +478,7 @@ mod tests {
             issue_text: None,
             provider: None,
             policy_acknowledged: false,
+            profile: None,
         };
         let id = Engine::new_run_id(&req);
         assert!(id.starts_with("my-crate-42-"), "{id}");
@@ -496,6 +497,7 @@ mod tests {
             issue_text: None,
             provider: None,
             policy_acknowledged: false,
+            profile: None,
         };
         let mut st = RunState::new("r1".into(), req, "claude".into());
         st.status = Status::Running;
@@ -517,6 +519,7 @@ mod tests {
             issue_text: None,
             provider: Some("nope".into()),
             policy_acknowledged: false,
+            profile: None,
         };
         assert!(engine.submit(req).is_err());
     }
@@ -547,6 +550,7 @@ mod tests {
             issue_text: None,
             provider: None,
             policy_acknowledged: false,
+            profile: None,
         };
         RunState::new("invalid.name".into(), request, "claude".into()).save(&directory).unwrap();
         assert!(engine.list().is_empty());
@@ -564,6 +568,7 @@ mod tests {
             issue_text: None,
             provider: None,
             policy_acknowledged: false,
+            profile: None,
         };
         RunState::new("linked".into(), request, "claude".into()).save(outside.path()).unwrap();
         std::fs::create_dir_all(runs_dir(home.path())).unwrap();
@@ -580,6 +585,7 @@ mod tests {
             issue_text: None,
             provider: None,
             policy_acknowledged: false,
+            profile: None,
         };
         let ids: std::collections::HashSet<_> = (0..1000).map(|_| Engine::new_run_id(&req)).collect();
         assert_eq!(ids.len(), 1000);
@@ -597,6 +603,7 @@ mod tests {
             issue_text: None,
             provider: None,
             policy_acknowledged: false,
+            profile: None,
         };
         let id = engine.submit(req).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -622,6 +629,7 @@ mod tests {
             issue_text: None,
             provider: None,
             policy_acknowledged: false,
+            profile: None,
         };
         let mut st = RunState::new("retry".into(), req, "claude".into());
         st.status = Status::Failed;
@@ -676,6 +684,7 @@ mod tests {
             issue_text: None,
             provider: None,
             policy_acknowledged: false,
+            profile: None,
         }
     }
 

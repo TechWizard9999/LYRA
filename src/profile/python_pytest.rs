@@ -47,6 +47,25 @@ const DISCOVERY_WRAPPER: &str =
 
 const PYTEST_CONFIG_FILES: [&str; 4] = ["pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml"];
 
+/// Verification provenance: every top-level package or module of the project must be found
+/// inside the checkout under test (the working directory). `find_spec` locates a top-level
+/// name without importing it, so no project code runs. Exit 1 names each one that resolves
+/// elsewhere, for example to an editable install of another clone.
+const PROVENANCE_CHECK: &str = "import importlib.util, os, sys
+root = os.path.realpath(os.getcwd())
+bad = []
+for name in sys.argv[1:]:
+    spec = importlib.util.find_spec(name)
+    places = [spec.origin] if spec and spec.origin not in (None, 'built-in', 'frozen') else list(getattr(spec, 'submodule_search_locations', None) or [])
+    places = [os.path.realpath(p) for p in places]
+    inside = bool(places) and all(p == root or p.startswith(root + os.sep) for p in places)
+    print(name, '->', ', '.join(places) or 'not found')
+    if not inside:
+        bad.append(name)
+for name in bad:
+    print('ERROR: ' + name + ' does not resolve inside the checkout under test')
+sys.exit(1 if bad else 0)";
+
 pub struct PythonPytest;
 
 /// Pytest evidence at the worktree root. Files are read, nothing is executed.
@@ -144,6 +163,12 @@ impl ExecutionProfile for PythonPytest {
     fn id(&self) -> &'static str {
         ID
     }
+    fn detect(&self, worktree: &Path) -> Option<ResolvedProfile> {
+        detect(worktree)
+    }
+    fn detection(&self) -> &'static str {
+        DETECTION
+    }
     fn required_tools(&self) -> &'static [&'static str] {
         &[PYTHON]
     }
@@ -156,16 +181,38 @@ impl ExecutionProfile for PythonPytest {
 
     fn is_source_file(&self, path: &Path) -> bool {
         path.extension().is_some_and(|e| e == "py" || e == "pyi")
-            || path.file_name().and_then(|n| n.to_str()).is_some_and(|n| self.manifest_names().contains(&n))
+            || path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                self.manifest_names().contains(&n) || (n.ends_with(".txt") && n.contains("requirements"))
+            })
     }
     fn source_extensions(&self) -> &'static [&'static str] {
         &["py", "pyi"]
     }
     fn manifest_names(&self) -> &'static [&'static str] {
-        &["pyproject.toml", "setup.cfg", "setup.py", "pytest.ini", "tox.ini"]
+        &[
+            "pyproject.toml",
+            "setup.cfg",
+            "setup.py",
+            "pytest.ini",
+            ".pytest.ini",
+            "pytest.toml",
+            ".pytest.toml",
+            "tox.ini",
+            "requirements.txt",
+            "requirements-dev.txt",
+            "requirements-test.txt",
+            "dev-requirements.txt",
+            "test-requirements.txt",
+            "constraints.txt",
+        ]
     }
     fn generated_dirs(&self) -> &'static [&'static str] {
-        &["__pycache__", "venv", "env", "build", "dist", "node_modules", "site-packages"]
+        // Only names that are never source. Virtual environments and build output are
+        // recognised by markers in `is_generated_dir`, so `src/env/` or `src/build/` stay visible.
+        &["__pycache__", "node_modules", "site-packages"]
+    }
+    fn is_generated_dir(&self, relative: &Path, path: &Path) -> bool {
+        is_generated_python_dir(relative, path)
     }
     fn is_test_path(&self, path: &str) -> bool {
         is_test_path(path)
@@ -299,6 +346,15 @@ impl ExecutionProfile for PythonPytest {
         let optional =
             |value: &Option<String>| value.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
         let mut steps = Vec::new();
+        let names = importable_names(worktree);
+        if !names.is_empty() {
+            steps.push(VerifyStep {
+                name: "imports",
+                spec: CommandSpec::new(PYTHON, worktree).args(["-c", PROVENANCE_CHECK]).args(names),
+                log: "50-verify/imports.txt",
+                regression: false,
+            });
+        }
         if let Some(build) = optional(&verify.build) {
             steps.push(VerifyStep {
                 name: "build",
@@ -334,6 +390,84 @@ impl ExecutionProfile for PythonPytest {
     fn explain_failure(&self, output: &str, exit_code: Option<i32>) -> String {
         first_error_line(output, exit_code)
     }
+}
+
+/// Generated output, by marker rather than by name: caches and installed-package folders, any
+/// virtual environment (it has `pyvenv.cfg`, whatever it is called), `*.egg-info`, and at the
+/// repository root a setuptools `build/` (`lib`, `bdist.*`, `temp.*` inside) or a `dist/` that
+/// holds only archives. A package directory that merely shares one of those names is source.
+pub fn is_generated_python_dir(relative: &Path, path: &Path) -> bool {
+    let Some(name) = relative.file_name().and_then(|n| n.to_str()) else { return false };
+    if ["__pycache__", "node_modules", "site-packages"].contains(&name) || name.ends_with(".egg-info") {
+        return true;
+    }
+    if path.join("pyvenv.cfg").is_file() {
+        return true;
+    }
+    if relative.components().count() != 1 || path.join("__init__.py").exists() {
+        return false;
+    }
+    let children: Vec<String> = std::fs::read_dir(path)
+        .map(|entries| entries.flatten().filter_map(|e| e.file_name().into_string().ok()).collect())
+        .unwrap_or_default();
+    match name {
+        "build" => children.iter().any(|c| c == "lib" || c.starts_with("bdist.") || c.starts_with("temp.")),
+        "dist" => children.iter().all(|c| [".whl", ".tar.gz", ".zip", ".egg"].iter().any(|ext| c.ends_with(ext))),
+        _ => false,
+    }
+}
+
+/// The project's own top-level packages and modules in the repository root and `src/`, which
+/// the verification provenance step requires to resolve inside the checkout. Tests, docs,
+/// tooling scripts, virtual environments and build output are not project code.
+pub fn importable_names(root: &Path) -> Vec<String> {
+    const NOT_PROJECT_DIRS: [&str; 12] = [
+        "tests",
+        "test",
+        "testing",
+        "docs",
+        "doc",
+        "examples",
+        "scripts",
+        "benchmarks",
+        "build",
+        "dist",
+        "site-packages",
+        "node_modules",
+    ];
+    const NOT_PROJECT_MODULES: [&str; 7] =
+        ["setup", "conftest", "noxfile", "fabfile", "tasks", "manage", "sitecustomize"];
+    let mut names = Vec::new();
+    for base in [root.to_path_buf(), root.join("src")] {
+        let Ok(entries) = std::fs::read_dir(&base) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+            let Ok(kind) = entry.file_type() else { continue };
+            let candidate = if kind.is_dir() {
+                (!NOT_PROJECT_DIRS.contains(&file_name.as_str())
+                    && !path.join("pyvenv.cfg").exists()
+                    && path.join("__init__.py").is_file())
+                .then_some(file_name)
+            } else if kind.is_file() {
+                file_name
+                    .strip_suffix(".py")
+                    .filter(|stem| {
+                        !NOT_PROJECT_MODULES.contains(stem) && !stem.starts_with("test_") && !stem.ends_with("_test")
+                    })
+                    .map(str::to_owned)
+            } else {
+                None
+            };
+            if let Some(name) = candidate.filter(|n| identifier_re().is_match(n)) {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names.truncate(50);
+    names
 }
 
 // ---------------------------------------------------------------------------------------
@@ -632,6 +766,33 @@ pub fn is_test_path(path: &str) -> bool {
         || name.ends_with("_test.py")
 }
 
+/// The directory tree whose infrastructure the frozen test depends on: the deepest ancestor
+/// named `tests`, `test` or `testing`, otherwise the test module's own directory (`""` for the
+/// repository root).
+fn test_tree(test_file: &str) -> String {
+    let parts: Vec<&str> = test_file.split('/').collect();
+    let dirs = &parts[..parts.len().saturating_sub(1)];
+    match dirs.iter().rposition(|d| matches!(*d, "tests" | "test" | "testing")) {
+        Some(i) => dirs[..=i].join("/"),
+        None => dirs.join("/"),
+    }
+}
+
+/// Inside the test tree everything except other test modules is locked: a package
+/// initializer runs on import, a helper or a new module can change or shadow what the
+/// unchanged test exercises, and data files are its inputs. Other test modules may still be
+/// corrected when they encoded the buggy behaviour. A test at the repository root locks only
+/// the root `__init__.py`, because root modules are production code.
+fn locked_by_test_tree(path: &str, tree: &str) -> bool {
+    let name = guards::base_name(path);
+    if tree.is_empty() {
+        return path == "__init__.py";
+    }
+    let inside = path.strip_prefix(tree).is_some_and(|rest| rest.starts_with('/'));
+    let test_module = name.ends_with(".py") && (name.starts_with("test_") || name.ends_with("_test.py"));
+    inside && !test_module
+}
+
 /// Files that change how pytest collects, imports or reports, wherever they are.
 fn collection_control_violation(path: &str) -> Option<&'static str> {
     let name = guards::base_name(path);
@@ -713,11 +874,21 @@ pub fn check_fix_changes_with(
     // 1. The test module is byte-for-byte its frozen form.
     let mut violations = guards::frozen_test_violations(changes, rec, read_checkpoint, read_now);
 
-    // 2. Nothing that changes collection, imports or plugin loading.
+    // 2. Nothing that changes collection, imports or plugin loading, and none of the test
+    //    infrastructure next to the frozen test.
+    let test_file = guards::norm_path(&rec.test_file);
+    let tree = test_tree(&test_file);
     for (status, raw) in changes {
         let path = guards::norm_path(raw);
         if let Some(reason) = collection_control_violation(&path) {
             violations.push(format!("{status} {path}: {reason}"));
+            continue;
+        }
+        if path != test_file && locked_by_test_tree(&path, &tree) {
+            let tree = if tree.is_empty() { "the repository root" } else { tree.as_str() };
+            violations.push(format!(
+                "{status} {path}: test infrastructure in {tree} (package initializers, helper modules, data) is locked with the frozen test"
+            ));
             continue;
         }
         let name = guards::base_name(&path);
@@ -750,10 +921,20 @@ pub fn check_fix_changes_with(
 /// Scrubbed environment (no PYTHONPATH, PYTHONHOME, PYTEST_ADDOPTS or PYTEST_PLUGINS from
 /// the operator), no byte-code written into the checkout, and tool caches that would
 /// otherwise land in the working directory redirected to the owned environment.
+///
+/// Imports are bound to the checkout under test: `PYTHONPATH` lists the command's working
+/// directory and its `src/`, which Python searches before site-packages, `.pth` path entries
+/// and editable-install finders. An installed copy of the project (for example an editable
+/// install of the operator's own clone) therefore cannot stand in for the candidate's code.
 fn controlled_python_environment(spec: CommandSpec, caches: Option<&Path>) -> CommandSpec {
-    const OWNED: [&str; 4] = ["PYTHONDONTWRITEBYTECODE", "PYTEST_ADDOPTS", "RUFF_CACHE_DIR", "MYPY_CACHE_DIR"];
+    const OWNED: [&str; 5] =
+        ["PYTHONDONTWRITEBYTECODE", "PYTEST_ADDOPTS", "RUFF_CACHE_DIR", "MYPY_CACHE_DIR", "PYTHONPATH"];
+    let checkout_paths = [spec.cwd.clone(), spec.cwd.join("src")];
     let mut spec = spec.scrubbed();
     spec.env.retain(|(key, _)| !OWNED.iter().any(|owned| key.eq_ignore_ascii_case(owned)));
+    if let Ok(path) = std::env::join_paths(checkout_paths.iter().filter(|p| p.is_dir() || *p == &checkout_paths[0])) {
+        spec.env.push(("PYTHONPATH".into(), path.to_string_lossy().into_owned()));
+    }
     spec.env.push(("PYTHONDONTWRITEBYTECODE".into(), "1".into()));
     // Applies to the configured suite command too, which the harness does not build.
     spec.env.push(("PYTEST_ADDOPTS".into(), "-p no:cacheprovider".into()));
@@ -885,6 +1066,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             frozen_commit: None,
             frozen_len: None,
             profile: Some(ID.into()),
+            frozen_inputs: Vec::new(),
         }
     }
 
@@ -1143,6 +1325,35 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
     }
 
     #[test]
+    fn fix_lock_freezes_test_package_initializers_helpers_and_data() {
+        let frozen = HashMap::from([(FILE, "from tests.helpers import expected\n")]);
+        let read = reader(&frozen);
+        let check = |path: &str, status: &str| {
+            let changes =
+                vec![("M".to_string(), "textkit/lists.py".to_string()), (status.to_string(), path.to_string())];
+            check_fix_changes_with(&changes, &rec(), &read, &read)
+        };
+        for (path, status) in [
+            ("tests/__init__.py", "M"),
+            ("tests/__init__.py", "??"),
+            ("tests/helpers.py", "M"),
+            ("tests/util/__init__.py", "D"),
+            ("tests/textkit.py", "??"),
+            ("tests/data/golden.txt", "M"),
+        ] {
+            let err = check(path, status).unwrap_err();
+            assert!(err.contains("test infrastructure in tests"), "{path}: {err}");
+        }
+        assert!(check("tests/test_other.py", "M").is_ok(), "other tests may be corrected");
+        assert!(check("textkit/__init__.py", "M").is_ok(), "production package initializers may change");
+        assert_eq!(test_tree("src/pkg/tests/unit/test_x.py"), "src/pkg/tests");
+        assert_eq!(test_tree("pkg/test_x.py"), "pkg");
+        assert_eq!(test_tree("test_x.py"), "");
+        assert!(locked_by_test_tree("__init__.py", "") && !locked_by_test_tree("calc.py", ""));
+        assert!(!locked_by_test_tree("tests_extra/helpers.py", "tests"));
+    }
+
+    #[test]
     fn verification_steps_default_to_the_suite_and_skip_unconfigured_optional_steps() {
         let steps = PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), Path::new("/w")).unwrap();
         let names: Vec<&str> = steps.iter().map(|s| s.name).collect();
@@ -1172,7 +1383,10 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         std::env::remove_var("PYTEST_ADDOPTS");
         std::env::remove_var("PYTHONPATH");
         assert!(spec.clear_env);
-        assert!(!spec.env.iter().any(|(k, _)| k == "PYTHONPATH"));
+        assert!(
+            !spec.env.iter().any(|(k, v)| k == "PYTHONPATH" && v.contains("/somewhere")),
+            "operator PYTHONPATH is dropped"
+        );
         let addopts: Vec<&str> =
             spec.env.iter().filter(|(k, _)| k == "PYTEST_ADDOPTS").map(|(_, v)| v.as_str()).collect();
         assert_eq!(addopts, ["-p no:cacheprovider"]);
@@ -1257,6 +1471,269 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         assert!(
             !root.join(".pytest_cache").exists() && !root.join("tests/__pycache__").exists(),
             "checkout stays clean"
+        );
+    }
+
+    /// An editable install of another clone must not stand in for the candidate checkout.
+    /// A venv whose site-packages has a `.pth` entry for clone A's `src/` (what an editable
+    /// install leaves behind) runs checkout B; only B's code may decide the results, and the
+    /// provenance step must fail when imports are not bound to B.
+    #[tokio::test]
+    #[ignore = "needs a provisioned python3 with pytest on PATH"]
+    async fn imports_come_from_the_checkout_not_an_editable_install_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let timeout = Duration::from_secs(120);
+        let cancel = CancellationToken::new();
+        let write = |path: std::path::PathBuf, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        // Clone A (the operator's own checkout, installed editable): correct behaviour.
+        let clone_a = dir.path().join("clone-a");
+        write(clone_a.join("src/pkg/__init__.py"), "def answer():\n    return 42\n");
+        // Checkout B (the candidate under test): the bug.
+        let checkout = dir.path().join("checkout");
+        write(checkout.join("src/pkg/__init__.py"), "def answer():\n    return 41\n");
+        write(checkout.join("pytest.ini"), "[pytest]\n");
+        write(
+            checkout.join(FILE),
+            "from pkg import answer\n\ndef test_issue_7_fails():\n    assert answer() == 42, \"sum must be three\"\n",
+        );
+
+        // A venv without pip whose site-packages points at clone A, like `pip install -e`.
+        let venv = dir.path().join("venv");
+        let made = proc::run(
+            &CommandSpec::new(PYTHON, dir.path()).args(["-m", "venv", "--without-pip"]).arg(venv.to_string_lossy()),
+            timeout,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert!(made.success(), "{}", made.combined());
+        let venv_python = if cfg!(windows) { venv.join("Scripts/python.exe") } else { venv.join("bin/python") };
+        let purelib = proc::run(
+            &CommandSpec::new(venv_python.to_string_lossy(), dir.path())
+                .args(["-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"]),
+            timeout,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        write(
+            std::path::PathBuf::from(purelib.stdout.trim()).join("__editable__pkg.pth"),
+            &format!("{}\n", clone_a.join("src").display()),
+        );
+        // pytest itself comes from the provisioned interpreter, as a system-site package would.
+        let pytest_site = proc::run(
+            &CommandSpec::new(PYTHON, dir.path())
+                .args(["-c", "import os, pytest; print(os.path.dirname(os.path.dirname(pytest.__file__)))"]),
+            timeout,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        write(
+            std::path::PathBuf::from(purelib.stdout.trim()).join("provisioned.pth"),
+            &format!("{}\n", pytest_site.stdout.trim()),
+        );
+        let with_venv = |mut spec: CommandSpec| {
+            spec.program = venv_python.to_string_lossy().into_owned();
+            spec
+        };
+
+        // Unbound (the old behaviour): `import pkg` resolves to clone A and the bug is hidden.
+        let mut unbound = with_venv(PythonPytest.regression_command(&rec(), &checkout).unwrap()).scrubbed();
+        unbound.env.push(("PYTHONDONTWRITEBYTECODE".into(), "1".into()));
+        let out = proc::run(&unbound, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(
+            classify_pytest(&out, ID_),
+            RegressionOutcome::Passed,
+            "precondition: the editable install leaks: {out}"
+        );
+
+        // Bound: the candidate's code decides, in repro and in verification.
+        let spec = with_venv(
+            PythonPytest
+                .reproduction_environment(PythonPytest.regression_command(&rec(), &checkout).unwrap(), dir.path()),
+        );
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Failed, "{out}");
+
+        let steps = PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), &checkout).unwrap();
+        assert_eq!(steps[0].name, "imports");
+        assert_eq!(steps[0].spec.args.last().unwrap(), "pkg");
+        let provenance = steps[0].spec.clone();
+        let bound = proc::run(
+            &with_venv(PythonPytest.command_environment(provenance.clone(), &dir.path().join("env"))),
+            timeout,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert!(bound.success() && bound.stdout.contains("pkg -> "), "{}", bound.combined());
+        // Without the binding the provenance step fails visibly and names the package.
+        let mut leaked = with_venv(provenance).scrubbed();
+        leaked.env.push(("PYTHONDONTWRITEBYTECODE".into(), "1".into()));
+        let leaked = proc::run(&leaked, timeout, &cancel).await.unwrap();
+        assert!(
+            !leaked.success() && leaked.stdout.contains("ERROR: pkg does not resolve inside the checkout"),
+            "{}",
+            leaked.combined()
+        );
+        assert!(PythonPytest.explain_failure(&leaked.stdout, leaked.exit_code).contains("pkg"));
+
+        // The candidate's fix (and only it) makes the bound regression pass.
+        write(checkout.join("src/pkg/__init__.py"), "def answer():\n    return 42\n");
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "{out}");
+    }
+
+    /// Changing a helper the frozen test imports would make the unchanged failing test pass;
+    /// the lock rejects it.
+    #[tokio::test]
+    #[ignore = "needs a provisioned python3 with pytest on PATH"]
+    async fn changing_a_test_helper_could_pass_the_frozen_test_and_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("pytest.ini"), "[pytest]\n").unwrap();
+        std::fs::write(root.join("calc.py"), "def add(a, b):\n    return a - b\n").unwrap();
+        std::fs::write(root.join("tests/__init__.py"), "").unwrap();
+        std::fs::write(root.join("tests/helpers.py"), "EXPECTED = 3\n").unwrap();
+        let test = "from calc import add\nfrom tests.helpers import EXPECTED\n\ndef test_issue_7_fails():\n    assert add(1, 2) == EXPECTED, \"sum must be three\"\n";
+        std::fs::write(root.join(FILE), test).unwrap();
+        let spec = PythonPytest.reproduction_environment(PythonPytest.regression_command(&rec(), root).unwrap(), root);
+        let timeout = Duration::from_secs(120);
+        let cancel = CancellationToken::new();
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Failed, "{out}");
+        let frozen: HashMap<&str, String> = [FILE, "tests/helpers.py", "tests/__init__.py"]
+            .into_iter()
+            .map(|p| (p, std::fs::read_to_string(root.join(p)).unwrap()))
+            .collect();
+
+        for (path, text) in
+            [("tests/helpers.py", "EXPECTED = -1\n"), ("tests/__init__.py", "import calc\ncalc.add = lambda a, b: 3\n")]
+        {
+            let original = std::fs::read_to_string(root.join(path)).unwrap();
+            std::fs::write(root.join(path), text).unwrap();
+            let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+            assert_eq!(
+                classify_pytest(&out, ID_),
+                RegressionOutcome::Passed,
+                "the attack works without the lock: {out}"
+            );
+            let read_checkpoint = |p: &str| frozen.get(p).cloned();
+            let read_now = |p: &str| std::fs::read_to_string(root.join(p)).ok();
+            let err =
+                check_fix_changes_with(&[("M".into(), path.into())], &rec(), &read_checkpoint, &read_now).unwrap_err();
+            assert!(err.contains(path) && err.contains("locked"), "{err}");
+            std::fs::write(root.join(path), original).unwrap();
+        }
+    }
+
+    #[test]
+    fn requirements_only_projects_put_their_dependency_files_in_the_source_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("requirements.txt"), "attrs==23.1\n").unwrap();
+        std::fs::write(root.join("requirements-dev.txt"), "pytest>=8\n").unwrap();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::write(root.join("app/core.py"), "import attrs\n").unwrap();
+        assert_eq!(detect(root).unwrap().evidence, vec!["requirements-dev.txt"]);
+        // In the overview without being named...
+        let overview = crate::stages::readonly_source_snapshot(root, &[], &PythonPytest);
+        assert!(overview.contains("File: requirements.txt") && overview.contains("attrs==23.1"), "{overview}");
+        assert!(overview.contains("File: requirements-dev.txt"));
+        // ...and completely, as an ancestor manifest of a relevant file.
+        let focused = crate::stages::readonly_source_snapshot(root, &["app/core.py".to_string()], &PythonPytest);
+        let complete = &focused[..focused.find("[Fallback source overview").unwrap()];
+        assert!(
+            complete.contains("File: requirements.txt") && complete.contains("File: requirements-dev.txt"),
+            "{complete}"
+        );
+    }
+
+    #[test]
+    fn packages_named_env_or_build_stay_visible_while_real_environments_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("pytest.ini", "[pytest]\n");
+        write("src/env/settings.py", "DEBUG = False\n");
+        write("src/build/parser.py", "def parse(): pass\n");
+        write("env/__init__.py", "");
+        write("env/config.py", "ENV = 1\n");
+        write("venv/pyvenv.cfg", "home = /usr/bin\n");
+        write("venv/lib/python3.12/site-packages/dep/__init__.py", "LEAKED_DEPENDENCY = 1\n");
+        write("myenv/pyvenv.cfg", "home = /usr/bin\n");
+        write("myenv/lib/x.py", "LEAKED_RENAMED_VENV = 1\n");
+        write("build/lib/pkg/__init__.py", "LEAKED_BUILD_OUTPUT = 1\n");
+        write("dist/pkg-0.1.tar.gz", "");
+        let snapshot = crate::stages::readonly_source_snapshot(root, &[], &PythonPytest);
+        for visible in ["src/env/settings.py", "src/build/parser.py", "env/config.py"] {
+            assert!(snapshot.contains(&format!("File: {visible}")), "{visible} missing:\n{snapshot}");
+        }
+        for hidden in ["LEAKED_DEPENDENCY", "LEAKED_RENAMED_VENV", "LEAKED_BUILD_OUTPUT"] {
+            assert!(!snapshot.contains(hidden), "{hidden} leaked:\n{snapshot}");
+        }
+        assert!(!is_generated_python_dir(Path::new("dist"), &root.join("src")), "a non-archive dist is source");
+    }
+
+    #[test]
+    fn provenance_names_cover_project_packages_and_modules_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for (rel, text) in [
+            ("src/pkg/__init__.py", ""),
+            ("toplevel/__init__.py", ""),
+            ("calc.py", ""),
+            ("setup.py", ""),
+            ("conftest.py", ""),
+            ("test_root.py", ""),
+            ("tests/__init__.py", ""),
+            ("docs/__init__.py", ""),
+            ("venv/pyvenv.cfg", ""),
+            ("venv/__init__.py", ""),
+            ("not-a-name/__init__.py", ""),
+            ("namespace_only/mod.py", ""),
+        ] {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        assert_eq!(importable_names(root), ["calc", "pkg", "toplevel"]);
+        let steps = PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), root).unwrap();
+        assert_eq!(steps.iter().map(|s| s.name).collect::<Vec<_>>(), ["imports", "repro", "tests"]);
+        assert_eq!(steps[0].spec.args[2..], ["calc", "pkg", "toplevel"]);
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), empty.path()).unwrap()[0].name,
+            "repro"
+        );
+    }
+
+    #[test]
+    fn environment_binds_imports_to_the_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let spec = PythonPytest.command_environment(CommandSpec::new(PYTHON, dir.path()), Path::new("/env"));
+        let python_path: Vec<&str> =
+            spec.env.iter().filter(|(k, _)| k == "PYTHONPATH").map(|(_, v)| v.as_str()).collect();
+        assert_eq!(python_path.len(), 1);
+        let entries: Vec<std::path::PathBuf> = std::env::split_paths(python_path[0]).collect();
+        assert_eq!(entries, [dir.path().to_path_buf(), dir.path().join("src")]);
+        let flat = tempfile::tempdir().unwrap();
+        let spec = PythonPytest.reproduction_environment(CommandSpec::new(PYTHON, flat.path()), Path::new("/run"));
+        let value = &spec.env.iter().find(|(k, _)| k == "PYTHONPATH").unwrap().1;
+        assert_eq!(
+            std::env::split_paths(value).collect::<Vec<_>>(),
+            [flat.path().to_path_buf()],
+            "no src/ entry when absent"
         );
     }
 

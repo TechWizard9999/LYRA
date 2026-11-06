@@ -36,6 +36,12 @@ impl ExecutionProfile for RustCargo {
     fn id(&self) -> &'static str {
         ID
     }
+    fn detect(&self, worktree: &Path) -> Option<ResolvedProfile> {
+        detect(worktree)
+    }
+    fn detection(&self) -> &'static str {
+        DETECTION
+    }
     fn required_tools(&self) -> &'static [&'static str] {
         &["cargo", "rustfmt"]
     }
@@ -1099,6 +1105,7 @@ test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; fini
             frozen_commit: None,
             frozen_len: None,
             profile: Some(ID.into()),
+            frozen_inputs: Vec::new(),
         }
     }
 

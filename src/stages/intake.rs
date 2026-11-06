@@ -98,9 +98,10 @@ fn intake(ctx: &mut StageCtx) -> Result<(), StageError> {
     ctx.events.info(format!("worktree {} on {branch} from {default} @ {}", wt.display(), git::short(&base)));
 
     // Execution profile (PLAN §13): resolved once from the worktree, frozen for the run.
-    let (resolved, profile) =
-        crate::profile::resolve(&wt).map_err(|reason| StageError::fatal(ErrorKind::Config, reason))?;
-    let missing = crate::profile::missing_tools(&*profile);
+    let resolution = crate::profile::resolve(&wt, ctx.state.request.profile.as_deref())
+        .map_err(|reason| StageError::fatal(ErrorKind::Config, reason))?;
+    let resolved = resolution.resolved.clone();
+    let missing = crate::profile::missing_tools(&*resolution.profile);
     if !missing.is_empty() {
         // Retryable: installing the tool or activating the right environment fixes it.
         return Err(StageError::new(
@@ -112,9 +113,21 @@ fn intake(ctx: &mut StageCtx) -> Result<(), StageError> {
             ),
         ));
     }
-    let p = ctx.run_dir.write_json("profile.json", &resolved).map_err(io_err)?;
+    let p = ctx.run_dir.write_json("profile.json", &resolution.artifact()).map_err(io_err)?;
     ctx.events.artifact(p);
-    ctx.events.info(format!("execution profile: {} ({})", resolved.id, resolved.evidence.join(", ")));
+    let chosen = if resolution.selected_by == "request" { ", chosen by the operator" } else { "" };
+    ctx.events.info(format!("execution profile: {} ({}{chosen})", resolved.id, resolved.evidence.join(", ")));
+    if !resolution.alternatives.is_empty() {
+        let others = resolution
+            .alternatives
+            .iter()
+            .map(|a| format!("{} ({})", a.id, a.evidence.join(", ")))
+            .collect::<Vec<_>>()
+            .join("; ");
+        ctx.events.warn(format!(
+            "this repository also matches {others}; to use another profile, start the run with that profile selected (`lyra run --profile <id>`)"
+        ));
+    }
     ctx.state.profile = Some(resolved);
 
     // Contribution / AI policy text, as of the base commit.

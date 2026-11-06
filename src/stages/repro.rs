@@ -100,6 +100,7 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
     // Fields supplied by the model cannot claim that a checkpoint already exists.
     rec.frozen_commit = None;
     rec.frozen_len = None;
+    rec.frozen_inputs = Vec::new();
     rec.profile = Some(profile.id().to_string());
 
     // 3. Only the allowed files may have changed.
@@ -178,6 +179,14 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
     let changes = git::changed_files(&worktree, &base).map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
     guards::check_repro_changes(&changes, &rec, &worktree, &base, &*profile)
         .map_err(|msg| StageError::new(ErrorKind::Guard, msg))?;
+    // Everything else this stage created is a test input: frozen with the test (PLAN §3.3).
+    rec.frozen_inputs = changes
+        .iter()
+        .filter(|(status, _)| guards::is_new(status))
+        .map(|(_, path)| guards::norm_path(path))
+        .filter(|path| *path != rec.test_file)
+        .collect();
+    rec.frozen_inputs.sort();
     let sha = git::commit_all(&worktree, &format!("test: failing repro for #{n}"))
         .map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
     ctx.state.checkpoints.insert(StageId::Repro, sha.clone());
@@ -376,6 +385,7 @@ mod tests {
                 issue_text: None,
                 provider: None,
                 policy_acknowledged: false,
+                profile: None,
             },
             "claude".into(),
         );
@@ -402,6 +412,7 @@ mod tests {
             frozen_commit: None,
             frozen_len: None,
             profile: Some(rust_cargo::ID.into()),
+            frozen_inputs: Vec::new(),
         };
         (temporary, ctx, record)
     }
@@ -544,6 +555,7 @@ mod tests {
             frozen_commit: Some("abc123".into()),
             frozen_len: Some(10),
             profile: Some("rust-cargo".into()),
+            frozen_inputs: Vec::new(),
         };
         let md = repro_markdown(&rec, 9);
         assert!(md.starts_with("# Repro for #9"));
