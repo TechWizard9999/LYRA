@@ -14,10 +14,12 @@ jobs:
           fetch-depth: 0
       - name: .claude/skills matches .agents/skills
         run: ./scripts/agents.sh check
-      - name: No AI co-author trailers in PR commits
+      - name: agents.sh checker regression tests
+        run: ./scripts/agents-test.sh
+      - name: No Co-Authored-By trailers in PR commits (single-author commits)
         if: github.event_name == 'pull_request'
         run: |
           if git log --format=%B "origin/${{ github.base_ref }}..HEAD" | grep -qiE '^[[:space:]]*co-authored-by:'; then
-            echo "A commit in this PR has a Co-Authored-By trailer; AGENTS.md rule 8 forbids it." >&2
+            echo "A commit in this PR has a Co-Authored-By trailer; commits here are single-author (AGENTS.md rule 8 bans AI co-author trailers; this check bans all)." >&2
             exit 1
           fi
