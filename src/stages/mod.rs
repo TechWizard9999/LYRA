@@ -141,7 +141,8 @@ pub(crate) fn readonly_source_snapshot(
         (resolved.starts_with(root) && resolved.is_file()).then_some(relative.to_path_buf())
     }
     fn append_source(snapshot: &mut String, relative: &std::path::Path, source: &str) {
-        snapshot.push_str(&format!("\nFile: {}\n", relative.display()));
+        // Repository-relative paths use `/` on every platform, as everywhere else in LYRA.
+        snapshot.push_str(&format!("\nFile: {}\n", relative.to_string_lossy().replace('\\', "/")));
         for (index, line) in source.lines().enumerate() {
             snapshot.push_str(&format!("{}: {}\n", index + 1, line));
         }
@@ -209,9 +210,10 @@ pub(crate) fn readonly_source_snapshot(
         for path in &complete {
             match std::fs::read_to_string(canonical_root.join(path)) {
                 Ok(source) => append_source(&mut snapshot, path, &source),
-                Err(error) => {
-                    snapshot.push_str(&format!("\n[Relevant source omitted: {}: {error}.]\n", path.display()))
-                }
+                Err(error) => snapshot.push_str(&format!(
+                    "\n[Relevant source omitted: {}: {error}.]\n",
+                    path.to_string_lossy().replace('\\', "/")
+                )),
             }
         }
     }

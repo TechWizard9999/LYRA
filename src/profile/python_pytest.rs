@@ -47,14 +47,15 @@ const DISCOVERY_WRAPPER: &str =
 
 const PYTEST_CONFIG_FILES: [&str; 4] = ["pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml"];
 
-/// Verification provenance: every top-level package or module of the project must be found
-/// inside the checkout under test (the working directory). `find_spec` locates a top-level
-/// name without importing it, so no project code runs. Exit 1 names each one that resolves
-/// elsewhere, for example to an editable install of another clone.
+/// Verification provenance: every project name (one per line on stdin) must be found inside
+/// the checkout under test (the working directory). `find_spec` locates a top-level name
+/// without importing it, so no project code runs. A name that is missing, resolves elsewhere
+/// (an editable install of another clone, a regular package shadowing a namespace package) or
+/// has any namespace portion outside the checkout fails, by name, with exit status 1.
 const PROVENANCE_CHECK: &str = "import importlib.util, os, sys
 root = os.path.realpath(os.getcwd())
 bad = []
-for name in sys.argv[1:]:
+for name in [line.strip() for line in sys.stdin if line.strip()]:
     spec = importlib.util.find_spec(name)
     places = [spec.origin] if spec and spec.origin not in (None, 'built-in', 'frozen') else list(getattr(spec, 'submodule_search_locations', None) or [])
     places = [os.path.realpath(p) for p in places]
@@ -346,11 +347,12 @@ impl ExecutionProfile for PythonPytest {
         let optional =
             |value: &Option<String>| value.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
         let mut steps = Vec::new();
-        let names = importable_names(worktree);
+        let names = provenance_names(worktree, &guards::norm_path(&rec.test_file));
         if !names.is_empty() {
             steps.push(VerifyStep {
                 name: "imports",
-                spec: CommandSpec::new(PYTHON, worktree).args(["-c", PROVENANCE_CHECK]).args(names),
+                // Names travel on stdin: no command-line length limit, so none is left unchecked.
+                spec: CommandSpec::new(PYTHON, worktree).args(["-c", PROVENANCE_CHECK]).stdin(names.join("\n") + "\n"),
                 log: "50-verify/imports.txt",
                 regression: false,
             });
@@ -417,9 +419,70 @@ pub fn is_generated_python_dir(relative: &Path, path: &Path) -> bool {
     }
 }
 
+/// Every name the provenance step checks: the project's top-level packages and modules
+/// ([`importable_names`]) plus each top-level name the frozen regression imports that exists
+/// as project code anywhere in the checkout (for example a `lib/pkg` layout), which must then
+/// also resolve inside it. Third-party and standard-library imports are not project code.
+pub fn provenance_names(root: &Path, test_file: &str) -> Vec<String> {
+    let mut names = importable_names(root);
+    if let Ok(source) = std::fs::read_to_string(root.join(test_file)) {
+        let tree = test_tree(test_file);
+        for module in imported_modules(&source) {
+            let Some(top) = module.split('.').next().filter(|t| !t.is_empty()) else { continue };
+            if identifier_re().is_match(top) && project_code_named(root, top, &tree) {
+                names.push(top.to_string());
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Whether the checkout holds project code called `name` (a directory with Python files or a
+/// `name.py`), outside the test tree, virtual environments and build output, up to four levels.
+fn project_code_named(root: &Path, name: &str, test_tree: &str) -> bool {
+    fn visit(root: &Path, dir: &Path, depth: usize, name: &str, test_tree: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else { return false };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            let relative = path.strip_prefix(root).unwrap_or(&path);
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_file() && file_name == format!("{name}.py") {
+                return true;
+            }
+            if !kind.is_dir() || file_name.starts_with('.') || is_generated_python_dir(relative, &path) {
+                continue;
+            }
+            let rel = relative.to_string_lossy().replace('\\', "/");
+            if matches!(file_name.as_str(), "tests" | "test" | "testing") || (!test_tree.is_empty() && rel == test_tree)
+            {
+                continue;
+            }
+            if file_name == name
+                && std::fs::read_dir(&path)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .any(|e| e.file_name().to_string_lossy().ends_with(".py"))
+            {
+                return true;
+            }
+            if depth < 4 && visit(root, &path, depth + 1, name, test_tree) {
+                return true;
+            }
+        }
+        false
+    }
+    visit(root, root, 1, name, test_tree)
+}
+
 /// The project's own top-level packages and modules in the repository root and `src/`, which
-/// the verification provenance step requires to resolve inside the checkout. Tests, docs,
-/// tooling scripts, virtual environments and build output are not project code.
+/// the verification provenance step requires to resolve inside the checkout: regular packages
+/// and modules in both, and PEP 420 namespace packages (a directory of Python files without
+/// `__init__.py`) under `src/`. Tests, docs, tooling scripts, virtual environments and build
+/// output are not project code. There is no limit on the number of names.
 pub fn importable_names(root: &Path) -> Vec<String> {
     const NOT_PROJECT_DIRS: [&str; 12] = [
         "tests",
@@ -445,10 +508,16 @@ pub fn importable_names(root: &Path) -> Vec<String> {
             let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else { continue };
             let Ok(kind) = entry.file_type() else { continue };
             let candidate = if kind.is_dir() {
-                (!NOT_PROJECT_DIRS.contains(&file_name.as_str())
-                    && !path.join("pyvenv.cfg").exists()
-                    && path.join("__init__.py").is_file())
-                .then_some(file_name)
+                let has_python = || {
+                    std::fs::read_dir(&path)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .any(|e| e.file_name().to_string_lossy().ends_with(".py"))
+                };
+                let package = path.join("__init__.py").is_file() || (base != root && has_python());
+                (!NOT_PROJECT_DIRS.contains(&file_name.as_str()) && !path.join("pyvenv.cfg").exists() && package)
+                    .then_some(file_name)
             } else if kind.is_file() {
                 file_name
                     .strip_suffix(".py")
@@ -466,8 +535,141 @@ pub fn importable_names(root: &Path) -> Vec<String> {
     }
     names.sort();
     names.dedup();
-    names.truncate(50);
     names
+}
+
+/// Module names a Python source imports: `import a.b, c as d`, `from a.b import c, d`,
+/// relative `from . import x` / `from ..m import y` (kept with their dots), parenthesised and
+/// backslash-continued lists, imports inside functions, and dotted names in string literals
+/// (`importlib.import_module("tests.test_helpers")`). For `from m import n` both `m` and `m.n`
+/// are returned, because `n` may be a submodule. Over-approximation is intended: the result
+/// only decides what is locked or checked.
+pub fn imported_modules(source: &str) -> Vec<String> {
+    static STRING: OnceLock<Regex> = OnceLock::new();
+    let string_re = STRING.get_or_init(|| Regex::new(r#"["']([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)["']"#).unwrap());
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0i64;
+    for raw in source.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if current.is_empty() && !(line.starts_with("import ") || line.starts_with("from ")) {
+            continue;
+        }
+        current.push(' ');
+        current.push_str(line.trim_end_matches('\\'));
+        depth += line.matches('(').count() as i64 - line.matches(')').count() as i64;
+        if depth <= 0 && !line.ends_with('\\') {
+            statements.push(std::mem::take(&mut current));
+            depth = 0;
+        }
+    }
+    let mut modules = Vec::new();
+    let valid =
+        |name: &str| !name.is_empty() && name.chars().all(|c| c == '.' || c == '_' || c.is_ascii_alphanumeric());
+    for statement in statements {
+        let statement = statement.replace(['(', ')'], " ");
+        for part in statement.split(';').map(str::trim) {
+            if let Some(rest) = part.strip_prefix("import ") {
+                modules.extend(rest.split(',').filter_map(|n| n.split_whitespace().next()).map(str::to_owned));
+            } else if let Some((module, names)) = part.strip_prefix("from ").and_then(|r| r.split_once(" import ")) {
+                let module = module.trim();
+                if !module.chars().all(|c| c == '.') {
+                    modules.push(module.to_string());
+                }
+                for name in names.split(',').filter_map(|n| n.split_whitespace().next()).filter(|n| *n != "*") {
+                    let joined =
+                        if module.ends_with('.') { format!("{module}{name}") } else { format!("{module}.{name}") };
+                    modules.push(joined);
+                }
+            }
+        }
+    }
+    modules.extend(string_re.captures_iter(source).map(|c| c[1].to_string()));
+    modules.retain(|m| valid(m));
+    modules.sort();
+    modules.dedup();
+    modules
+}
+
+fn parent_dir(path: &str) -> &str {
+    path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("")
+}
+
+fn join_rel(dir: &str, rest: &str) -> String {
+    if dir.is_empty() {
+        rest.to_string()
+    } else {
+        format!("{dir}/{rest}")
+    }
+}
+
+/// Repository files that importing `module` from `importer` may execute: the module file or
+/// package `__init__.py`, and the `__init__.py` of every package on the way. Absolute names are
+/// looked up where pytest and Python put them on `sys.path`: the importer's base directory (the
+/// first ancestor without `__init__.py`, pytest's default import mode), the repository root
+/// and `src/`; relative names from the importer's package.
+fn module_files(module: &str, importer: &str, exists: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let (bases, dotted) = if module.starts_with('.') {
+        let dots = module.chars().take_while(|c| *c == '.').count();
+        let mut dir = parent_dir(importer);
+        for _ in 1..dots {
+            dir = parent_dir(dir);
+        }
+        (vec![dir.to_string()], &module[dots..])
+    } else {
+        let mut base = parent_dir(importer);
+        while !base.is_empty() && exists(&join_rel(base, "__init__.py")) {
+            base = parent_dir(base);
+        }
+        (vec![base.to_string(), String::new(), "src".to_string()], module)
+    };
+    let parts: Vec<&str> = dotted.split('.').filter(|p| !p.is_empty()).collect();
+    let mut files = Vec::new();
+    for base in bases {
+        for i in 1..=parts.len() {
+            let package = join_rel(&base, &parts[..i].join("/"));
+            files.push(join_rel(&package, "__init__.py"));
+            if i == parts.len() {
+                files.push(format!("{package}.py"));
+            }
+        }
+    }
+    files.retain(|f| exists(f));
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// Test-side files the frozen regression loads, transitively: whatever its imports (and those
+/// of the files found) resolve to inside the test tree, or to a test-named module or
+/// `conftest.py` anywhere. Production modules it imports are not followed: they are what the
+/// fix is meant to change.
+pub fn regression_imports(test_file: &str, read: FileReader<'_>) -> std::collections::BTreeSet<String> {
+    let tree = test_tree(test_file);
+    let exists = |p: &str| read(p).is_some();
+    let test_side = |path: &str| {
+        let name = guards::base_name(path);
+        (!tree.is_empty() && path.strip_prefix(tree.as_str()).is_some_and(|r| r.starts_with('/')))
+            || name == "conftest.py"
+            || (name.ends_with(".py") && (name.starts_with("test_") || name.ends_with("_test.py")))
+    };
+    let mut locked = std::collections::BTreeSet::new();
+    let mut queue = vec![test_file.to_string()];
+    while let Some(file) = queue.pop() {
+        let Some(source) = read(&file) else { continue };
+        for module in imported_modules(&source) {
+            for dependency in module_files(&module, &file, &exists) {
+                if dependency != test_file
+                    && test_side(&dependency)
+                    && locked.len() < 500
+                    && locked.insert(dependency.clone())
+                {
+                    queue.push(dependency);
+                }
+            }
+        }
+    }
+    locked
 }
 
 // ---------------------------------------------------------------------------------------
@@ -878,10 +1080,15 @@ pub fn check_fix_changes_with(
     //    infrastructure next to the frozen test.
     let test_file = guards::norm_path(&rec.test_file);
     let tree = test_tree(&test_file);
+    let imported = regression_imports(&test_file, read_checkpoint);
     for (status, raw) in changes {
         let path = guards::norm_path(raw);
         if let Some(reason) = collection_control_violation(&path) {
             violations.push(format!("{status} {path}: {reason}"));
+            continue;
+        }
+        if imported.contains(&path) {
+            violations.push(format!("{status} {path}: imported by the frozen regression, so it is locked with it"));
             continue;
         }
         if path != test_file && locked_by_test_tree(&path, &tree) {
@@ -1561,7 +1768,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
 
         let steps = PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), &checkout).unwrap();
         assert_eq!(steps[0].name, "imports");
-        assert_eq!(steps[0].spec.args.last().unwrap(), "pkg");
+        assert_eq!(steps[0].spec.stdin.as_deref(), Some("pkg\n"));
         let provenance = steps[0].spec.clone();
         let bound = proc::run(
             &with_venv(PythonPytest.command_environment(provenance.clone(), &dir.path().join("env"))),
@@ -1600,21 +1807,24 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         std::fs::write(root.join("calc.py"), "def add(a, b):\n    return a - b\n").unwrap();
         std::fs::write(root.join("tests/__init__.py"), "").unwrap();
         std::fs::write(root.join("tests/helpers.py"), "EXPECTED = 3\n").unwrap();
-        let test = "from calc import add\nfrom tests.helpers import EXPECTED\n\ndef test_issue_7_fails():\n    assert add(1, 2) == EXPECTED, \"sum must be three\"\n";
+        std::fs::write(root.join("tests/test_helpers.py"), "LIMIT = 0\n").unwrap();
+        let test = "from calc import add\nfrom tests.helpers import EXPECTED\nfrom tests.test_helpers import LIMIT\n\ndef test_issue_7_fails():\n    assert add(1, 2) == EXPECTED + LIMIT, \"sum must be three\"\n";
         std::fs::write(root.join(FILE), test).unwrap();
         let spec = PythonPytest.reproduction_environment(PythonPytest.regression_command(&rec(), root).unwrap(), root);
         let timeout = Duration::from_secs(120);
         let cancel = CancellationToken::new();
         let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
         assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Failed, "{out}");
-        let frozen: HashMap<&str, String> = [FILE, "tests/helpers.py", "tests/__init__.py"]
+        let frozen: HashMap<&str, String> = [FILE, "tests/helpers.py", "tests/__init__.py", "tests/test_helpers.py"]
             .into_iter()
             .map(|p| (p, std::fs::read_to_string(root.join(p)).unwrap()))
             .collect();
 
-        for (path, text) in
-            [("tests/helpers.py", "EXPECTED = -1\n"), ("tests/__init__.py", "import calc\ncalc.add = lambda a, b: 3\n")]
-        {
+        for (path, text) in [
+            ("tests/helpers.py", "EXPECTED = -1\n"),
+            ("tests/__init__.py", "import calc\ncalc.add = lambda a, b: 3\n"),
+            ("tests/test_helpers.py", "LIMIT = -4\n"),
+        ] {
             let original = std::fs::read_to_string(root.join(path)).unwrap();
             std::fs::write(root.join(path), text).unwrap();
             let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
@@ -1709,7 +1919,8 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         assert_eq!(importable_names(root), ["calc", "pkg", "toplevel"]);
         let steps = PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), root).unwrap();
         assert_eq!(steps.iter().map(|s| s.name).collect::<Vec<_>>(), ["imports", "repro", "tests"]);
-        assert_eq!(steps[0].spec.args[2..], ["calc", "pkg", "toplevel"]);
+        assert_eq!(steps[0].spec.args.len(), 2, "names travel on stdin, not argv");
+        assert_eq!(steps[0].spec.stdin.as_deref(), Some("calc\npkg\ntoplevel\n"));
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(
             PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), empty.path()).unwrap()[0].name,
@@ -1735,6 +1946,201 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             [flat.path().to_path_buf()],
             "no src/ entry when absent"
         );
+    }
+
+    #[test]
+    fn import_parsing_covers_the_forms_a_regression_uses() {
+        let source = "import os, sys as system\nfrom tests.test_helpers import (\n    EXPECTED,\n    build,  # comment\n)\nfrom . import test_shared\nfrom ..pkg.mod import thing\nfrom calc import add\nimport a.b \\\n    as ab\ndef f():\n    import late_helper\n    mod = importlib.import_module('tests.dynamic_helper')\nfrom x import *\n";
+        let modules = imported_modules(source);
+        for expected in [
+            "os",
+            "sys",
+            "tests.test_helpers",
+            "tests.test_helpers.EXPECTED",
+            "tests.test_helpers.build",
+            ".test_shared",
+            "..pkg.mod",
+            "..pkg.mod.thing",
+            "calc",
+            "calc.add",
+            "a.b",
+            "late_helper",
+            "tests.dynamic_helper",
+            "x",
+        ] {
+            assert!(modules.contains(&expected.to_string()), "{expected} missing from {modules:?}");
+        }
+        assert!(!modules.iter().any(|m| m.ends_with('*') || m == "."));
+    }
+
+    #[test]
+    fn modules_imported_by_the_regression_are_locked_even_when_named_like_tests() {
+        let frozen_test = "from tests.test_helpers import EXPECTED\nfrom .test_shared import build\nfrom calc import add\n\ndef test_issue_7_fails():\n    assert add(1, 2) == EXPECTED, \"sum must be three\"\n";
+        let files = HashMap::from([
+            (FILE, frozen_test),
+            ("tests/__init__.py", ""),
+            ("tests/test_helpers.py", "from tests.test_base import BASE\nEXPECTED = BASE + 3\n"),
+            ("tests/test_base.py", "BASE = 0\n"),
+            ("tests/test_shared.py", "def build(): pass\n"),
+            ("tests/test_other.py", "def test_other(): pass\n"),
+            ("calc.py", "def add(a, b): return a - b\n"),
+        ]);
+        let read = reader(&files);
+        let locked = regression_imports(FILE, &read);
+        assert_eq!(
+            locked.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["tests/__init__.py", "tests/test_base.py", "tests/test_helpers.py", "tests/test_shared.py"],
+            "direct, relative and transitive test-side imports; production `calc` is not followed"
+        );
+        let check = |path: &str| {
+            let changes = vec![("M".to_string(), "calc.py".to_string()), ("M".to_string(), path.to_string())];
+            check_fix_changes_with(&changes, &rec(), &read, &read)
+        };
+        for path in ["tests/test_helpers.py", "tests/test_base.py", "tests/test_shared.py"] {
+            let err = check(path).unwrap_err();
+            assert!(err.contains("imported by the frozen regression"), "{path}: {err}");
+        }
+        assert!(check("tests/test_other.py").is_ok(), "tests the regression does not import stay editable");
+
+        // pytest's default import mode puts the first directory without __init__.py on sys.path,
+        // so a bare `import test_helpers` from tests/ resolves to tests/test_helpers.py.
+        let bare =
+            HashMap::from([(FILE, "from test_helpers import EXPECTED\n"), ("tests/test_helpers.py", "EXPECTED = 3\n")]);
+        assert!(regression_imports(FILE, &reader(&bare)).contains("tests/test_helpers.py"));
+        // A helper named like a test outside the test tree is locked too.
+        let outside = HashMap::from([
+            (FILE, "from support.test_fixtures import DATA\n"),
+            ("support/test_fixtures.py", "DATA = 1\n"),
+        ]);
+        assert!(regression_imports(FILE, &reader(&outside)).contains("support/test_fixtures.py"));
+    }
+
+    #[test]
+    fn provenance_covers_namespace_packages_imported_project_code_and_has_no_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("src/nspkg/module.py", "");
+        write("lib/libpkg/__init__.py", "");
+        write("tools/release.py", "");
+        write("tests/test_helpers.py", "");
+        write(
+            FILE,
+            "import os\nimport attrs\nfrom nspkg.module import x\nfrom libpkg import y\nfrom test_helpers import z\n",
+        );
+        let names = provenance_names(root, FILE);
+        assert!(names.contains(&"nspkg".to_string()), "PEP 420 namespace package under src/: {names:?}");
+        assert!(
+            names.contains(&"libpkg".to_string()),
+            "project code the regression imports, outside root/src: {names:?}"
+        );
+        for not_project in ["os", "attrs", "tools", "test_helpers"] {
+            assert!(!names.contains(&not_project.to_string()), "{not_project}: {names:?}");
+        }
+        for i in 0..120 {
+            write(&format!("src/mod_{i}.py"), "");
+        }
+        let all = provenance_names(root, FILE);
+        assert!(all.len() > 120, "no truncation: {}", all.len());
+        let steps = PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), root).unwrap();
+        assert_eq!(steps[0].name, "imports");
+        assert_eq!(steps[0].spec.stdin.as_deref().unwrap().lines().count(), all.len());
+    }
+
+    /// A regular package of the same name outside the checkout takes precedence over the
+    /// candidate's PEP 420 namespace package; the provenance step must catch it by name.
+    #[tokio::test]
+    #[ignore = "needs a provisioned python3 with pytest on PATH"]
+    async fn a_regular_package_elsewhere_cannot_hide_behind_a_namespace_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let timeout = Duration::from_secs(120);
+        let cancel = CancellationToken::new();
+        let write = |path: std::path::PathBuf, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let checkout = dir.path().join("checkout");
+        write(checkout.join("src/pkg/module.py"), "def answer():\n    return 41\n");
+        write(checkout.join("pytest.ini"), "[pytest]\n");
+        write(
+            checkout.join(FILE),
+            "from pkg.module import answer\n\ndef test_issue_7_fails():\n    assert answer() == 42, \"sum must be three\"\n",
+        );
+        let external = dir.path().join("site");
+        write(external.join("pkg/__init__.py"), "");
+        write(external.join("pkg/module.py"), "def answer():\n    return 42\n");
+
+        let venv = dir.path().join("venv");
+        let made = proc::run(
+            &CommandSpec::new(PYTHON, dir.path()).args(["-m", "venv", "--without-pip"]).arg(venv.to_string_lossy()),
+            timeout,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert!(made.success(), "{}", made.combined());
+        let venv_python = if cfg!(windows) { venv.join("Scripts/python.exe") } else { venv.join("bin/python") };
+        let purelib = proc::run(
+            &CommandSpec::new(venv_python.to_string_lossy(), dir.path())
+                .args(["-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"]),
+            timeout,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        let purelib = std::path::PathBuf::from(purelib.stdout.trim());
+        write(purelib.join("external.pth"), &format!("{}\n", external.display()));
+        let pytest_site = proc::run(
+            &CommandSpec::new(PYTHON, dir.path())
+                .args(["-c", "import os, pytest; print(os.path.dirname(os.path.dirname(pytest.__file__)))"]),
+            timeout,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        write(purelib.join("provisioned.pth"), &format!("{}\n", pytest_site.stdout.trim()));
+        let with_venv = |mut spec: CommandSpec| {
+            spec.program = venv_python.to_string_lossy().into_owned();
+            spec
+        };
+
+        // Even with imports bound to the checkout, Python prefers the external regular package
+        // (PEP 420), so the bug is hidden: binding alone cannot fix this layout...
+        let spec = with_venv(
+            PythonPytest
+                .reproduction_environment(PythonPytest.regression_command(&rec(), &checkout).unwrap(), dir.path()),
+        );
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(
+            classify_pytest(&out, ID_),
+            RegressionOutcome::Passed,
+            "precondition: the external package wins: {out}"
+        );
+        // ...so verification fails visibly, naming the package.
+        let steps = PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), &checkout).unwrap();
+        assert_eq!(steps[0].name, "imports");
+        let env_root = dir.path().join("env");
+        let check =
+            proc::run(&with_venv(PythonPytest.command_environment(steps[0].spec.clone(), &env_root)), timeout, &cancel)
+                .await
+                .unwrap();
+        assert!(
+            !check.success() && check.stdout.contains("ERROR: pkg does not resolve inside the checkout"),
+            "{}",
+            check.combined()
+        );
+
+        // Once nothing shadows it, the namespace package resolves inside and the check passes.
+        std::fs::remove_file(purelib.join("external.pth")).unwrap();
+        let check =
+            proc::run(&with_venv(PythonPytest.command_environment(steps[0].spec.clone(), &env_root)), timeout, &cancel)
+                .await
+                .unwrap();
+        assert!(check.success(), "{}", check.combined());
     }
 
     #[test]
