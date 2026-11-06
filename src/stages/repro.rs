@@ -171,6 +171,10 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
         }
     }
     ctx.events.info(format!("repro: test {} fails with the expected text", rec.test_name));
+    // Test-side modules the failing run actually loaded are frozen with the test.
+    let loaded = profile
+        .loaded_test_inputs(&output, &rec)
+        .map_err(|msg| StageError::new(ErrorKind::Guard, msg).with_details(&out_rel))?;
 
     // 5. Build scripts may have written files; guard that final diff before committing.
     if std::fs::read(&abs_test).map_err(|e| StageError::new(ErrorKind::Io, e.to_string()))? != tested_source {
@@ -185,8 +189,10 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
         .filter(|(status, _)| guards::is_new(status))
         .map(|(_, path)| guards::norm_path(path))
         .filter(|path| *path != rec.test_file)
+        .chain(loaded)
         .collect();
     rec.frozen_inputs.sort();
+    rec.frozen_inputs.dedup();
     let sha = git::commit_all(&worktree, &format!("test: failing repro for #{n}"))
         .map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
     ctx.state.checkpoints.insert(StageId::Repro, sha.clone());

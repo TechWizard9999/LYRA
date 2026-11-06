@@ -45,6 +45,24 @@ const PYTEST_FLAGS: [&str; 8] =
 const DISCOVERY_WRAPPER: &str =
     "import sys, pytest; code = int(pytest.main(sys.argv[1:])); sys.exit(0 if code == 5 else code)";
 
+/// The regression runs pytest in-process through this fixed recorder, which afterwards lists
+/// every module file it loaded from inside the working directory. Python itself reports what
+/// the regression imported, however the import was written (inline, conditional, dynamic),
+/// and Repro freezes the test-side ones with the test. The exit status is pytest's.
+const PYTEST_RECORDER: &str = "import os, sys, pytest
+code = int(pytest.main(sys.argv[1:]))
+root = os.path.realpath(os.getcwd())
+for module in list(sys.modules.values()):
+    path = getattr(module, '__file__', None)
+    if isinstance(path, str):
+        path = os.path.realpath(path)
+        if path.startswith(root + os.sep):
+            print('LYRA-LOADED ' + os.path.relpath(path, root).replace(os.sep, '/'))
+print('LYRA-LOADED-END')
+sys.exit(code)";
+const LOADED_PREFIX: &str = "LYRA-LOADED ";
+const LOADED_END: &str = "LYRA-LOADED-END";
+
 const PYTEST_CONFIG_FILES: [&str; 4] = ["pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml"];
 
 /// Verification provenance: every project name (one per line on stdin) must be found inside
@@ -247,7 +265,7 @@ impl ExecutionProfile for PythonPytest {
     }
     fn regression_command(&self, rec: &ReproRecord, cwd: &Path) -> Result<CommandSpec, String> {
         let id = node_id(&rec.test_file, &rec.test_name)?;
-        Ok(CommandSpec::new(PYTHON, cwd).args(["-m", "pytest"]).args(PYTEST_FLAGS).arg(id))
+        Ok(regression_spec(&id, cwd))
     }
     fn discovery(&self, spec: &CommandSpec) -> Discovery {
         // Collect the whole recorded test module: once its source is emptied nothing may be
@@ -293,6 +311,9 @@ impl ExecutionProfile for PythonPytest {
     }
     fn assert_passed(&self, output: &str, rec: &ReproRecord) -> Result<(), String> {
         assert_test_passed(output, rec.test_name.trim())
+    }
+    fn loaded_test_inputs(&self, output: &str, rec: &ReproRecord) -> Result<Vec<String>, String> {
+        parse_loaded_modules(output, &guards::norm_path(&rec.test_file))
     }
     fn assert_absent_from_discovery(&self, output: &str, rec: &ReproRecord) -> Result<(), String> {
         assert_absent_from_collection(output, &guards::norm_path(&rec.test_file), rec.test_name.trim())
@@ -538,6 +559,11 @@ pub fn importable_names(root: &Path) -> Vec<String> {
     names
 }
 
+fn import_keyword() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\b(?:from\s+\.*[\w.]*\s+import|import)\s").unwrap())
+}
+
 /// Module names a Python source imports: `import a.b, c as d`, `from a.b import c, d`,
 /// relative `from . import x` / `from ..m import y` (kept with their dots), parenthesised and
 /// backslash-continued lists, imports inside functions, and dotted names in string literals
@@ -552,7 +578,7 @@ pub fn imported_modules(source: &str) -> Vec<String> {
     let mut depth = 0i64;
     for raw in source.lines() {
         let line = raw.split('#').next().unwrap_or("").trim();
-        if current.is_empty() && !(line.starts_with("import ") || line.starts_with("from ")) {
+        if current.is_empty() && !import_keyword().is_match(line) {
             continue;
         }
         current.push(' ');
@@ -568,7 +594,12 @@ pub fn imported_modules(source: &str) -> Vec<String> {
         |name: &str| !name.is_empty() && name.chars().all(|c| c == '.' || c == '_' || c.is_ascii_alphanumeric());
     for statement in statements {
         let statement = statement.replace(['(', ')'], " ");
-        for part in statement.split(';').map(str::trim) {
+        // Simple statements may follow `;` or a compound-statement header on the same line
+        // (`if cond: from m import x`, `setup(); import m`), so every segment is examined from
+        // its first import keyword.
+        for part in statement.split([';', ':']).map(str::trim) {
+            let Some(start) = import_keyword().find(part).map(|m| m.start()) else { continue };
+            let part = &part[start..];
             if let Some(rest) = part.strip_prefix("import ") {
                 modules.extend(rest.split(',').filter_map(|n| n.split_whitespace().next()).map(str::to_owned));
             } else if let Some((module, names)) = part.strip_prefix("from ").and_then(|r| r.split_once(" import ")) {
@@ -644,32 +675,62 @@ fn module_files(module: &str, importer: &str, exists: &dyn Fn(&str) -> bool) -> 
 /// of the files found) resolve to inside the test tree, or to a test-named module or
 /// `conftest.py` anywhere. Production modules it imports are not followed: they are what the
 /// fix is meant to change.
-pub fn regression_imports(test_file: &str, read: FileReader<'_>) -> std::collections::BTreeSet<String> {
+pub fn regression_imports(test_file: &str, read: FileReader<'_>) -> Result<std::collections::BTreeSet<String>, String> {
+    const LIMIT: usize = 2000;
     let tree = test_tree(test_file);
     let exists = |p: &str| read(p).is_some();
-    let test_side = |path: &str| {
-        let name = guards::base_name(path);
-        (!tree.is_empty() && path.strip_prefix(tree.as_str()).is_some_and(|r| r.starts_with('/')))
-            || name == "conftest.py"
-            || (name.ends_with(".py") && (name.starts_with("test_") || name.ends_with("_test.py")))
-    };
     let mut locked = std::collections::BTreeSet::new();
     let mut queue = vec![test_file.to_string()];
     while let Some(file) = queue.pop() {
         let Some(source) = read(&file) else { continue };
         for module in imported_modules(&source) {
             for dependency in module_files(&module, &file, &exists) {
-                if dependency != test_file
-                    && test_side(&dependency)
-                    && locked.len() < 500
-                    && locked.insert(dependency.clone())
-                {
+                if dependency != test_file && is_test_side(&dependency, &tree) && locked.insert(dependency.clone()) {
+                    if locked.len() > LIMIT {
+                        return Err(format!(
+                            "the frozen regression reaches more than {LIMIT} test-side modules; LYRA cannot establish its inputs"
+                        ));
+                    }
                     queue.push(dependency);
                 }
             }
         }
     }
-    locked
+    Ok(locked)
+}
+
+/// Test-side code: anything in the test tree, a test-named module or a `conftest.py` anywhere.
+fn is_test_side(path: &str, tree: &str) -> bool {
+    let name = guards::base_name(path);
+    (!tree.is_empty() && path.strip_prefix(tree).is_some_and(|r| r.starts_with('/')))
+        || name == "conftest.py"
+        || (name.ends_with(".py") && (name.starts_with("test_") || name.ends_with("_test.py")))
+}
+
+/// Parses the import recorder's report (see [`PYTEST_RECORDER`]) into the test-side files the
+/// regression actually loaded, repository-relative. A run without the end marker (crashed,
+/// truncated, or not run through the recorder) is an error: the inputs cannot be established.
+pub fn parse_loaded_modules(output: &str, test_file: &str) -> Result<Vec<String>, String> {
+    if !output.lines().any(|l| l.trim() == LOADED_END) {
+        return Err("the regression run did not report the modules it loaded, so LYRA cannot establish which test \
+                    inputs to lock"
+            .into());
+    }
+    let tree = test_tree(test_file);
+    let mut loaded: Vec<String> = output
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix(LOADED_PREFIX))
+        .map(guards::norm_path)
+        .filter(|p| {
+            !p.is_empty()
+                && !p.split('/').any(|c| c.is_empty() || c == ".." || c.starts_with('.') || c == "site-packages")
+                && *p != test_file
+                && is_test_side(p, &tree)
+        })
+        .collect();
+    loaded.sort();
+    loaded.dedup();
+    Ok(loaded)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -716,8 +777,12 @@ fn describe_layout(worktree: &Path) -> Value {
 // Regression identity and command
 // ---------------------------------------------------------------------------------------
 
+fn regression_spec(id: &str, cwd: &Path) -> CommandSpec {
+    CommandSpec::new(PYTHON, cwd).args(["-c", PYTEST_RECORDER]).args(PYTEST_FLAGS).arg(id)
+}
+
 fn regression_line(id: &str) -> String {
-    format!("{PYTHON} -m pytest {} {id}", PYTEST_FLAGS.join(" "))
+    regression_spec(id, Path::new(".")).display()
 }
 
 fn identifier_re() -> &'static Regex {
@@ -1080,7 +1145,10 @@ pub fn check_fix_changes_with(
     //    infrastructure next to the frozen test.
     let test_file = guards::norm_path(&rec.test_file);
     let tree = test_tree(&test_file);
-    let imported = regression_imports(&test_file, read_checkpoint);
+    let imported = regression_imports(&test_file, read_checkpoint).unwrap_or_else(|reason| {
+        violations.push(reason);
+        Default::default()
+    });
     for (status, raw) in changes {
         let path = guards::norm_path(raw);
         if let Some(reason) = collection_control_violation(&path) {
@@ -1986,7 +2054,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             ("calc.py", "def add(a, b): return a - b\n"),
         ]);
         let read = reader(&files);
-        let locked = regression_imports(FILE, &read);
+        let locked = regression_imports(FILE, &read).unwrap();
         assert_eq!(
             locked.iter().map(String::as_str).collect::<Vec<_>>(),
             ["tests/__init__.py", "tests/test_base.py", "tests/test_helpers.py", "tests/test_shared.py"],
@@ -2006,13 +2074,13 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         // so a bare `import test_helpers` from tests/ resolves to tests/test_helpers.py.
         let bare =
             HashMap::from([(FILE, "from test_helpers import EXPECTED\n"), ("tests/test_helpers.py", "EXPECTED = 3\n")]);
-        assert!(regression_imports(FILE, &reader(&bare)).contains("tests/test_helpers.py"));
+        assert!(regression_imports(FILE, &reader(&bare)).unwrap().contains("tests/test_helpers.py"));
         // A helper named like a test outside the test tree is locked too.
         let outside = HashMap::from([
             (FILE, "from support.test_fixtures import DATA\n"),
             ("support/test_fixtures.py", "DATA = 1\n"),
         ]);
-        assert!(regression_imports(FILE, &reader(&outside)).contains("support/test_fixtures.py"));
+        assert!(regression_imports(FILE, &reader(&outside)).unwrap().contains("support/test_fixtures.py"));
     }
 
     #[test]
@@ -2141,6 +2209,126 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
                 .await
                 .unwrap();
         assert!(check.success(), "{}", check.combined());
+    }
+
+    #[test]
+    fn inline_and_conditional_imports_are_found_and_the_limit_fails_visibly() {
+        let source = "if True: from tests.test_helpers import EXPECTED\nsetup(); import tests.test_other\ntry: import tests.test_maybe\nexcept ImportError: pass\nwith ctx(): from .test_shared import build\nx = 1  # import tests.test_comment\n";
+        let modules = imported_modules(source);
+        for expected in [
+            "tests.test_helpers",
+            "tests.test_helpers.EXPECTED",
+            "tests.test_other",
+            "tests.test_maybe",
+            ".test_shared.build",
+        ] {
+            assert!(modules.contains(&expected.to_string()), "{expected} missing from {modules:?}");
+        }
+        let files = HashMap::from([
+            (FILE, source),
+            ("tests/__init__.py", ""),
+            ("tests/test_helpers.py", "EXPECTED = 3\n"),
+            ("tests/test_other.py", ""),
+            ("tests/test_maybe.py", ""),
+            ("tests/test_shared.py", ""),
+        ]);
+        let read = reader(&files);
+        let locked = regression_imports(FILE, &read).unwrap();
+        for path in ["tests/test_helpers.py", "tests/test_other.py", "tests/test_maybe.py", "tests/test_shared.py"] {
+            assert!(locked.contains(path), "{path}: {locked:?}");
+        }
+        let changes =
+            vec![("M".to_string(), "calc.py".to_string()), ("M".to_string(), "tests/test_helpers.py".to_string())];
+        assert!(check_fix_changes_with(&changes, &rec(), &read, &read)
+            .unwrap_err()
+            .contains("imported by the frozen regression"));
+
+        // Past the limit the guard reports that it cannot establish the inputs, never a silent pass.
+        let many: String = (0..2001).map(|i| format!("import tests.test_h{i}\n")).collect();
+        let helpers: Vec<String> = (0..2001).map(|i| format!("tests/test_h{i}.py")).collect();
+        let mut wide: HashMap<&str, &str> = helpers.iter().map(|p| (p.as_str(), "")).collect();
+        wide.insert(FILE, many.as_str());
+        wide.insert("tests/__init__.py", "");
+        let err = regression_imports(FILE, &reader(&wide)).unwrap_err();
+        assert!(err.contains("cannot establish"), "{err}");
+        let only_production = vec![("M".to_string(), "calc.py".to_string())];
+        assert!(check_fix_changes_with(&only_production, &rec(), &reader(&wide), &reader(&wide))
+            .unwrap_err()
+            .contains("cannot establish"));
+    }
+
+    #[test]
+    fn the_import_recorder_report_is_required_and_keeps_only_test_side_files() {
+        let report = "1 failed in 0.02s\nLYRA-LOADED calc.py\nLYRA-LOADED tests/__init__.py\nLYRA-LOADED tests/test_helpers.py\nLYRA-LOADED tests/test_issue_7.py\nLYRA-LOADED conftest.py\nLYRA-LOADED .venv/lib/test_x.py\nLYRA-LOADED lib/site-packages/test_y.py\nLYRA-LOADED ../outside/test_z.py\nLYRA-LOADED-END\n";
+        assert_eq!(
+            parse_loaded_modules(report, FILE).unwrap(),
+            ["conftest.py", "tests/__init__.py", "tests/test_helpers.py"]
+        );
+        let err = parse_loaded_modules("1 failed in 0.02s\nLYRA-LOADED tests/test_helpers.py\n", FILE).unwrap_err();
+        assert!(err.contains("cannot establish"), "a run without the end marker fails closed: {err}");
+        // The recorder wraps the same flags and node id; classification ignores its report.
+        let spec = PythonPytest.regression_command(&rec(), Path::new("/w")).unwrap();
+        assert_eq!(spec.args[..2], ["-c".to_string(), PYTEST_RECORDER.to_string()]);
+        assert_eq!(
+            classify_pytest(&format!("{FAILED}LYRA-LOADED tests/test_helpers.py\nLYRA-LOADED-END\n"), ID_),
+            RegressionOutcome::Failed
+        );
+    }
+
+    /// End to end with real pytest: a regression that imports a test-named helper inline,
+    /// conditionally and dynamically. The recorder reports what was loaded, Repro freezes it,
+    /// and changing the helper (which would make the unchanged failing test pass) is rejected.
+    #[tokio::test]
+    #[ignore = "needs a provisioned python3 with pytest on PATH"]
+    async fn inline_conditional_and_dynamic_imports_of_test_helpers_are_frozen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("pytest.ini", "[pytest]\n");
+        write("calc.py", "def add(a, b):\n    return a - b\n");
+        write("tests/__init__.py", "");
+        write("tests/test_helpers.py", "EXPECTED = 3\n");
+        write("tests/test_offset.py", "OFFSET = 0\n");
+        let test = "import importlib\nfrom calc import add\nif True: from tests.test_helpers import EXPECTED\n\ndef test_issue_7_fails():\n    offset = importlib.import_module('tests.' + 'test_' + 'offset').OFFSET\n    assert add(1, 2) == EXPECTED + offset, \"sum must be three\"\n";
+        write(FILE, test);
+        let timeout = Duration::from_secs(120);
+        let cancel = CancellationToken::new();
+        let spec = PythonPytest.reproduction_environment(PythonPytest.regression_command(&rec(), root).unwrap(), root);
+        let run = proc::run(&spec, timeout, &cancel).await.unwrap();
+        let out = run.combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Failed, "{out}");
+        PythonPytest.confirm_failure(&run, &rec()).unwrap();
+        let loaded = PythonPytest.loaded_test_inputs(&out, &rec()).unwrap();
+        assert!(loaded.contains(&"tests/test_helpers.py".to_string()), "inline conditional import: {loaded:?}");
+        assert!(loaded.contains(&"tests/test_offset.py".to_string()), "computed dynamic import: {loaded:?}");
+        assert!(!loaded.contains(&"calc.py".to_string()), "production stays editable: {loaded:?}");
+
+        let mut record = rec();
+        record.frozen_inputs = loaded;
+        let frozen: HashMap<String, String> =
+            [FILE, "tests/test_helpers.py", "tests/test_offset.py", "tests/__init__.py", "calc.py"]
+                .into_iter()
+                .map(|p| (p.to_string(), std::fs::read_to_string(root.join(p)).unwrap()))
+                .collect();
+        for (path, text) in [("tests/test_helpers.py", "EXPECTED = -1\n"), ("tests/test_offset.py", "OFFSET = -4\n")] {
+            write(path, text);
+            let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+            assert_eq!(
+                classify_pytest(&out, ID_),
+                RegressionOutcome::Passed,
+                "the attack works without the lock: {out}"
+            );
+            let read_checkpoint = |p: &str| frozen.get(p).cloned();
+            let read_now = |p: &str| std::fs::read_to_string(root.join(p)).ok();
+            let err =
+                check_fix_changes_with(&[("M".into(), path.into())], &record, &read_checkpoint, &read_now).unwrap_err();
+            assert!(err.contains(path) && err.contains("locked"), "{err}");
+            write(path, &frozen[path]);
+        }
     }
 
     #[test]
