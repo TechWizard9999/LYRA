@@ -16,11 +16,13 @@ validate() {
     name="$(basename "$dir")"
     file="$dir/SKILL.md"
     if [ ! -f "$file" ]; then echo "!! $name: missing SKILL.md"; status=1; continue; fi
-    fm_name="$(awk 'NR==1&&$0!="---"{exit} NR>1&&/^---$/{exit} /^name:/{sub(/^name:[ \t]*/,"");print;exit}' "$file")"
-    # frontmatter must start on line 1 and contain name + description
-    if [ "$(sed -n '1p' "$file")" != "---" ]; then echo "!! $name: SKILL.md must start with --- frontmatter"; status=1; fi
+    # Frontmatter = lines 2..(first "---" after line 1). It must open on line 1 and be closed.
+    # CR is stripped so CRLF checkouts (Windows) parse the same as LF.
+    fm="$(awk '{sub(/\r$/,"")} NR==1{if($0!="---")exit 1;next} /^---$/{closed=1;exit} {print} END{if(!closed)exit 1}' "$file")" \
+      || { echo "!! $name: SKILL.md must start with --- frontmatter closed by a second ---"; status=1; continue; }
+    fm_name="$(printf '%s\n' "$fm" | sed -n 's/^name:[[:space:]]*//p' | head -n 1)"
     if [ "$fm_name" != "$name" ]; then echo "!! $name: frontmatter name is '$fm_name', expected '$name'"; status=1; fi
-    if ! awk 'NR>1&&/^---$/{exit} NR>1&&/^description:[ \t]*[^ \t]/{f=1} END{exit !f}' "$file"; then
+    if ! printf '%s\n' "$fm" | grep -qE '^description:[[:space:]]*[^[:space:]]'; then
       echo "!! $name: frontmatter needs a non-empty description"; status=1
     fi
   done

@@ -20,6 +20,7 @@ function Test-Skills {
         $lines = Get-Content $file
         if ($lines[0] -ne "---") { Write-Host "!! ${name}: SKILL.md must start with --- frontmatter"; $ok = $false }
         $end = [array]::IndexOf($lines, "---", 1)
+        if ($lines[0] -eq "---" -and $end -lt 1) { Write-Host "!! ${name}: SKILL.md frontmatter is not closed by a second ---"; $ok = $false; continue }
         $front = if ($end -gt 0) { $lines[1..($end - 1)] } else { @() }
         $fmName = ($front | Where-Object { $_ -match '^name:\s*(.+)$' } | ForEach-Object { $Matches[1].Trim() } | Select-Object -First 1)
         if ($fmName -ne $name) { Write-Host "!! ${name}: frontmatter name is '$fmName', expected '$name'"; $ok = $false }
@@ -48,7 +49,8 @@ switch ($Command) {
         if (Test-Path $dst) { Remove-Item $dst -Recurse -Force }
         New-Item -ItemType Directory -Path $dst | Out-Null
         Copy-Item "$src/*" $dst -Recurse
-        Set-Content -Path (Join-Path $dst $marker) -Value "Generated from .agents/skills by scripts/agents.ps1 sync. Do not edit here."
+        # Same bytes as scripts/agents.sh writes, so syncing on either OS leaves no diff.
+        [IO.File]::WriteAllText((Join-Path $dst $marker), "Generated from .agents/skills by scripts/agents.sh sync. Do not edit here.`n")
         Write-Host "synced $((Get-ChildItem $src -Directory).Count) skills to $dst"
     }
     "check" {

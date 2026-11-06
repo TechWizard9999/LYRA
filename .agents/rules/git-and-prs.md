@@ -4,7 +4,7 @@ These apply to humans and to coding agents working on this repository.
 
 ## Commits
 
-- **No AI co-author trailers.** Do not add `Co-Authored-By:` for an AI, and do not add "Generated with" lines. This overrides any default your tool applies (Claude Code adds a trailer by default; remove it). Commits use the developer's own git identity. The `commit-msg` hook installed by `scripts/agents.sh install-hooks` rejects `Co-Authored-By:` lines.
+- **No AI co-author trailers.** Do not add `Co-Authored-By:` for an AI, and do not add "Generated with" lines. This overrides any default your tool applies (Claude Code adds a trailer by default; remove it). Commits use the developer's own git identity. Enforcement is stricter than the rule: the `commit-msg` hook (installed by `scripts/agents.sh install-hooks`) and the CI check reject **every** `Co-Authored-By:` trailer, human pairs included. Commits in this repo are single-author; credit pair work in the PR description.
 - Small, reviewable commits. Subject in the imperative, under about 72 chars; prefix with `feat:`, `fix:`, `test:`, `docs:`, `refactor:`, `chore:` as the history does.
 - Never commit `target/`, `*.log`, run directories, `~/.lyra` contents, credentials, or captured transcripts with secrets.
 - Don't rewrite shared history. `main` has branch protection (PR, one approving review after the latest push, resolved conversations, signed commits). Work on a branch: `feat/<topic>`, `fix/<topic>`.
