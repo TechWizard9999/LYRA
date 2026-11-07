@@ -5,7 +5,10 @@
 param([Parameter(Position = 0)][string]$Command = "")
 
 $ErrorActionPreference = "Stop"
-Set-Location (Split-Path -Parent $PSScriptRoot)
+# Absolute repo root. .NET APIs resolve relative paths against the process working directory,
+# which Set-Location does not change, so anything passed to [IO.File] must be built from $root.
+$root = Split-Path -Parent $PSScriptRoot
+Set-Location $root
 
 $src = ".agents/skills"
 $dst = ".claude/skills"
@@ -50,7 +53,7 @@ switch ($Command) {
         New-Item -ItemType Directory -Path $dst | Out-Null
         Copy-Item "$src/*" $dst -Recurse
         # Same bytes as scripts/agents.sh writes, so syncing on either OS leaves no diff.
-        [IO.File]::WriteAllText((Join-Path $dst $marker), "Generated from .agents/skills by scripts/agents.sh sync. Do not edit here.`n")
+        [IO.File]::WriteAllText((Join-Path (Join-Path $root $dst) $marker), "Generated from .agents/skills by scripts/agents.sh sync. Do not edit here.`n")
         Write-Host "synced $((Get-ChildItem $src -Directory).Count) skills to $dst"
     }
     "check" {
