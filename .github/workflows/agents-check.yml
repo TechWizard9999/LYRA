@@ -23,3 +23,11 @@ jobs:
             echo "A commit in this PR has a Co-Authored-By trailer; commits here are single-author (AGENTS.md rule 8 bans AI co-author trailers; this check bans all)." >&2
             exit 1
           fi
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: agents.ps1 sync/check from outside the repo
+        shell: pwsh
+        run: ./scripts/agents-test.ps1
