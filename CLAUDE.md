@@ -12,3 +12,11 @@ See [AGENTS.md](AGENTS.md): it is the canonical guide (purpose, architecture map
 8. Contracts (`error`, `events`, `state`, `config`, `artifacts`, `proc`, `git`, `providers/mod.rs`, `stages/mod.rs`, `engine`) change only with a note in the PR.
 9. Prompts live in `src/prompts/`, schemas in `src/schemas/`; artifacts follow the PLAN §7 layout.
 10. On Windows, run cargo from PowerShell, not Git Bash (its `link` shadows the linker).
+
+## Agent context
+
+Full rules, skills and decisions live in [`.agents/`](.agents/README.md) (one folder, no per-directory instruction files). Read the rule files that match your change (`.agents/rules/`) and use the matching skill (`.agents/skills/`): `change-a-stage`, `add-guard`, `add-provider-adapter`, `add-prompt-or-schema`, `add-artifact`, `change-contract`, `add-dashboard-feature`, `write-tests`, `record-fixture`, `pre-pr-check`, `acceptance-run`, `onboard`, `debug-a-run`, `commit-and-pr`, `review-checklist`, `update-docs`.
+
+Claude Code loads skills from `.claude/skills/`, which is **generated** from `.agents/skills/`. Edit `.agents/skills/`, then run `./scripts/agents.sh sync` (PowerShell: `.\scripts\agents.ps1 sync`). Never edit `.claude/skills/` by hand.
+
+Rule 6 above wins over any default commit attribution your tooling adds: no `Co-Authored-By` trailers.

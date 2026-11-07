@@ -1,0 +1,12 @@
+#!/usr/bin/env sh
+# Keep .claude/skills in sync with .agents/skills, and rustfmt clean when Rust files are staged.
+staged="$(git diff --cached --name-only)"
+
+if printf '%s\n' "$staged" | grep -qE '^(\.agents/skills/|\.claude/skills/)'; then
+  ./scripts/agents.sh check || exit 1
+fi
+
+if printf '%s\n' "$staged" | grep -qE '\.rs$' && command -v cargo >/dev/null 2>&1; then
+  cargo fmt --all -- --check >/dev/null 2>&1 || { echo "pre-commit: cargo fmt --all needed" >&2; exit 1; }
+fi
+exit 0
