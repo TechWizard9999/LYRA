@@ -20,6 +20,10 @@ pub struct CommandSpec {
     /// Start from an empty environment plus `env` (plus the allow-list from `scrubbed_env`).
     pub clear_env: bool,
     pub stdin: Option<String>,
+    /// What to show people in place of the argv: a copyable equivalent when the argv embeds a
+    /// harness program (`python -c <script>`), which would not fit a line of a log or a
+    /// pull-request table. It never changes what runs.
+    pub shown: Option<String>,
 }
 
 impl CommandSpec {
@@ -31,6 +35,7 @@ impl CommandSpec {
             env: Vec::new(),
             clear_env: false,
             stdin: None,
+            shown: None,
         }
     }
     pub fn arg(mut self, a: impl Into<String>) -> Self {
@@ -53,6 +58,11 @@ impl CommandSpec {
         self.stdin = Some(s.into());
         self
     }
+    /// The single line [`display`](Self::display) shows for this command instead of its argv.
+    pub fn shown(mut self, line: impl Into<String>) -> Self {
+        self.shown = Some(line.into());
+        self
+    }
     /// Untrusted command (repro, verify): minimal environment, no provider keys.
     pub fn scrubbed(mut self) -> Self {
         self.clear_env = true;
@@ -67,8 +77,12 @@ impl CommandSpec {
         let program = parts.next().context("empty command line")?;
         Ok(Self::new(program, cwd).args(parts.map(|s| s.to_string())))
     }
-    /// Human-readable command line for logs.
+    /// Human-readable command line for logs and the pull request: the `shown` line when one
+    /// is set, otherwise the argv with space-containing arguments quoted.
     pub fn display(&self) -> String {
+        if let Some(shown) = &self.shown {
+            return shown.clone();
+        }
         let mut s = self.program.clone();
         for a in &self.args {
             s.push(' ');
@@ -588,6 +602,9 @@ mod tests {
     fn display_quotes_spaces() {
         let s = CommandSpec::new("claude", ".").args(["-p", "hello world"]);
         assert_eq!(s.display(), "claude -p \"hello world\"");
+        let shown = CommandSpec::new("python3", ".").args(["-c", "import x\nx.run()"]).shown("python3 -m x");
+        assert_eq!(shown.display(), "python3 -m x", "the shown line replaces an embedded program");
+        assert_eq!(shown.args[1], "import x\nx.run()", "what runs is unchanged");
     }
 
     #[tokio::test]

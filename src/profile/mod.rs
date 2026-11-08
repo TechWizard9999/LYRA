@@ -155,11 +155,13 @@ pub trait ExecutionProfile: Send + Sync {
     fn assert_passed(&self, output: &str, rec: &ReproRecord) -> Result<(), String>;
     /// Source binding: the selected test is absent from a discovery run with its source emptied.
     fn assert_absent_from_discovery(&self, output: &str, rec: &ReproRecord) -> Result<(), String>;
-    /// S2: test-side files the failing regression run actually loaded (repository-relative),
-    /// which Repro freezes with the test. An error means the profile cannot establish them and
-    /// the reproduction is rejected. The default records nothing (`rust-cargo` locks its test
-    /// inputs through registration and the frozen-input rule).
-    fn loaded_test_inputs(&self, _output: &str, _rec: &ReproRecord) -> Result<Vec<String>, String> {
+    /// S2: files the failing regression run actually loaded that are not production code
+    /// (repository-relative), which Repro freezes with the test; `worktree` is the checkout the
+    /// run used, for the profile to read what the repository declares. An error means the
+    /// profile cannot establish them and the reproduction is rejected. The default records
+    /// nothing (`rust-cargo` locks its test inputs through registration and the frozen-input
+    /// rule).
+    fn loaded_test_inputs(&self, _output: &str, _rec: &ReproRecord, _worktree: &Path) -> Result<Vec<String>, String> {
         Ok(Vec::new())
     }
 

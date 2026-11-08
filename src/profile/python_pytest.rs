@@ -18,6 +18,7 @@ use crate::proc::{self, CommandOutput, CommandSpec};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -312,8 +313,9 @@ impl ExecutionProfile for PythonPytest {
     fn assert_passed(&self, output: &str, rec: &ReproRecord) -> Result<(), String> {
         assert_test_passed(output, rec.test_name.trim())
     }
-    fn loaded_test_inputs(&self, output: &str, rec: &ReproRecord) -> Result<Vec<String>, String> {
-        parse_loaded_modules(output, &guards::norm_path(&rec.test_file))
+    fn loaded_test_inputs(&self, output: &str, rec: &ReproRecord, worktree: &Path) -> Result<Vec<String>, String> {
+        let read = |p: &str| std::fs::read_to_string(worktree.join(p)).ok();
+        parse_loaded_modules(output, &guards::norm_path(&rec.test_file), &ProductionCode::declared(&read))
     }
     fn assert_absent_from_discovery(&self, output: &str, rec: &ReproRecord) -> Result<(), String> {
         assert_absent_from_collection(output, &guards::norm_path(&rec.test_file), rec.test_name.trim())
@@ -373,7 +375,13 @@ impl ExecutionProfile for PythonPytest {
             steps.push(VerifyStep {
                 name: "imports",
                 // Names travel on stdin: no command-line length limit, so none is left unchecked.
-                spec: CommandSpec::new(PYTHON, worktree).args(["-c", PROVENANCE_CHECK]).stdin(names.join("\n") + "\n"),
+                spec: CommandSpec::new(PYTHON, worktree)
+                    .args(["-c", PROVENANCE_CHECK])
+                    .shown(format!(
+                        "{PYTHON} -c <LYRA import-provenance check: {} project names on stdin>",
+                        names.len()
+                    ))
+                    .stdin(names.join("\n") + "\n"),
                 log: "50-verify/imports.txt",
                 regression: false,
             });
@@ -671,30 +679,49 @@ fn module_files(module: &str, importer: &str, exists: &dyn Fn(&str) -> bool) -> 
     files
 }
 
-/// Test-side files the frozen regression loads, transitively: whatever its imports (and those
-/// of the files found) resolve to inside the test tree, or to a test-named module or
-/// `conftest.py` anywhere. Production modules it imports are not followed: they are what the
-/// fix is meant to change.
-pub fn regression_imports(test_file: &str, read: FileReader<'_>) -> Result<std::collections::BTreeSet<String>, String> {
+/// Files the frozen regression loads that are not production code, transitively: whatever
+/// its imports (and those of the files found) resolve to inside the test tree, to a
+/// test-named module or `conftest.py` anywhere, or to test support outside the declared
+/// production code ([`ProductionCode`]). Production modules it imports are not followed: they
+/// are what the fix is meant to change. A module that cannot be classified is an error.
+pub fn regression_imports(
+    test_file: &str,
+    read: FileReader<'_>,
+    production: &ProductionCode,
+) -> Result<BTreeSet<String>, String> {
     const LIMIT: usize = 2000;
     let tree = test_tree(test_file);
     let exists = |p: &str| read(p).is_some();
-    let mut locked = std::collections::BTreeSet::new();
+    let mut locked = BTreeSet::new();
+    let mut unknown = BTreeSet::new();
     let mut queue = vec![test_file.to_string()];
     while let Some(file) = queue.pop() {
         let Some(source) = read(&file) else { continue };
         for module in imported_modules(&source) {
             for dependency in module_files(&module, &file, &exists) {
-                if dependency != test_file && is_test_side(&dependency, &tree) && locked.insert(dependency.clone()) {
-                    if locked.len() > LIMIT {
-                        return Err(format!(
-                            "the frozen regression reaches more than {LIMIT} test-side modules; LYRA cannot establish its inputs"
-                        ));
+                if dependency == test_file {
+                    continue;
+                }
+                match production.classify(&dependency, &tree) {
+                    Classification::Production => {}
+                    Classification::Unknown => {
+                        unknown.insert(dependency);
                     }
-                    queue.push(dependency);
+                    Classification::TestSupport if locked.insert(dependency.clone()) => {
+                        if locked.len() > LIMIT {
+                            return Err(format!(
+                                "the frozen regression reaches more than {LIMIT} test-side modules; LYRA cannot establish its inputs"
+                            ));
+                        }
+                        queue.push(dependency);
+                    }
+                    Classification::TestSupport => {}
                 }
             }
         }
+    }
+    if !unknown.is_empty() {
+        return Err(production.unknown_message(&unknown));
     }
     Ok(locked)
 }
@@ -707,30 +734,190 @@ fn is_test_side(path: &str, tree: &str) -> bool {
         || (name.ends_with(".py") && (name.starts_with("test_") || name.ends_with("_test.py")))
 }
 
-/// Parses the import recorder's report (see [`PYTEST_RECORDER`]) into the test-side files the
-/// regression actually loaded, repository-relative. A run without the end marker (crashed,
-/// truncated, or not run through the recorder) is an error: the inputs cannot be established.
-pub fn parse_loaded_modules(output: &str, test_file: &str) -> Result<Vec<String>, String> {
+/// Parses the import recorder's report (see [`PYTEST_RECORDER`]) into the files the regression
+/// actually loaded that are not production code, repository-relative: test-side modules and
+/// test support anywhere else (a shared `support/helpers.py`, a root helper module). A run
+/// without the end marker (crashed, truncated, or not run through the recorder) is an error,
+/// and so is a loaded module the repository's metadata cannot classify: in both cases the
+/// inputs cannot be established.
+pub fn parse_loaded_modules(output: &str, test_file: &str, production: &ProductionCode) -> Result<Vec<String>, String> {
     if !output.lines().any(|l| l.trim() == LOADED_END) {
         return Err("the regression run did not report the modules it loaded, so LYRA cannot establish which test \
                     inputs to lock"
             .into());
     }
     let tree = test_tree(test_file);
-    let mut loaded: Vec<String> = output
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix(LOADED_PREFIX))
-        .map(guards::norm_path)
-        .filter(|p| {
-            !p.is_empty()
-                && !p.split('/').any(|c| c.is_empty() || c == ".." || c.starts_with('.') || c == "site-packages")
-                && *p != test_file
-                && is_test_side(p, &tree)
-        })
-        .collect();
+    let mut loaded = Vec::new();
+    let mut unknown = BTreeSet::new();
+    for path in output.lines().filter_map(|l| l.trim().strip_prefix(LOADED_PREFIX)).map(guards::norm_path) {
+        if path.is_empty()
+            || path.split('/').any(|c| c.is_empty() || c == ".." || c.starts_with('.') || c == "site-packages")
+            || path == test_file
+        {
+            continue;
+        }
+        match production.classify(&path, &tree) {
+            Classification::Production => {}
+            Classification::TestSupport => loaded.push(path),
+            Classification::Unknown => {
+                unknown.insert(path);
+            }
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(production.unknown_message(&unknown));
+    }
     loaded.sort();
     loaded.dedup();
     Ok(loaded)
+}
+
+/// Top-level directories outside the test tree that hold a frozen input (a shared
+/// `support/helpers.py` the regression loaded, a `fixtures/` file the repro created): the whole
+/// tree is test support and is locked with the test, so no module can be added next to the
+/// frozen one to shadow it.
+fn support_trees(frozen_inputs: &[String], tree: &str) -> BTreeSet<String> {
+    frozen_inputs
+        .iter()
+        .map(|p| guards::norm_path(p))
+        .filter(|p| !is_test_side(p, tree))
+        .filter_map(|p| p.split_once('/').map(|(top, _)| top.to_string()))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------------------
+// Production code against test support
+// ---------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Classification {
+    /// What the fix is meant to change.
+    Production,
+    /// A regression input, frozen with the test.
+    TestSupport,
+    /// The repository declares no production code, so the two cannot be told apart.
+    Unknown,
+}
+
+/// Where the repository says its production code lives, so that everything else the frozen
+/// regression loads can be frozen as test support: the top-level import names its packaging
+/// metadata declares (`pyproject.toml` `[project] name`, setuptools, poetry, hatch and flit
+/// package lists; `setup.cfg` `[metadata] name` and `[options] packages` / `py_modules`), the
+/// `packages` list under `[profiles.python-pytest]` in the repository's `lyra.toml`, and
+/// everything under `src/`. Read from the frozen checkout, never from the fix.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProductionCode {
+    names: BTreeSet<String>,
+}
+
+impl ProductionCode {
+    pub fn declared(read: FileReader<'_>) -> Self {
+        let mut names = BTreeSet::new();
+        if let Some(text) = read("pyproject.toml") {
+            if let Ok(doc) = text.parse::<toml::Value>() {
+                let at = |path: &[&str]| path.iter().try_fold(&doc, |v, k| v.get(k));
+                let mut take = |value: Option<&toml::Value>| {
+                    for raw in strings_of(value) {
+                        if let Some(name) = import_name(&raw) {
+                            names.insert(name);
+                        }
+                    }
+                };
+                take(at(&["project", "name"]));
+                take(at(&["tool", "setuptools", "packages"]));
+                take(at(&["tool", "setuptools", "py-modules"]));
+                take(at(&["tool", "setuptools", "packages", "find", "include"]));
+                take(at(&["tool", "poetry", "name"]));
+                take(at(&["tool", "poetry", "packages"]));
+                take(at(&["tool", "hatch", "build", "targets", "wheel", "packages"]));
+                take(at(&["tool", "flit", "module", "name"]));
+            }
+        }
+        if let Some(text) = read("setup.cfg") {
+            for (header, lines) in ini_sections(&text) {
+                let keys: &[&str] = match header.as_str() {
+                    "metadata" => &["name"],
+                    "options" => &["packages", "py_modules"],
+                    _ => continue,
+                };
+                let mut continued = false;
+                for line in lines {
+                    if let Some((key, value)) = line.split_once('=') {
+                        continued = keys.contains(&key.trim());
+                        if continued {
+                            names.extend(value.split(',').filter_map(import_name));
+                        }
+                    } else if continued {
+                        names.extend(line.split(',').filter_map(import_name));
+                    }
+                }
+            }
+        }
+        if let Some(text) = read("lyra.toml") {
+            if let Ok(doc) = text.parse::<toml::Value>() {
+                let value = doc.get("profiles").and_then(|p| p.get(ID)).and_then(|p| p.get("packages"));
+                names.extend(strings_of(value).iter().filter_map(|raw| import_name(raw)));
+            }
+        }
+        Self { names }
+    }
+
+    /// `path` is repository-relative; `tree` is the regression's test tree.
+    fn classify(&self, path: &str, tree: &str) -> Classification {
+        if is_test_side(path, tree) {
+            return Classification::TestSupport;
+        }
+        if path.starts_with("src/") {
+            return Classification::Production;
+        }
+        if self.names.is_empty() {
+            return Classification::Unknown;
+        }
+        let top = path.split('/').next().unwrap_or(path);
+        if self.names.contains(top.strip_suffix(".py").unwrap_or(top)) {
+            Classification::Production
+        } else {
+            Classification::TestSupport
+        }
+    }
+
+    fn unknown_message(&self, paths: &BTreeSet<String>) -> String {
+        format!(
+            "the frozen regression loads {}, which LYRA cannot tell apart from production code because the repository \
+             declares no packages; declare them (`[project] name` or `[tool.setuptools] packages` in pyproject.toml, \
+             `[options] packages` in setup.cfg, or `packages = [...]` under `[profiles.{ID}]` in the repository's \
+             lyra.toml): everything the regression loads outside them and `src/` is then frozen as test support",
+            paths.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
+        )
+    }
+}
+
+/// The strings in a TOML value: a string, an array of strings, or the `include` / `from` keys
+/// of an array of tables (poetry's `packages = [{ include = "pkg" }]`).
+fn strings_of(value: Option<&toml::Value>) -> Vec<String> {
+    match value {
+        Some(toml::Value::String(s)) => vec![s.clone()],
+        Some(toml::Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                toml::Value::String(s) => Some(s.clone()),
+                toml::Value::Table(t) => {
+                    t.get("include").or_else(|| t.get("from")).and_then(|v| v.as_str()).map(String::from)
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The top-level import name a declaration refers to: `src/pkg` → `pkg`, `pkg.sub` → `pkg`,
+/// `pkg*` → `pkg`, a distribution name `my-project` → `my_project`; `find:` and non-identifiers
+/// are skipped.
+fn import_name(raw: &str) -> Option<String> {
+    let last = raw.trim().trim_matches('"').trim_matches('\'').trim_end_matches('/').rsplit('/').next()?;
+    let name = last.split(['.', '*']).next()?.replace('-', "_");
+    identifier_re().is_match(&name).then_some(name)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -777,12 +964,19 @@ fn describe_layout(worktree: &Path) -> Value {
 // Regression identity and command
 // ---------------------------------------------------------------------------------------
 
+/// The regression as it runs: pytest in-process through the import recorder (what source
+/// binding, the fix lock and verification freeze), shown to people as the equivalent plain
+/// pytest command ([`regression_line`]).
 fn regression_spec(id: &str, cwd: &Path) -> CommandSpec {
-    CommandSpec::new(PYTHON, cwd).args(["-c", PYTEST_RECORDER]).args(PYTEST_FLAGS).arg(id)
+    CommandSpec::new(PYTHON, cwd).args(["-c", PYTEST_RECORDER]).args(PYTEST_FLAGS).arg(id).shown(regression_line(id))
 }
 
+/// The one-line reproduction command recorded in `repro.json` and printed in the draft PR:
+/// the same pytest flags and node id without the recorder. It is copyable as typed in sh and
+/// PowerShell: the flags carry no quotes or spaces and the node id is validated to plain path
+/// characters, `::` and identifiers.
 fn regression_line(id: &str) -> String {
-    regression_spec(id, Path::new(".")).display()
+    format!("{PYTHON} -m pytest {} {id}", PYTEST_FLAGS.join(" "))
 }
 
 fn identifier_re() -> &'static Regex {
@@ -1145,10 +1339,12 @@ pub fn check_fix_changes_with(
     //    infrastructure next to the frozen test.
     let test_file = guards::norm_path(&rec.test_file);
     let tree = test_tree(&test_file);
-    let imported = regression_imports(&test_file, read_checkpoint).unwrap_or_else(|reason| {
+    let production = ProductionCode::declared(read_checkpoint);
+    let imported = regression_imports(&test_file, read_checkpoint, &production).unwrap_or_else(|reason| {
         violations.push(reason);
         Default::default()
     });
+    let support = support_trees(&rec.frozen_inputs, &tree);
     for (status, raw) in changes {
         let path = guards::norm_path(raw);
         if let Some(reason) = collection_control_violation(&path) {
@@ -1163,6 +1359,14 @@ pub fn check_fix_changes_with(
             let tree = if tree.is_empty() { "the repository root" } else { tree.as_str() };
             violations.push(format!(
                 "{status} {path}: test infrastructure in {tree} (package initializers, helper modules, data) is locked with the frozen test"
+            ));
+            continue;
+        }
+        if let Some(top) =
+            support.iter().find(|top| path.strip_prefix(top.as_str()).is_some_and(|r| r.starts_with('/')))
+        {
+            violations.push(format!(
+                "{status} {path}: test support in {top}/ (loaded by the frozen regression) is locked with the frozen test"
             ));
             continue;
         }
@@ -1347,6 +1551,12 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
 
     fn reader<'a>(map: &'a HashMap<&'a str, &'a str>) -> impl Fn(&str) -> Option<String> + 'a {
         move |p: &str| map.get(p).map(|s| s.to_string())
+    }
+
+    /// Packaging metadata declaring `calc` as the production code of the fixture repositories.
+    const PYPROJECT: &str = "[project]\nname = \"calc\"\n";
+    fn declared() -> ProductionCode {
+        ProductionCode::declared(&|p: &str| (p == "pyproject.toml").then(|| PYPROJECT.to_string()))
     }
 
     fn output(exit: i32, text: &str) -> CommandOutput {
@@ -1872,6 +2082,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         let root = dir.path();
         std::fs::create_dir_all(root.join("tests")).unwrap();
         std::fs::write(root.join("pytest.ini"), "[pytest]\n").unwrap();
+        std::fs::write(root.join("pyproject.toml"), PYPROJECT).unwrap();
         std::fs::write(root.join("calc.py"), "def add(a, b):\n    return a - b\n").unwrap();
         std::fs::write(root.join("tests/__init__.py"), "").unwrap();
         std::fs::write(root.join("tests/helpers.py"), "EXPECTED = 3\n").unwrap();
@@ -2052,9 +2263,10 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             ("tests/test_shared.py", "def build(): pass\n"),
             ("tests/test_other.py", "def test_other(): pass\n"),
             ("calc.py", "def add(a, b): return a - b\n"),
+            ("pyproject.toml", PYPROJECT),
         ]);
         let read = reader(&files);
-        let locked = regression_imports(FILE, &read).unwrap();
+        let locked = regression_imports(FILE, &read, &declared()).unwrap();
         assert_eq!(
             locked.iter().map(String::as_str).collect::<Vec<_>>(),
             ["tests/__init__.py", "tests/test_base.py", "tests/test_helpers.py", "tests/test_shared.py"],
@@ -2074,13 +2286,13 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         // so a bare `import test_helpers` from tests/ resolves to tests/test_helpers.py.
         let bare =
             HashMap::from([(FILE, "from test_helpers import EXPECTED\n"), ("tests/test_helpers.py", "EXPECTED = 3\n")]);
-        assert!(regression_imports(FILE, &reader(&bare)).unwrap().contains("tests/test_helpers.py"));
+        assert!(regression_imports(FILE, &reader(&bare), &declared()).unwrap().contains("tests/test_helpers.py"));
         // A helper named like a test outside the test tree is locked too.
         let outside = HashMap::from([
             (FILE, "from support.test_fixtures import DATA\n"),
             ("support/test_fixtures.py", "DATA = 1\n"),
         ]);
-        assert!(regression_imports(FILE, &reader(&outside)).unwrap().contains("support/test_fixtures.py"));
+        assert!(regression_imports(FILE, &reader(&outside), &declared()).unwrap().contains("support/test_fixtures.py"));
     }
 
     #[test]
@@ -2231,9 +2443,10 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             ("tests/test_other.py", ""),
             ("tests/test_maybe.py", ""),
             ("tests/test_shared.py", ""),
+            ("pyproject.toml", PYPROJECT),
         ]);
         let read = reader(&files);
-        let locked = regression_imports(FILE, &read).unwrap();
+        let locked = regression_imports(FILE, &read, &declared()).unwrap();
         for path in ["tests/test_helpers.py", "tests/test_other.py", "tests/test_maybe.py", "tests/test_shared.py"] {
             assert!(locked.contains(path), "{path}: {locked:?}");
         }
@@ -2249,7 +2462,8 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         let mut wide: HashMap<&str, &str> = helpers.iter().map(|p| (p.as_str(), "")).collect();
         wide.insert(FILE, many.as_str());
         wide.insert("tests/__init__.py", "");
-        let err = regression_imports(FILE, &reader(&wide)).unwrap_err();
+        wide.insert("pyproject.toml", PYPROJECT);
+        let err = regression_imports(FILE, &reader(&wide), &declared()).unwrap_err();
         assert!(err.contains("cannot establish"), "{err}");
         let only_production = vec![("M".to_string(), "calc.py".to_string())];
         assert!(check_fix_changes_with(&only_production, &rec(), &reader(&wide), &reader(&wide))
@@ -2258,14 +2472,42 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
     }
 
     #[test]
-    fn the_import_recorder_report_is_required_and_keeps_only_test_side_files() {
-        let report = "1 failed in 0.02s\nLYRA-LOADED calc.py\nLYRA-LOADED tests/__init__.py\nLYRA-LOADED tests/test_helpers.py\nLYRA-LOADED tests/test_issue_7.py\nLYRA-LOADED conftest.py\nLYRA-LOADED .venv/lib/test_x.py\nLYRA-LOADED lib/site-packages/test_y.py\nLYRA-LOADED ../outside/test_z.py\nLYRA-LOADED-END\n";
+    fn the_import_recorder_report_is_required_and_freezes_everything_but_production_code() {
+        let report = "1 failed in 0.02s\nLYRA-LOADED calc.py\nLYRA-LOADED calc/util.py\nLYRA-LOADED src/other/x.py\nLYRA-LOADED tests/__init__.py\nLYRA-LOADED tests/test_helpers.py\nLYRA-LOADED tests/test_issue_7.py\nLYRA-LOADED conftest.py\nLYRA-LOADED support/__init__.py\nLYRA-LOADED support/helpers.py\nLYRA-LOADED helpers.py\nLYRA-LOADED .venv/lib/test_x.py\nLYRA-LOADED lib/site-packages/test_y.py\nLYRA-LOADED ../outside/test_z.py\nLYRA-LOADED-END\n";
         assert_eq!(
-            parse_loaded_modules(report, FILE).unwrap(),
-            ["conftest.py", "tests/__init__.py", "tests/test_helpers.py"]
+            parse_loaded_modules(report, FILE, &declared()).unwrap(),
+            [
+                "conftest.py",
+                "helpers.py",
+                "support/__init__.py",
+                "support/helpers.py",
+                "tests/__init__.py",
+                "tests/test_helpers.py"
+            ],
+            "declared `calc` and `src/` stay editable; shared support anywhere else is frozen"
         );
-        let err = parse_loaded_modules("1 failed in 0.02s\nLYRA-LOADED tests/test_helpers.py\n", FILE).unwrap_err();
+        let err = parse_loaded_modules("1 failed in 0.02s\nLYRA-LOADED tests/test_helpers.py\n", FILE, &declared())
+            .unwrap_err();
         assert!(err.contains("cannot establish"), "a run without the end marker fails closed: {err}");
+        // With nothing declared, production and support cannot be told apart: a visible error
+        // naming the files and the remedy, never a silent choice.
+        let err = parse_loaded_modules(report, FILE, &ProductionCode::default()).unwrap_err();
+        for expected in ["`calc.py`", "`support/helpers.py`", "`helpers.py`", "declares no packages", "lyra.toml"] {
+            assert!(err.contains(expected), "{expected}: {err}");
+        }
+        assert!(
+            !err.contains("`src/other/x.py`") && !err.contains("`tests/"),
+            "src/ and the test tree never need a declaration: {err}"
+        );
+        assert_eq!(
+            support_trees(
+                &["support/helpers.py".into(), "fixtures/a.json".into(), "helpers.py".into(), "tests/data.json".into()],
+                "tests"
+            )
+            .into_iter()
+            .collect::<Vec<_>>(),
+            ["fixtures", "support"]
+        );
         // The recorder wraps the same flags and node id; classification ignores its report.
         let spec = PythonPytest.regression_command(&rec(), Path::new("/w")).unwrap();
         assert_eq!(spec.args[..2], ["-c".to_string(), PYTEST_RECORDER.to_string()]);
@@ -2289,6 +2531,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             std::fs::write(path, text).unwrap();
         };
         write("pytest.ini", "[pytest]\n");
+        write("pyproject.toml", PYPROJECT);
         write("calc.py", "def add(a, b):\n    return a - b\n");
         write("tests/__init__.py", "");
         write("tests/test_helpers.py", "EXPECTED = 3\n");
@@ -2302,7 +2545,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         let out = run.combined();
         assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Failed, "{out}");
         PythonPytest.confirm_failure(&run, &rec()).unwrap();
-        let loaded = PythonPytest.loaded_test_inputs(&out, &rec()).unwrap();
+        let loaded = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap();
         assert!(loaded.contains(&"tests/test_helpers.py".to_string()), "inline conditional import: {loaded:?}");
         assert!(loaded.contains(&"tests/test_offset.py".to_string()), "computed dynamic import: {loaded:?}");
         assert!(!loaded.contains(&"calc.py".to_string()), "production stays editable: {loaded:?}");
@@ -2329,6 +2572,193 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             assert!(err.contains(path) && err.contains("locked"), "{err}");
             write(path, &frozen[path]);
         }
+    }
+
+    #[test]
+    fn production_code_is_read_from_packaging_metadata_and_the_repository_lyra_toml() {
+        let files = HashMap::from([
+            ("pyproject.toml", "[project]\nname = \"my-project\"\n[tool.setuptools]\npy-modules = [\"cli\"]\n[tool.setuptools.packages.find]\ninclude = [\"plugins*\", \"my_project.sub\"]\n[tool.poetry]\nname = \"poem\"\npackages = [{ include = \"verse\", from = \"src\" }]\n[tool.hatch.build.targets.wheel]\npackages = [\"src/hatched\"]\n[tool.flit.module]\nname = \"flat\"\n"),
+            ("setup.cfg", "[metadata]\nname = cfg-dist\n[options]\npackages =\n    cfgpkg\n    cfgpkg.sub\npy_modules = single, other\n[options.extras_require]\ntest = pytest\n"),
+            ("lyra.toml", "[verify]\ntest = \"python3 -m pytest\"\n[profiles.python-pytest]\npackages = [\"declared\", \"bad-name!\"]\n"),
+        ]);
+        let production = ProductionCode::declared(&reader(&files));
+        let expected: BTreeSet<String> = [
+            "my_project",
+            "cli",
+            "plugins",
+            "poem",
+            "verse",
+            "hatched",
+            "flat",
+            "cfg_dist",
+            "cfgpkg",
+            "single",
+            "other",
+            "declared",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(production.names, expected);
+        for (path, want) in [
+            ("my_project/core.py", Classification::Production),
+            ("cli.py", Classification::Production),
+            ("src/anything/at_all.py", Classification::Production),
+            ("support/helpers.py", Classification::TestSupport),
+            ("helpers.py", Classification::TestSupport),
+            ("tests/helpers.py", Classification::TestSupport),
+            ("conftest.py", Classification::TestSupport),
+        ] {
+            assert_eq!(production.classify(path, "tests"), want, "{path}");
+        }
+        // Nothing declared: only `src/` and the test side are certain.
+        let none = ProductionCode::declared(&|_: &str| None);
+        assert_eq!(none.classify("src/pkg/a.py", "tests"), Classification::Production);
+        assert_eq!(none.classify("tests/helpers.py", "tests"), Classification::TestSupport);
+        assert_eq!(none.classify("support/helpers.py", "tests"), Classification::Unknown);
+        assert_eq!(none.classify("calc.py", "tests"), Classification::Unknown);
+        // A broken pyproject declares nothing rather than failing the parse silently elsewhere.
+        assert!(ProductionCode::declared(&|p: &str| (p == "pyproject.toml").then(|| "[project\nname=".to_string()))
+            .names
+            .is_empty());
+    }
+
+    #[test]
+    fn support_loaded_outside_the_test_tree_is_locked_statically_and_through_frozen_inputs() {
+        let frozen_test = "from calc import add\nfrom support.helpers import EXPECTED\n\ndef test_issue_7_fails():\n    assert add(1, 2) == EXPECTED, \"sum must be three\"\n";
+        let files = HashMap::from([
+            (FILE, frozen_test),
+            ("pyproject.toml", PYPROJECT),
+            ("calc.py", "def add(a, b): return a - b\n"),
+            ("support/__init__.py", ""),
+            ("support/helpers.py", "EXPECTED = 3\n"),
+            ("support/unused.py", "X = 1\n"),
+            ("tools/release.py", "Y = 1\n"),
+        ]);
+        let read = reader(&files);
+        // Static layer: the helper is resolved from the import and locked, production is not.
+        let locked = regression_imports(FILE, &read, &declared()).unwrap();
+        assert_eq!(
+            locked.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["support/__init__.py", "support/helpers.py"]
+        );
+        let changes = |path: &str| vec![("M".to_string(), "calc.py".to_string()), ("M".to_string(), path.to_string())];
+        let err = check_fix_changes_with(&changes("support/helpers.py"), &rec(), &read, &read).unwrap_err();
+        assert!(err.contains("support/helpers.py") && err.contains("locked"), "{err}");
+        assert!(
+            check_fix_changes_with(&changes("tools/release.py"), &rec(), &read, &read).is_ok(),
+            "unrelated code stays editable"
+        );
+
+        // Recorder layer: what the run loaded is frozen, and its whole tree with it, so nothing
+        // can be added or changed next to the frozen helper even when the static layer sees no import.
+        let mut record = rec();
+        record.frozen_inputs = vec!["support/helpers.py".into()];
+        let silent = HashMap::from([
+            (FILE, "import importlib\nfrom calc import add\n\ndef test_issue_7_fails():\n    assert add(1, 2) == importlib.import_module('sup' + 'port.helpers').EXPECTED\n"),
+            ("pyproject.toml", PYPROJECT),
+            ("calc.py", "def add(a, b): return a - b\n"),
+            ("support/__init__.py", ""),
+            ("support/helpers.py", "EXPECTED = 3\n"),
+        ]);
+        let read = reader(&silent);
+        for (status, path) in [
+            ("M", "support/helpers.py"),
+            ("A", "support/shadow.py"),
+            ("M", "support/__init__.py"),
+            ("D", "support/unused.py"),
+        ] {
+            let changes = vec![("M".to_string(), "calc.py".to_string()), (status.to_string(), path.to_string())];
+            let err = check_fix_changes_with(&changes, &record, &read, &read).unwrap_err();
+            assert!(err.contains(path) && err.contains("locked"), "{status} {path}: {err}");
+        }
+        assert!(check_fix_changes_with(&changes("tools/release.py"), &record, &read, &read).is_ok());
+
+        // Without a declaration the fix is rejected visibly instead of guessing which is which.
+        let undeclared: HashMap<&str, &str> =
+            files.iter().filter(|(k, _)| **k != "pyproject.toml").map(|(k, v)| (*k, *v)).collect();
+        let read = reader(&undeclared);
+        let err = check_fix_changes_with(&changes("tools/release.py"), &rec(), &read, &read).unwrap_err();
+        assert!(err.contains("declares no packages") && err.contains("`calc.py`"), "{err}");
+    }
+
+    #[test]
+    fn the_recorded_command_is_one_copyable_line_while_the_recorder_runs() {
+        let line = regression_line(ID_);
+        assert_eq!(
+            line,
+            format!(
+                "{PYTHON} -m pytest -p no:cacheprovider -o addopts= --rootdir=. --confcutdir=. --color=no -rA {ID_}"
+            )
+        );
+        assert!(
+            !line.contains('\n') && line.chars().all(|c| c.is_ascii_alphanumeric() || " -_./:=".contains(c)),
+            "valid as typed in sh and PowerShell: {line}"
+        );
+        let spec = PythonPytest.regression_command(&rec(), Path::new("/w")).unwrap();
+        assert_eq!(spec.args[1], PYTEST_RECORDER, "what runs is still the recorder");
+        assert_eq!(spec.display(), line, "what is shown is the plain command");
+        assert_eq!(
+            PythonPytest.command_environment(spec, Path::new("/env")).display(),
+            line,
+            "the environment keeps the shown line"
+        );
+        let steps = PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), Path::new("/w")).unwrap();
+        assert!(steps.iter().all(|s| !s.spec.display().contains('\n')), "every verify step fits one table cell");
+    }
+
+    /// End to end with real pytest, the reviewer's scenario: the regression imports shared
+    /// test infrastructure outside the test tree (`support/helpers.py`). Changing the helper's
+    /// expected value makes the unchanged failing test pass; both the recorder layer and the
+    /// static layer reject the change, and so does adding a module next to it.
+    #[tokio::test]
+    #[ignore = "needs a provisioned python3 with pytest on PATH"]
+    async fn a_shared_helper_outside_the_test_tree_is_frozen_with_the_regression() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("pytest.ini", "[pytest]\n");
+        write("pyproject.toml", PYPROJECT);
+        write("calc.py", "def add(a, b):\n    return a - b\n");
+        write("support/__init__.py", "");
+        write("support/helpers.py", "EXPECTED = 3\n");
+        write(FILE, "from calc import add\nfrom support.helpers import EXPECTED\n\ndef test_issue_7_fails():\n    assert add(1, 2) == EXPECTED, \"sum must be three\"\n");
+        let timeout = Duration::from_secs(120);
+        let cancel = CancellationToken::new();
+        let spec = PythonPytest.reproduction_environment(PythonPytest.regression_command(&rec(), root).unwrap(), root);
+        let run = proc::run(&spec, timeout, &cancel).await.unwrap();
+        let out = run.combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Failed, "{out}");
+        PythonPytest.confirm_failure(&run, &rec()).unwrap();
+        let loaded = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap();
+        assert_eq!(loaded, ["support/__init__.py", "support/helpers.py"], "production `calc` is not frozen");
+
+        let frozen: HashMap<String, String> =
+            [FILE, "pyproject.toml", "calc.py", "support/__init__.py", "support/helpers.py"]
+                .into_iter()
+                .map(|p| (p.to_string(), std::fs::read_to_string(root.join(p)).unwrap()))
+                .collect();
+        write("support/helpers.py", "EXPECTED = -1\n");
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "the attack works without the lock: {out}");
+        let read_checkpoint = |p: &str| frozen.get(p).cloned();
+        let read_now = |p: &str| std::fs::read_to_string(root.join(p)).ok();
+        let change = vec![("M".to_string(), "support/helpers.py".to_string())];
+        let mut with_recorder = rec();
+        with_recorder.frozen_inputs = loaded;
+        for record in [&with_recorder, &rec()] {
+            let err = check_fix_changes_with(&change, record, &read_checkpoint, &read_now).unwrap_err();
+            assert!(err.contains("support/helpers.py") && err.contains("locked"), "{err}");
+        }
+        write("support/helpers.py", &frozen["support/helpers.py"]);
+        write("support/shadow.py", "EXPECTED = -1\n");
+        let added = vec![("M".to_string(), "calc.py".to_string()), ("A".to_string(), "support/shadow.py".to_string())];
+        let err = check_fix_changes_with(&added, &with_recorder, &read_checkpoint, &read_now).unwrap_err();
+        assert!(err.contains("support/shadow.py") && err.contains("test support in support/"), "{err}");
     }
 
     #[test]

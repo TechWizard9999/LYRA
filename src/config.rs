@@ -144,7 +144,8 @@ impl Default for Config {
     }
 }
 
-/// Only the `[verify]` table may be overridden per repository.
+/// Only the `[verify]` table may be overridden per repository here; the python-pytest profile
+/// additionally reads `packages` under `[profiles.python-pytest]` from the same file itself.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RepoOverrides {

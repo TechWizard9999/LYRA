@@ -171,9 +171,9 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
         }
     }
     ctx.events.info(format!("repro: test {} fails with the expected text", rec.test_name));
-    // Test-side modules the failing run actually loaded are frozen with the test.
+    // Test-side modules and test support the failing run actually loaded are frozen with the test.
     let loaded = profile
-        .loaded_test_inputs(&output, &rec)
+        .loaded_test_inputs(&output, &rec, &worktree)
         .map_err(|msg| StageError::new(ErrorKind::Guard, msg).with_details(&out_rel))?;
 
     // 5. Build scripts may have written files; guard that final diff before committing.
