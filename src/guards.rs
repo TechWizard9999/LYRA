@@ -554,12 +554,14 @@ new file mode 100644
         for (profile, manifest, test_file, fixture) in cases {
             let dir = tempfile::tempdir().unwrap();
             let wt = dir.path();
+            // A production source file of the profile's language.
+            let source = if profile.id() == "python-pytest" { "src/core.py" } else { "src/core.rs" };
             git::run(wt, &["init", "-q", "-b", "main"]).unwrap();
             git::run(wt, &["config", "user.email", "t@example.com"]).unwrap();
             git::run(wt, &["config", "user.name", "T"]).unwrap();
             std::fs::write(wt.join(manifest), "[package]\nname = \"foo\"\nversion = \"0.1.0\"\n").unwrap();
             std::fs::create_dir_all(wt.join("src")).unwrap();
-            std::fs::write(wt.join("src/core.txt"), "buggy\n").unwrap();
+            std::fs::write(wt.join(source), "buggy\n").unwrap();
             git::commit_all(wt, "init").unwrap();
 
             // S2: the test plus a fixture holding the input that triggers the bug.
@@ -578,12 +580,12 @@ new file mode 100644
             let checkpoint = git::commit_all(wt, "test: failing repro for #123").unwrap();
 
             // A real production fix passes the lock.
-            std::fs::write(wt.join("src/core.txt"), "fixed\n").unwrap();
+            std::fs::write(wt.join(source), "fixed\n").unwrap();
             let changes = git::changed_files(wt, &checkpoint).unwrap();
             assert_eq!(check_fix_changes(&changes, &record, wt, &checkpoint, profile), Ok(()), "{}", profile.id());
 
             // Changing only the fixture to a non-triggering input is rejected...
-            std::fs::write(wt.join("src/core.txt"), "buggy\n").unwrap();
+            std::fs::write(wt.join(source), "buggy\n").unwrap();
             std::fs::write(wt.join(fixture), "{\"frame\": [1, 2, 3, 4]}\n").unwrap();
             let changes = git::changed_files(wt, &checkpoint).unwrap();
             let err = check_fix_changes(&changes, &record, wt, &checkpoint, profile).unwrap_err();
@@ -594,7 +596,7 @@ new file mode 100644
             assert!(check_fix_changes(&changes, &record, wt, &checkpoint, profile).unwrap_err().contains(fixture));
             // ...or replacing it, even alongside a production change.
             std::fs::write(wt.join(fixture), "[]\n").unwrap();
-            std::fs::write(wt.join("src/core.txt"), "fixed\n").unwrap();
+            std::fs::write(wt.join(source), "fixed\n").unwrap();
             let changes = git::changed_files(wt, &checkpoint).unwrap();
             assert!(check_fix_changes(&changes, &record, wt, &checkpoint, profile).unwrap_err().contains(fixture));
         }

@@ -18,7 +18,7 @@ use crate::proc::{self, CommandOutput, CommandSpec};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -213,7 +213,9 @@ fn pytest_section_rules() -> [(&'static str, HeaderRule); 3] {
 /// A requirement line or a quoted dependency string naming pytest itself.
 fn declares_pytest(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r#"(?mi)(^\s*|["'])pytest\s*([<>=!~;\[,"']|$)"#).unwrap());
+    // The name, then a version specifier, extras, a marker, a direct reference (`@ url`), the
+    // old parenthesised form, a comment, a line continuation, or the end.
+    let re = RE.get_or_init(|| Regex::new(r#"(?mi)(^\s*|["'])pytest\s*([<>=!~;\[,"'@(#\\]|$)"#).unwrap());
     re.is_match(text)
 }
 
@@ -583,23 +585,12 @@ fn contains_python(dir: &Path, depth: usize) -> bool {
 /// the verification provenance step requires to resolve inside the checkout: regular packages
 /// and modules in both, and PEP 420 namespace packages (a directory without `__init__.py` that
 /// holds Python files at any depth, so a namespace root of subpackages counts) under `src/`.
-/// Tests, docs, tooling scripts, virtual environments and build output are not project code.
+/// Tests, docs, tooling scripts, virtual environments and generated build output (by marker,
+/// see [`is_generated_python_dir`]) are not project code.
 /// There is no limit on the number of names.
 pub fn importable_names(root: &Path) -> Vec<String> {
-    const NOT_PROJECT_DIRS: [&str; 12] = [
-        "tests",
-        "test",
-        "testing",
-        "docs",
-        "doc",
-        "examples",
-        "scripts",
-        "benchmarks",
-        "build",
-        "dist",
-        "site-packages",
-        "node_modules",
-    ];
+    const NOT_PROJECT_DIRS: [&str; 8] =
+        ["tests", "test", "testing", "docs", "doc", "examples", "scripts", "benchmarks"];
     const NOT_PROJECT_MODULES: [&str; 7] =
         ["setup", "conftest", "noxfile", "fabfile", "tasks", "manage", "sitecustomize"];
     let mut names = Vec::new();
@@ -611,7 +602,12 @@ pub fn importable_names(root: &Path) -> Vec<String> {
             let Ok(kind) = entry.file_type() else { continue };
             let candidate = if kind.is_dir() {
                 let package = path.join("__init__.py").is_file() || (base != root && contains_python(&path, 0));
-                (!NOT_PROJECT_DIRS.contains(&file_name.as_str()) && !path.join("pyvenv.cfg").exists() && package)
+                // Generated output is recognised by its markers, not its name: `src/build/` or a
+                // root `build/` package is source.
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                (!NOT_PROJECT_DIRS.contains(&file_name.as_str())
+                    && !is_generated_python_dir(relative, &path)
+                    && package)
                     .then_some(file_name)
             } else if kind.is_file() {
                 file_name
@@ -840,6 +836,8 @@ pub fn parse_loaded_modules(output: &str, test_file: &str, production: &Producti
             continue;
         }
         match production.classify(&path, &tree) {
+            // Data the run read inside production code may be a test input: frozen too.
+            Classification::Production if is_read && !is_source_code(&path) => loaded.push(path),
             Classification::Production => {}
             Classification::TestSupport => loaded.push(path),
             Classification::Unknown => {
@@ -883,69 +881,124 @@ enum Classification {
 }
 
 /// Where the repository says its production code lives, so that everything else the frozen
-/// regression loads can be frozen as test support: the top-level import names its packaging
-/// metadata declares (`pyproject.toml` setuptools, poetry, hatch and flit package lists;
-/// `setup.cfg` `[options] packages` / `py_modules`), the `packages` list under
-/// `[profiles.python-pytest]` in the repository's `lyra.toml`, and everything under `src/`. A
-/// distribution name (`[project] name`, `[tool.poetry] name`, `[metadata] name`) is not an
-/// import name: `published-project` may well ship the package `libcode`. It counts only when a
-/// package or module spelled like it exists in the checkout; otherwise the repository has to
-/// declare its packages. Read from the frozen checkout, never from the fix.
+/// regression loads can be frozen as test support: everything under `src/`, plus the packages
+/// and modules its packaging metadata declares, resolved to their actual locations in the
+/// checkout:
+///
+/// - `pyproject.toml`: setuptools `packages`, `py-modules`, `package-dir` (the `""` base and
+///   per-package directories) and `packages.find` (`where`, `include` and `exclude`, glob
+///   patterns such as `foo*`); poetry `packages` (`include` with its `from` directory); hatch
+///   wheel `packages` (paths); flit `module.name`;
+/// - `setup.cfg`: `[options] packages` / `py_modules` / `package_dir`, and
+///   `[options.packages.find]` `where` / `include` / `exclude`;
+/// - `packages = [...]` under `[profiles.python-pytest]` in the repository's `lyra.toml` (names
+///   or paths such as `lib/pkg`).
+///
+/// `packages.find` without `include` declares every package below a `where` other than the
+/// root; at the root it declares nothing, because it would make every top-level directory
+/// production. A distribution name (`[project] name`, `[tool.poetry] name`, `[metadata] name`)
+/// is not an import name: `published-project` may well ship the package `libcode`. It counts
+/// only when a package or module spelled like it exists in the checkout; otherwise the
+/// repository has to declare its packages. Read from the frozen checkout, never from the fix.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProductionCode {
+    /// Literal top-level import names at the repository root (or under `src/`).
     names: BTreeSet<String>,
+    /// `(directory, glob)`: a path is production when its first component below `directory`
+    /// (`""` for the root), without `.py`, matches `glob`.
+    roots: BTreeSet<(String, String)>,
+    /// Exclusions of the same shape (`packages.find` `exclude`).
+    excluded: BTreeSet<(String, String)>,
 }
 
 impl ProductionCode {
     pub fn declared(read: FileReader<'_>) -> Self {
-        let mut names = BTreeSet::new();
+        let mut code = Self::default();
         let mut distributions = Vec::new();
         if let Some(text) = read("pyproject.toml") {
             if let Ok(doc) = text.parse::<toml::Value>() {
                 let at = |path: &[&str]| path.iter().try_fold(&doc, |v, k| v.get(k));
-                let mut take = |value: Option<&toml::Value>| {
-                    for raw in strings_of(value) {
-                        if let Some(name) = import_name(&raw) {
-                            names.insert(name);
+                let setuptools = at(&["tool", "setuptools"]);
+                let package_dir = setuptools.and_then(|s| s.get("package-dir")).and_then(toml::Value::as_table);
+                let base = package_dir.and_then(|t| t.get("")).and_then(toml::Value::as_str).unwrap_or("");
+                for (name, dir) in package_dir.into_iter().flatten() {
+                    if let (false, Some(dir)) = (name.is_empty(), dir.as_str()) {
+                        code.add_path(dir, "");
+                    }
+                }
+                let packages = setuptools.and_then(|s| s.get("packages"));
+                if let Some(find) = packages.and_then(|p| p.get("find")) {
+                    code.add_find(
+                        &strings_of(find.get("where")),
+                        &strings_of(find.get("include")),
+                        &strings_of(find.get("exclude")),
+                        base,
+                    );
+                } else {
+                    for raw in strings_of(packages) {
+                        code.add_name(&raw, base);
+                    }
+                }
+                for raw in strings_of(setuptools.and_then(|s| s.get("py-modules"))) {
+                    code.add_name(&raw, base);
+                }
+                if let Some(items) = at(&["tool", "poetry", "packages"]).and_then(toml::Value::as_array) {
+                    for item in items {
+                        match item {
+                            toml::Value::String(include) => code.add_name(include, ""),
+                            toml::Value::Table(t) => {
+                                let from = t.get("from").and_then(toml::Value::as_str).unwrap_or("");
+                                if let Some(include) = t.get("include").and_then(toml::Value::as_str) {
+                                    code.add_path(include, from);
+                                }
+                            }
+                            _ => {}
                         }
                     }
-                };
-                take(at(&["tool", "setuptools", "packages"]));
-                take(at(&["tool", "setuptools", "py-modules"]));
-                take(at(&["tool", "setuptools", "packages", "find", "include"]));
-                take(at(&["tool", "poetry", "packages"]));
-                take(at(&["tool", "hatch", "build", "targets", "wheel", "packages"]));
-                take(at(&["tool", "flit", "module", "name"]));
+                }
+                for raw in strings_of(at(&["tool", "hatch", "build", "targets", "wheel", "packages"])) {
+                    code.add_path(&raw, "");
+                }
+                for raw in strings_of(at(&["tool", "flit", "module", "name"])) {
+                    code.add_name(&raw, "");
+                }
                 distributions.extend(strings_of(at(&["project", "name"])));
                 distributions.extend(strings_of(at(&["tool", "poetry", "name"])));
             }
         }
         if let Some(text) = read("setup.cfg") {
-            for (header, lines) in ini_sections(&text) {
-                let keys: &[&str] = match header.as_str() {
-                    "metadata" => &["name"],
-                    "options" => &["packages", "py_modules"],
-                    _ => continue,
-                };
-                let mut continued = false;
-                for line in lines {
-                    if let Some((key, value)) = line.split_once('=') {
-                        continued = keys.contains(&key.trim());
-                        if continued && header == "metadata" {
-                            distributions.push(value.trim().to_string());
-                        } else if continued {
-                            names.extend(value.split(',').filter_map(import_name));
-                        }
-                    } else if continued {
-                        names.extend(line.split(',').filter_map(import_name));
-                    }
+            let sections = setup_cfg_values(&text);
+            let get = |section: &str, key: &str| -> Vec<String> {
+                sections.get(&(section.to_string(), key.to_string())).cloned().unwrap_or_default()
+            };
+            distributions.extend(get("metadata", "name"));
+            let mut base = String::new();
+            for entry in get("options", "package_dir") {
+                match entry.split_once('=') {
+                    Some((name, dir)) if name.trim().is_empty() => base = dir.trim().to_string(),
+                    Some((_, dir)) => code.add_path(dir.trim(), ""),
+                    None => {}
                 }
+            }
+            let packages = get("options", "packages");
+            if packages.iter().any(|p| p == "find:" || p == "find_namespace:") {
+                let find = "options.packages.find";
+                code.add_find(&get(find, "where"), &get(find, "include"), &get(find, "exclude"), &base);
+            } else {
+                for raw in packages {
+                    code.add_name(&raw, &base);
+                }
+            }
+            for raw in get("options", "py_modules") {
+                code.add_name(&raw, &base);
             }
         }
         if let Some(text) = read("lyra.toml") {
             if let Ok(doc) = text.parse::<toml::Value>() {
                 let value = doc.get("profiles").and_then(|p| p.get(ID)).and_then(|p| p.get("packages"));
-                names.extend(strings_of(value).iter().filter_map(|raw| import_name(raw)));
+                for raw in strings_of(value) {
+                    code.add_path(&raw, "");
+                }
             }
         }
         // A distribution name is only a hint: it names production code when the checkout has a
@@ -961,11 +1014,88 @@ impl ProductionCode {
                     format!("src/{n}.py"),
                 ];
                 if spelled.iter().any(|p| read(p).is_some()) {
-                    names.insert(n);
+                    code.names.insert(n);
                 }
             }
         }
-        Self { names }
+        code
+    }
+
+    /// A dotted package or module name (`pkg`, `pkg.sub`, a glob `pkg*`) below `base`.
+    fn add_name(&mut self, raw: &str, base: &str) {
+        let raw = raw.trim().trim_matches(|c| c == '"' || c == '\'');
+        let Some(top) = raw.split('.').next().filter(|t| is_name_pattern(t)) else { return };
+        self.add_root(base, top);
+    }
+
+    /// A directory path (`src/hatched`, `lib/pkg`, or a bare `pkg`) below `base`.
+    fn add_path(&mut self, raw: &str, base: &str) {
+        let raw = raw.trim().trim_matches(|c| c == '"' || c == '\'').trim_end_matches('/');
+        let (dir, last) = raw.rsplit_once('/').unwrap_or(("", raw));
+        let last = last.strip_suffix(".py").unwrap_or(last);
+        if is_name_pattern(last) {
+            self.add_root(&join_dir(base, dir), last);
+        }
+    }
+
+    fn add_find(&mut self, wheres: &[String], includes: &[String], excludes: &[String], base: &str) {
+        // `where` is relative to the project root; without it, packages are found in the
+        // `package-dir` base.
+        let wheres: Vec<String> =
+            if wheres.is_empty() { vec![join_dir(base, "")] } else { wheres.iter().map(|w| join_dir(w, "")).collect() };
+        for dir in &wheres {
+            if includes.is_empty() {
+                if !dir.is_empty() {
+                    self.add_root(dir, "*");
+                }
+            } else {
+                for include in includes {
+                    self.add_name(include, dir);
+                }
+            }
+            // An exclusion of a whole top-level package (`tests`, `bench*`) removes it;
+            // excluding only subpackages (`pkg.tests`) leaves the package declared.
+            for exclude in excludes.iter().map(|e| e.trim()) {
+                if !exclude.contains('.') && is_name_pattern(exclude) {
+                    self.excluded.insert((dir.clone(), exclude.to_string()));
+                }
+            }
+        }
+    }
+
+    fn add_root(&mut self, dir: &str, pattern: &str) {
+        let dir = join_dir(dir, "");
+        if (dir.is_empty() || dir == "src") && identifier_re().is_match(pattern) {
+            self.names.insert(pattern.to_string());
+        } else {
+            self.roots.insert((dir, pattern.to_string()));
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.names.is_empty() && self.roots.is_empty()
+    }
+
+    /// The first component of `path` below `dir`, without `.py`.
+    fn top_below<'p>(path: &'p str, dir: &str) -> Option<&'p str> {
+        let rest = if dir.is_empty() { path } else { path.strip_prefix(dir)?.strip_prefix('/')? };
+        let top = rest.split('/').next()?;
+        Some(top.strip_suffix(".py").unwrap_or(top))
+    }
+
+    fn declares(&self, path: &str) -> bool {
+        let matches = |(dir, glob): &(String, String)| Self::top_below(path, dir).is_some_and(|t| glob_match(glob, t));
+        if self.excluded.iter().any(matches) {
+            return false;
+        }
+        Self::top_below(path, "").is_some_and(|top| self.names.contains(top)) || self.roots.iter().any(matches)
+    }
+
+    /// The declarations, for messages: `calc`, `lib/pkg`, `foo*`.
+    fn describe(&self) -> String {
+        let roots =
+            self.roots.iter().map(|(dir, glob)| if dir.is_empty() { glob.clone() } else { format!("{dir}/{glob}") });
+        self.names.iter().cloned().chain(roots).map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")
     }
 
     /// `path` is repository-relative; `tree` is the regression's test tree.
@@ -976,14 +1106,13 @@ impl ProductionCode {
         if path.starts_with("src/") {
             return Classification::Production;
         }
-        if self.names.is_empty() {
+        if self.is_empty() {
             // Only a Python module outside `src/` might be undeclared production code; data and
             // other files there are not production code either way.
             let module = [".py", ".pyc", ".pyd", ".so", ".pyw"].iter().any(|ext| path.ends_with(ext));
             return if module { Classification::Unknown } else { Classification::TestSupport };
         }
-        let top = path.split('/').next().unwrap_or(path);
-        if self.names.contains(top.strip_suffix(".py").unwrap_or(top)) {
+        if self.declares(path) {
             Classification::Production
         } else {
             Classification::TestSupport
@@ -1002,8 +1131,75 @@ impl ProductionCode {
     }
 }
 
-/// The strings in a TOML value: a string, an array of strings, or the `include` / `from` keys
-/// of an array of tables (poetry's `packages = [{ include = "pkg" }]`).
+/// `base/dir` without `.` components or surrounding slashes (`""` is the repository root).
+fn join_dir(base: &str, dir: &str) -> String {
+    base.split('/')
+        .chain(dir.split('/'))
+        .map(str::trim)
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// An identifier, optionally with `*` / `?` glob characters.
+fn is_name_pattern(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '*' | '?'))
+}
+
+/// `fnmatch`-style matching with `*` and `?`.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    fn go(p: &[u8], t: &[u8]) -> bool {
+        match (p.first(), t.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => go(&p[1..], t) || (!t.is_empty() && go(p, &t[1..])),
+            (Some(b'?'), Some(_)) => go(&p[1..], &t[1..]),
+            (Some(a), Some(b)) if a == b => go(&p[1..], &t[1..]),
+            _ => false,
+        }
+    }
+    go(pattern.as_bytes(), text.as_bytes())
+}
+
+/// `setup.cfg` values by `(section, key)`: comma- and line-separated items, with indented
+/// continuation lines (and the `=dir` / `pkg = dir` lines of `package_dir`) belonging to the
+/// key above them.
+fn setup_cfg_values(text: &str) -> HashMap<(String, String), Vec<String>> {
+    let mut values: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut section = String::new();
+    let mut key: Option<String> = None;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line.trim_matches(|c| c == '[' || c == ']').trim().to_string();
+            key = None;
+            continue;
+        }
+        let items = if raw.starts_with([' ', '\t']) {
+            line.to_string()
+        } else if let Some((k, v)) = line.split_once(['=', ':']).filter(|(k, _)| !k.trim().is_empty()) {
+            key = Some(k.trim().to_string());
+            v.trim().to_string()
+        } else {
+            line.to_string()
+        };
+        let Some(key) = key.clone() else { continue };
+        let entry = values.entry((section.clone(), key.clone())).or_default();
+        if key == "package_dir" {
+            if !items.is_empty() {
+                entry.push(items);
+            }
+        } else {
+            entry.extend(items.split(',').map(str::trim).filter(|i| !i.is_empty()).map(String::from));
+        }
+    }
+    values
+}
+
+/// The strings in a TOML value: a string, an array of strings, or the `include` keys of an
+/// array of tables.
 fn strings_of(value: Option<&toml::Value>) -> Vec<String> {
     match value {
         Some(toml::Value::String(s)) => vec![s.clone()],
@@ -1011,9 +1207,7 @@ fn strings_of(value: Option<&toml::Value>) -> Vec<String> {
             .iter()
             .filter_map(|item| match item {
                 toml::Value::String(s) => Some(s.clone()),
-                toml::Value::Table(t) => {
-                    t.get("include").or_else(|| t.get("from")).and_then(|v| v.as_str()).map(String::from)
-                }
+                toml::Value::Table(t) => t.get("include").and_then(|v| v.as_str()).map(String::from),
                 _ => None,
             })
             .collect(),
@@ -1021,13 +1215,21 @@ fn strings_of(value: Option<&toml::Value>) -> Vec<String> {
     }
 }
 
-/// The top-level import name a declaration refers to: `src/pkg` → `pkg`, `pkg.sub` → `pkg`,
-/// `pkg*` → `pkg`, a distribution name `my-project` → `my_project`; `find:` and non-identifiers
-/// are skipped.
+/// The top-level import name a distribution name refers to: `my-project` → `my_project`;
+/// non-identifiers are skipped.
 fn import_name(raw: &str) -> Option<String> {
     let last = raw.trim().trim_matches('"').trim_matches('\'').trim_end_matches('/').rsplit('/').next()?;
     let name = last.split(['.', '*']).next()?.replace('-', "_");
     identifier_re().is_match(&name).then_some(name)
+}
+
+/// Source code a fix may change inside production code. Anything else there (package data,
+/// JSON, CSV, templates) may be a test input the regression reads, which LYRA cannot tell
+/// apart from production data, so it stays frozen.
+fn is_source_code(path: &str) -> bool {
+    const SOURCE: [&str; 13] =
+        [".py", ".pyi", ".pyw", ".pyx", ".pxd", ".pxi", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh"];
+    SOURCE.iter().any(|ext| path.ends_with(ext))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1501,16 +1703,17 @@ fn fix_may_not_change(
              add it inside an existing package"
                 .into(),
         ),
+        Classification::Production if !is_source_code(path) => Some(
+            "only source code may change inside production code: package data (JSON, CSV, text, templates) may be \
+             a test input the regression reads, which LYRA cannot tell apart from production data, so it is frozen"
+                .into(),
+        ),
         Classification::Production => None,
         Classification::Unknown => Some(production.unknown_message(&BTreeSet::from([path.to_string()]))),
         Classification::TestSupport => Some(format!(
             "not declared production code; a fix may change only `src/`, the declared packages{} and the \
              dependency fields of the root manifests",
-            if production.names.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", production.names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", "))
-            }
+            if production.is_empty() { String::new() } else { format!(" ({})", production.describe()) }
         )),
     }
 }
@@ -1556,15 +1759,20 @@ fn manifest_violation(
     if guards::is_new(status) || status == "D" {
         return Some("a root manifest may have its dependency fields changed, but not be added or deleted".into());
     }
-    let same = match path {
-        "pyproject.toml" => match (pyproject_without_dependencies(&old), pyproject_without_dependencies(&new)) {
-            (Some(old), Some(new)) => old == new,
-            (None, _) => true, // a broken frozen manifest cannot be compared; the fix may repair it
-            (Some(_), None) => return Some("the manifest is no longer valid TOML".into()),
-        },
-        "setup.cfg" => setup_cfg_without_dependencies(&old) == setup_cfg_without_dependencies(&new),
-        _ => true,
-    };
+    let same =
+        match path {
+            "pyproject.toml" => match (pyproject_without_dependencies(&old), pyproject_without_dependencies(&new)) {
+                (Some(old), Some(new)) => old == new,
+                (None, _) => return Some(
+                    "the frozen pyproject.toml is not valid TOML, so its dependency fields cannot be told apart from \
+                     the rest; it stays frozen"
+                        .into(),
+                ),
+                (Some(_), None) => return Some("the manifest is no longer valid TOML".into()),
+            },
+            "setup.cfg" => setup_cfg_without_dependencies(&old) == setup_cfg_without_dependencies(&new),
+            _ => true,
+        };
     (!same).then(|| "only the dependency fields of a root manifest may change".into())
 }
 
@@ -1834,8 +2042,27 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("requirements-dev.txt"), "black\npytest>=8\n").unwrap();
         assert_eq!(detect(dir.path()).unwrap().evidence, vec!["requirements-dev.txt"]);
-        std::fs::write(dir.path().join("requirements-dev.txt"), "pytest-cov-but-not-really-pytestish\n").unwrap();
-        assert!(detect(dir.path()).is_none());
+        // Valid pip forms: a comment after whitespace, a direct reference, a continuation,
+        // the old parenthesised form, any case.
+        for line in [
+            "pytest  # test runner\n",
+            "pytest @ https://example.com/pytest.whl\n",
+            "pytest@https://example.com/pytest.whl\n",
+            "pytest \\\n    --hash=sha256:abc\n",
+            "pytest (>=7)\n",
+            "PyTest==8.0\n",
+        ] {
+            std::fs::write(dir.path().join("requirements-dev.txt"), line).unwrap();
+            assert_eq!(
+                detect(dir.path()).map(|r| r.evidence),
+                Some(vec!["requirements-dev.txt".to_string()]),
+                "{line:?}"
+            );
+        }
+        for line in ["pytest-cov-but-not-really-pytestish\n", "pytest_cov\n", "# pytest\n", "notpytest\n"] {
+            std::fs::write(dir.path().join("requirements-dev.txt"), line).unwrap();
+            assert!(detect(dir.path()).is_none(), "{line:?}");
+        }
         std::fs::write(
             dir.path().join("pyproject.toml"),
             "[project.optional-dependencies]\ntest = [\"pytest\", \"hypothesis\"]\n",
@@ -2120,10 +2347,15 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             vec![("A", "src/app/new.py")],
             vec![("D", "src/app/a.py")],
             vec![("D", "src/app/a.py"), ("A", "src/app/b.py")],
-            vec![("M", "src/app/data.json")],
             vec![("A", "calc/util.py")],
         ] {
             assert!(check(&changes).is_ok(), "{changes:?}");
+        }
+        // Package data inside production code may be a test input: frozen, under src/ and in
+        // a declared package, without a `tests` or `fixtures` directory in its path.
+        for path in ["src/app/data.json", "src/app/data/test_vector.json", "calc/table.csv"] {
+            let err = check(&[("M", path)]).unwrap_err();
+            assert!(err.contains(path) && err.contains("only source code may change"), "{path}: {err}");
         }
         // Everything else, in every form.
         for changes in [
@@ -2194,6 +2426,22 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             assert!(manifest("setup.cfg", broken.clone()).is_err(), "{broken}");
         }
         assert!(manifest("requirements.txt", "attrs>=23\nsix\n".into()).is_ok());
+
+        // A frozen pyproject.toml that cannot be parsed cannot be compared field by field: it
+        // stays frozen, whatever the replacement (the reviewer's malformed-original case).
+        let mut broken = checkpoint.clone();
+        broken.insert("pyproject.toml", "[project\nname = \"calc\"\n[tool.setuptools]\npackages = [\"calc\"]\n");
+        let read_broken = reader(&broken);
+        for replacement in [
+            "[project]\nname = \"calc\"\ndependencies = [\"attrs\"]\n".to_string(),
+            "[tool.pytest.ini_options]\naddopts = \"-k not issue\"\n".to_string(),
+        ] {
+            let mut now = broken.clone();
+            now.insert("pyproject.toml", Box::leak(replacement.into_boxed_str()));
+            let changes = vec![("M".to_string(), "pyproject.toml".to_string())];
+            let err = check_fix_changes_with(&changes, &rec(), &read_broken, &reader(&now)).unwrap_err();
+            assert!(err.contains("not valid TOML") && err.contains("stays frozen"), "{err}");
+        }
     }
 
     #[test]
@@ -2551,6 +2799,10 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             // A namespace root that holds only subpackages: no `.py` directly in `src/acme/`.
             ("src/acme/widget/mod.py", ""),
             ("src/empty_dirs/nothing/.keep", ""),
+            // A source namespace package named like build output; real build output at the root
+            // (`build/lib/...`) is still skipped by its markers.
+            ("src/build/parser.py", ""),
+            ("build/lib/generated/__init__.py", ""),
             // Imported by the regression and found through its nested layout under `lib/`.
             ("lib/vendor/deep/mod.py", ""),
             (FILE, "from acme.widget import mod\nimport vendor.deep.mod\nimport os\n"),
@@ -2559,12 +2811,12 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         }
-        assert_eq!(importable_names(root), ["acme", "calc", "pkg", "toplevel"]);
-        assert_eq!(provenance_names(root, FILE), ["acme", "calc", "pkg", "toplevel", "vendor"]);
+        assert_eq!(importable_names(root), ["acme", "build", "calc", "pkg", "toplevel"]);
+        assert_eq!(provenance_names(root, FILE), ["acme", "build", "calc", "pkg", "toplevel", "vendor"]);
         let steps = PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), root).unwrap();
         assert_eq!(steps.iter().map(|s| s.name).collect::<Vec<_>>(), ["imports", "repro", "tests"]);
         assert_eq!(steps[0].spec.args.len(), 2, "names travel on stdin, not argv");
-        assert_eq!(steps[0].spec.stdin.as_deref(), Some("acme\ncalc\npkg\ntoplevel\nvendor\n"));
+        assert_eq!(steps[0].spec.stdin.as_deref(), Some("acme\nbuild\ncalc\npkg\ntoplevel\nvendor\n"));
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(
             PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), empty.path()).unwrap()[0].name,
@@ -2706,6 +2958,9 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         for (module, import) in [
             ("pkg/module.py", "from pkg.module import answer"),
             ("pkg/widget/module.py", "from pkg.widget.module import answer"),
+            // A source namespace package named like generated output, imported under a computed
+            // name, so the static import scan cannot see it: `src/build/` is still listed.
+            ("build/parser.py", "import importlib\nanswer = importlib.import_module(\"bu\" + \"ild.parser\").answer"),
         ] {
             namespace_package_shadowed_externally(module, import).await;
         }
@@ -2726,8 +2981,8 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             checkout.join(FILE),
             &format!("{import}\n\ndef test_issue_7_fails():\n    assert answer() == 42, \"sum must be three\"\n"),
         );
+        let package = module.split('/').next().unwrap();
         let external = dir.path().join("site");
-        write(external.join("pkg/__init__.py"), "");
         for dir in std::path::Path::new(module).ancestors().skip(1).filter(|d| !d.as_os_str().is_empty()) {
             write(external.join(dir).join("__init__.py"), "");
         }
@@ -2783,14 +3038,15 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         // when `src/pkg/` itself holds no Python file).
         let steps = PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), &checkout).unwrap();
         assert_eq!(steps[0].name, "imports", "{module}");
-        assert_eq!(steps[0].spec.stdin.as_deref(), Some("pkg\n"), "{module}");
+        assert_eq!(steps[0].spec.stdin.as_deref(), Some(format!("{package}\n").as_str()), "{module}");
         let env_root = dir.path().join("env");
         let check =
             proc::run(&with_venv(PythonPytest.command_environment(steps[0].spec.clone(), &env_root)), timeout, &cancel)
                 .await
                 .unwrap();
         assert!(
-            !check.success() && check.stdout.contains("ERROR: pkg does not resolve inside the checkout"),
+            !check.success()
+                && check.stdout.contains(&format!("ERROR: {package} does not resolve inside the checkout")),
             "{}",
             check.combined()
         );
@@ -2858,10 +3114,12 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         assert_eq!(
             parse_loaded_modules(report, FILE, &declared()).unwrap(),
             [
+                "calc/table.csv",
                 "conftest.py",
                 "data/golden.bin",
                 "fixtures/input.json",
                 "helpers.py",
+                "src/other/schema.json",
                 "support/__init__.py",
                 "support/helpers.py",
                 "tests/__init__.py",
@@ -2869,9 +3127,8 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
                 "tests/helpers.py",
                 "tests/test_helpers.py"
             ],
-            "declared `calc` and `src/` stay editable (modules and data alike); shared support and data read anywhere \
-             else are frozen; Python sources among the reads belong to the module layer, configuration to its guard, \
-             caches to nobody"
+            "declared `calc` and `src/` modules stay editable; every non-source file the run read is frozen, also \
+             inside production code; configuration belongs to its guard, caches to nobody"
         );
         let err = parse_loaded_modules("1 failed in 0.02s\nLYRA-LOADED tests/test_helpers.py\n", FILE, &declared())
             .unwrap_err();
@@ -2977,11 +3234,13 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         // `my_project` counts because `my_project/__init__.py` exists; the distribution names
         // `poem` and `cfg-dist` name nothing in the checkout and are not import names.
         let expected: BTreeSet<String> =
-            ["my_project", "cli", "plugins", "verse", "hatched", "flat", "cfgpkg", "single", "other", "declared"]
+            ["my_project", "cli", "verse", "hatched", "flat", "cfgpkg", "single", "other", "declared"]
                 .into_iter()
                 .map(String::from)
                 .collect();
         assert_eq!(production.names, expected);
+        assert!(production.roots.contains(&(String::new(), "plugins*".to_string())), "{:?}", production.roots);
+        assert_eq!(production.classify("plugins_extra/hook.py", "tests"), Classification::Production);
         // The reviewer's case: a flat layout whose distribution name differs from its import
         // package. The distribution name must not be taken for production code, or every real
         // fix to `libcode/` would be rejected as a change to frozen test support; without an
@@ -3025,6 +3284,70 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         assert!(ProductionCode::declared(&|p: &str| (p == "pyproject.toml").then(|| "[project\nname=".to_string()))
             .names
             .is_empty());
+    }
+
+    /// Declarations resolve to the directories they name: setuptools `packages.find` globs,
+    /// `where`, `exclude` and `package-dir`; poetry `from`; hatch paths; `setup.cfg` `find:` and
+    /// `package_dir`; paths in `lyra.toml`. Anything else stays frozen.
+    #[test]
+    fn package_declarations_resolve_to_their_actual_paths() {
+        let classify = |files: &[(&str, &str)], path: &str| {
+            let map: HashMap<&str, &str> = files.iter().copied().collect();
+            let production = ProductionCode::declared(&reader(&map));
+            production.classify(path, "tests")
+        };
+        use Classification::{Production, TestSupport, Unknown};
+        let find_foo = "[tool.setuptools.packages.find]\ninclude = [\"foo*\"]\n";
+        let poetry = "[tool.poetry]\npackages = [{ include = \"pkg\", from = \"lib\" }]\n";
+        let find_lib = "[tool.setuptools.packages.find]\nwhere = [\"lib\"]\nexclude = [\"bench*\"]\n";
+        let base = "[tool.setuptools]\npackages = [\"pkg\"]\npackage-dir = { \"\" = \"lib\" }\n";
+        let mapped = "[tool.setuptools]\npackages = [\"pkg\"]\npackage-dir = { pkg = \"code/pkgsrc\" }\n";
+        let hatch = "[tool.hatch.build.targets.wheel]\npackages = [\"lib/hatched\"]\n";
+        let lyra = "[profiles.python-pytest]\npackages = [\"vendor/mine\"]\n";
+        let cfg_find = "[options]\npackages = find:\npackage_dir =\n    =lib\n[options.packages.find]\nwhere = lib\ninclude = core*\n";
+        let cfg_dir = "[options]\npackages = pkg\npackage_dir =\n    =lib\n";
+        type Case<'a> = (Vec<(&'a str, &'a str)>, &'a str, Classification);
+        let cases: Vec<Case> = vec![
+            // The reviewer's two layouts.
+            (vec![("pyproject.toml", find_foo)], "foobar/core.py", Production),
+            (vec![("pyproject.toml", find_foo)], "bar/core.py", TestSupport),
+            (vec![("pyproject.toml", poetry)], "lib/pkg/core.py", Production),
+            (vec![("pyproject.toml", poetry)], "pkg/core.py", TestSupport),
+            (vec![("pyproject.toml", poetry)], "lib/other/core.py", TestSupport),
+            // find with where and exclude, no include: everything below a non-root where.
+            (vec![("pyproject.toml", find_lib)], "lib/anything/x.py", Production),
+            (vec![("pyproject.toml", find_lib)], "lib/benchmarks/x.py", TestSupport),
+            (vec![("pyproject.toml", find_lib)], "support/helpers.py", TestSupport),
+            // At the root, find without include declares nothing (support code would become production).
+            (vec![("pyproject.toml", "[tool.setuptools.packages.find]\n")], "support/helpers.py", Unknown),
+            // package-dir: a base for the package list, and per-package directories.
+            (vec![("pyproject.toml", base)], "lib/pkg/a.py", Production),
+            (vec![("pyproject.toml", base)], "pkg/a.py", TestSupport),
+            (vec![("pyproject.toml", mapped)], "code/pkgsrc/a.py", Production),
+            // hatch and lyra.toml paths.
+            (vec![("pyproject.toml", hatch)], "lib/hatched/a.py", Production),
+            (vec![("lyra.toml", lyra)], "vendor/mine/a.py", Production),
+            (vec![("lyra.toml", lyra)], "vendor/theirs/a.py", TestSupport),
+            // setup.cfg find: and package_dir.
+            (vec![("setup.cfg", cfg_find)], "lib/core_utils/a.py", Production),
+            (vec![("setup.cfg", cfg_find)], "lib/other/a.py", TestSupport),
+            (vec![("setup.cfg", cfg_dir)], "lib/pkg/a.py", Production),
+        ];
+        for (files, path, want) in cases {
+            assert_eq!(classify(&files, path), want, "{path} with {files:?}");
+        }
+        assert!(glob_match("foo*", "foobar") && glob_match("f?o", "foo") && !glob_match("foo*", "barfoo"));
+        assert_eq!(join_dir("./lib/", "."), "lib");
+        // A fix to the reviewer's `foobar/core.py` passes the lock.
+        let files = HashMap::from([
+            (FILE, "from foobar.core import f\n"),
+            ("pyproject.toml", find_foo),
+            ("foobar/core.py", ""),
+        ]);
+        let changes = vec![("M".to_string(), "foobar/core.py".to_string())];
+        let mut record = rec();
+        record.command = regression_line(ID_);
+        assert!(check_fix_changes_with(&changes, &record, &reader(&files), &reader(&files)).is_ok());
     }
 
     #[test]
@@ -3419,6 +3742,64 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         // The real fix, in the declared package, is accepted and passes.
         write("src/calc/__init__.py", "def add(a, b):\n    return a + b\n");
         let fix = vec![("M".to_string(), "src/calc/__init__.py".to_string())];
+        check_fix_changes_with(&fix, &with_recorder, &read_checkpoint, &read_now).unwrap();
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "{out}");
+    }
+
+    /// End to end with real pytest, the reviewer's ambiguous test data under `src/`: the
+    /// regression reads `src/app/data/test_vector.json`, an ordinary package data directory
+    /// with no `tests` or `fixtures` in its path. Changing it makes the unchanged failing test
+    /// pass; the recorder freezes it, and the allowlist rejects it on its own because only
+    /// source code may change inside production code. The real fix is accepted.
+    #[tokio::test]
+    #[ignore = "needs a provisioned python3 with pytest on PATH"]
+    async fn test_data_inside_production_code_is_frozen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("pytest.ini", "[pytest]\n");
+        write("src/app/__init__.py", "def add(a, b):\n    return a - b\n");
+        write("src/app/data/test_vector.json", "[1, 2, 3]\n");
+        write(
+            FILE,
+            "import json, pathlib\nfrom app import add\n\ndef test_issue_7_fails():\n    a, b, expected = json.loads(pathlib.Path(\"src/app/data/test_vector.json\").read_text())\n    assert add(a, b) == expected, \"sum must be three\"\n",
+        );
+        let timeout = Duration::from_secs(120);
+        let cancel = CancellationToken::new();
+        let spec = PythonPytest.reproduction_environment(PythonPytest.regression_command(&rec(), root).unwrap(), root);
+        let run = proc::run(&spec, timeout, &cancel).await.unwrap();
+        let out = run.combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Failed, "{out}");
+        let loaded = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap();
+        assert_eq!(loaded, ["src/app/data/test_vector.json"], "{out}");
+
+        let frozen: HashMap<String, String> = [FILE, "src/app/__init__.py", "src/app/data/test_vector.json"]
+            .into_iter()
+            .map(|p| (p.to_string(), std::fs::read_to_string(root.join(p)).unwrap()))
+            .collect();
+        let read_checkpoint = |p: &str| frozen.get(p).cloned();
+        let read_now = |p: &str| std::fs::read_to_string(root.join(p)).ok();
+        let with_recorder = ReproRecord { frozen_inputs: loaded, ..rec() };
+        write("src/app/data/test_vector.json", "[4, 1, 3]\n");
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "the attack works without the lock: {out}");
+        let modified = vec![("M".to_string(), "src/app/data/test_vector.json".to_string())];
+        let err = check_fix_changes_with(&modified, &with_recorder, &read_checkpoint, &read_now).unwrap_err();
+        assert!(err.contains("src/app/data/test_vector.json") && err.contains("locked"), "{err}");
+        let err = check_fix_changes_with(&modified, &rec(), &read_checkpoint, &read_now).unwrap_err();
+        assert!(err.contains("only source code may change"), "the allowlist alone rejects it: {err}");
+        // Renamed or a sibling added: rejected too.
+        let added = vec![("A".to_string(), "src/app/data/other.json".to_string())];
+        assert!(check_fix_changes_with(&added, &rec(), &read_checkpoint, &read_now).is_err());
+        write("src/app/data/test_vector.json", &frozen["src/app/data/test_vector.json"]);
+
+        write("src/app/__init__.py", "def add(a, b):\n    return a + b\n");
+        let fix = vec![("M".to_string(), "src/app/__init__.py".to_string())];
         check_fix_changes_with(&fix, &with_recorder, &read_checkpoint, &read_now).unwrap();
         let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
         assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "{out}");

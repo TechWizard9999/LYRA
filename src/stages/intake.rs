@@ -107,7 +107,7 @@ fn intake(ctx: &mut StageCtx) -> Result<(), StageError> {
         return Err(StageError::new(
             ErrorKind::Config,
             format!(
-                "the {} profile needs {} on PATH; install it (or activate the environment that has it) and retry",
+                "the {} profile cannot use {}; install it (or activate the environment that has a working one) and retry",
                 resolved.id,
                 missing.join(", ")
             ),

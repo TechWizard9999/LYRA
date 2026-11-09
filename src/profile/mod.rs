@@ -285,9 +285,59 @@ pub fn resolve(worktree: &Path, requested: Option<&str>) -> Result<Resolution, S
     })
 }
 
-/// Executables from `profile.required_tools()` that cannot be found on `PATH`.
-pub fn missing_tools(profile: &dyn ExecutionProfile) -> Vec<&'static str> {
-    profile.required_tools().iter().copied().filter(|tool| crate::proc::resolve_program(tool).is_err()).collect()
+/// Executables from `profile.required_tools()` that cannot be used, each with the reason:
+/// not found on `PATH`, or found but not starting. Being on `PATH` is not enough: the
+/// Windows Store `python` alias is on `PATH` and only prints "Python was not found", so each
+/// tool must also answer `--version` successfully.
+pub fn missing_tools(profile: &dyn ExecutionProfile) -> Vec<String> {
+    profile
+        .required_tools()
+        .iter()
+        .filter_map(|tool| match crate::proc::resolve_program(tool) {
+            Err(_) => Some(format!("{tool} (not found on PATH)")),
+            Ok(path) => tool_starts(&path).err().map(|reason| format!("{tool} ({reason})")),
+        })
+        .collect()
+}
+
+/// Whether `program --version` starts and succeeds within 30 seconds.
+pub(crate) fn tool_starts(program: &Path) -> Result<(), String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let found = program.display();
+    let mut child = Command::new(program)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("found at {found} but it cannot be started: {e}"))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("found at {found} but `--version` did not answer within 30 s"));
+            }
+            Err(e) => return Err(format!("found at {found} but it cannot be started: {e}")),
+        }
+    };
+    if status.success() {
+        return Ok(());
+    }
+    let mut output = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_string(&mut output);
+    }
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_string(&mut output);
+    }
+    let said = output.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("no output");
+    let code = status.code().map_or("a signal".to_string(), |c| format!("exit {c}"));
+    Err(format!("found at {found} but `--version` failed with {code}: {said}"))
 }
 
 /// The profile a saved run was resolved with. Runs written before this contract have
@@ -315,6 +365,50 @@ pub fn for_state(state: &RunState) -> Result<Box<dyn ExecutionProfile>, String> 
 
 #[cfg(test)]
 mod tests {
+    /// A tool that is on `PATH` but does not start (the Windows Store `python` alias exits
+    /// 9009 with "Python was not found") is reported; a working one is not.
+    #[test]
+    fn a_tool_on_path_must_also_start() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let (broken, working) = {
+            use std::os::unix::fs::PermissionsExt;
+            let write = |name: &str, body: &str| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, body).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                path
+            };
+            (
+                write("python-alias", "#!/bin/sh\necho 'Python was not found; run without arguments to install from the Microsoft Store' >&2\nexit 9009\n"),
+                write("python-real", "#!/bin/sh\necho 'Python 3.14.7'\n"),
+            )
+        };
+        #[cfg(windows)]
+        let (broken, working) = {
+            let write = |name: &str, body: &str| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, body).unwrap();
+                path
+            };
+            (
+                write("python-alias.cmd", "@echo Python was not found; run without arguments to install from the Microsoft Store 1>&2\r\n@exit /b 9009\r\n"),
+                write("python-real.cmd", "@echo Python 3.14.7\r\n"),
+            )
+        };
+        let err = tool_starts(&broken).unwrap_err();
+        assert!(err.contains("Python was not found") && err.contains("--version` failed with exit"), "{err}");
+        assert!(tool_starts(&working).is_ok());
+        let err = tool_starts(&dir.path().join("does-not-exist")).unwrap_err();
+        assert!(err.contains("cannot be started"), "{err}");
+        // Built-in profiles on this machine: whatever is missing is reported with a reason.
+        for profile in builtin() {
+            for missing in missing_tools(&*profile) {
+                assert!(missing.contains('(') && missing.ends_with(')'), "{missing}");
+            }
+        }
+    }
+
     use super::*;
     use crate::state::RunRequest;
 
