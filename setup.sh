@@ -33,7 +33,10 @@ if ! cargo build --release --locked; then
   echo; echo "Build failed; see SETUP.md (Troubleshooting)."; exit 1
 fi
 
-if [ -n "${LYRA_HOME:-}" ]; then lyra_home="$LYRA_HOME"; else lyra_home="$HOME/.lyra"; fi
+case "${LYRA_HOME:-}" in
+  *[![:space:]]*) lyra_home="$LYRA_HOME" ;;
+  *) lyra_home="$HOME/.lyra" ;;
+esac
 config="$lyra_home/config.toml"
 
 echo; echo "== lyra doctor"
@@ -41,12 +44,14 @@ lyra="$(pwd)/target/release/lyra"
 doctor_ok=1
 # The binary owns the default config and creates it only when missing.
 "$lyra" doctor || doctor_ok=0
+# Single-quote a shell word, including any embedded apostrophes.
+lyra_command="'$(printf '%s' "$lyra" | sed "s/'/'\\\\''/g")'"
 
 echo; echo "== Next steps"
 if [ "$problems" -gt 0 ] || [ "$doctor_ok" -eq 0 ]; then
   echo "Fix the items marked !! above (details in SETUP.md), then run ./setup.sh again."
 fi
 echo "  1. Edit $config (runtime, auth, model) if needed."
-echo "  2. Start the dashboard:  $lyra serve"
-echo "  3. In the browser, enter the path of a cloned Rust repo and a GitHub issue, then press Run."
-echo "     Or from a terminal:   $lyra run --repo /path/to/repo --issue https://github.com/owner/repo/issues/123"
+printf '  2. Start the dashboard:  %s serve\n' "$lyra_command"
+echo "  3. In the browser, enter the path of an already-cloned local repository with a supported profile and a GitHub issue, then press Run."
+printf '     Or from a terminal:   %s run --repo /path/to/repo --issue https://github.com/owner/repo/issues/123\n' "$lyra_command"
