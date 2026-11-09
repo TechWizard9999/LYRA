@@ -25,7 +25,15 @@ Claude Code only discovers skills under `.claude/skills/`. Codex reads `.agents/
 ./scripts/agents.sh install-hooks   # commit-msg + pre-commit hooks for this clone
 ```
 
-PowerShell: `.\scripts\agents.ps1 sync | check | install-hooks`.
+PowerShell (three separate commands; `|` would be a pipeline there):
+
+```powershell
+.\scripts\agents.ps1 sync
+.\scripts\agents.ps1 check
+.\scripts\agents.ps1 install-hooks
+```
+
+`check-staged` exists only in the shell script: the pre-commit hook runs through `sh`, including under Git for Windows.
 
 ## Rules (`rules/`)
 
