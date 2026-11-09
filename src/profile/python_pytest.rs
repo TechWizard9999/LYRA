@@ -62,10 +62,11 @@ const DISCOVERY_WRAPPER: &str =
 ///   `a+`, `rb`… and `os.open` with `O_RDONLY` or `O_RDWR` without `O_TRUNC`. Only `w`/`w+`
 ///   (and `O_TRUNC`), which discard the content, and write-only opens are not reads.
 /// - `sqlite3.connect` of an existing database file counts as a read.
-/// - pytest itself reads the root `pyproject.toml`, `setup.cfg` and `tox.ini` while it
-///   configures, before the session starts (marked by a `pytest_sessionstart` hook); those
-///   reads are not regression inputs. The same file read during the session (the test parses
-///   its own manifest) is one, and is frozen whole, dependency fields included.
+/// - pytest's own configuration loader (`_pytest/config/findpaths.py`, `iniconfig`) reads the root
+///   `pyproject.toml`, `setup.cfg` and `tox.ini`; such a read, identified by the call stack at
+///   the time of the open, is not a regression input. Any other read of those files (the test,
+///   a conftest at import time, a plugin) is reported. The fix guard freezes the root
+///   manifests regardless, so this only makes the evidence complete.
 /// - `subprocess.Popen`, `os.system`, `os.exec`, `os.posix_spawn`, `os.spawn`, `os.fork`,
 ///   `os.forkpty` and `os.startfile` start a process whose reads this interpreter cannot see,
 ///   so the inputs of such a regression cannot be established and Repro rejects it.
@@ -76,8 +77,16 @@ const DISCOVERY_WRAPPER: &str =
 const PYTEST_RECORDER: &str = "import os, sys, pytest
 cwd = os.getcwd()
 reads = set()
-session_reads = set()
-session_started = False
+input_reads = set()
+ROOT_SETUP = ('pyproject.toml', 'setup.cfg', 'tox.ini', 'setup.py')
+def lyra_pytest_config_read():
+    frame = sys._getframe(2)
+    while frame is not None:
+        name = frame.f_code.co_filename.replace(os.sep, '/')
+        if name.endswith('/_pytest/config/findpaths.py') or '/iniconfig/' in name:
+            return True
+        frame = frame.f_back
+    return False
 spawns = []
 unresolved = []
 active = True
@@ -115,14 +124,13 @@ def lyra_audit(event, args):
         path = lyra_path(path)
         if readable and not truncating and lyra_existing(path):
             reads.add(path)
-            if session_started:
-                session_reads.add(path)
+            if os.path.basename(path) not in ROOT_SETUP or not lyra_pytest_config_read():
+                input_reads.add(path)
     elif event == 'sqlite3.connect':
         path = lyra_path(args[0]) if args else None
         if lyra_existing(path):
             reads.add(path)
-            if session_started:
-                session_reads.add(path)
+            input_reads.add(path)
     elif event in SPAWNS:
         what = args[0] if args else ''
         if isinstance(what, (list, tuple)):
@@ -130,12 +138,8 @@ def lyra_audit(event, args):
         if isinstance(what, bytes):
             what = os.fsdecode(what)
         spawns.append(event + ' ' + str(what).replace(chr(10), ' ')[:200])
-class LyraSession:
-    def pytest_sessionstart(self, session):
-        global session_started
-        session_started = True
 sys.addaudithook(lyra_audit)
-code = int(pytest.main(sys.argv[1:], plugins=[LyraSession()]))
+code = int(pytest.main(sys.argv[1:]))
 active = False
 root = os.path.realpath(cwd)
 def inside(path):
@@ -145,10 +149,9 @@ for module in list(sys.modules.values()):
     path = getattr(module, '__file__', None)
     if isinstance(path, str) and inside(path):
         print('LYRA-LOADED ' + inside(path))
-ROOT_SETUP = ('pyproject.toml', 'setup.cfg', 'tox.ini', 'setup.py')
 for path in sorted(reads):
     if os.path.isfile(path) and inside(path):
-        if inside(path) in ROOT_SETUP and path not in session_reads:
+        if inside(path) in ROOT_SETUP and path not in input_reads:
             continue
         print('LYRA-READ ' + inside(path))
 for spawn in spawns:
@@ -172,32 +175,69 @@ const GENERATED_DIRS: [&str; 3] = ["__pycache__", "node_modules", "site-packages
 
 /// Verification provenance: every project name (one per line on stdin) must be found inside
 /// the checkout under test (the working directory). The name is located on the import path
-/// without importing it, so no project code runs: `PathFinder` first, which searches
-/// `sys.path` exactly as an import would and ignores modules the interpreter already loaded at
-/// start-up (a project `types.py` is not mistaken for the standard library's), then the other
-/// finders (editable installs). A regular package or module must come from the checkout; a
-/// namespace package's first portion, which wins for every subpackage it holds, must be the
-/// checkout's (other portions installed by dependencies, as in `google.*`, are allowed). A name
-/// that is missing or resolves elsewhere (an editable install of another clone, a regular
-/// package shadowing a namespace package) fails, by name, with exit status 1.
-const PROVENANCE_CHECK: &str = "import importlib.machinery, importlib.util, os, sys
+/// without importing it, so no project code runs: the `sys.path_hooks` finders over `sys.path`
+/// first, which search exactly as an import would and ignore modules the interpreter already
+/// loaded at start-up, then the other finders (editable installs). A regular package or module must come from the checkout; a
+/// namespace package's first portion must be the checkout's (other portions installed by
+/// dependencies, as in `google.*`, are allowed), and then every module and subpackage in that
+/// portion is checked the same way against the merged namespace path, recursively: an
+/// installed regular `acme/sub/` elsewhere wins over the checkout's `src/acme/sub/` and is
+/// caught as `acme.sub`. Namespace packages run no code, so nothing is imported. A name that is
+/// missing or resolves elsewhere (an editable install of another clone, a regular package
+/// shadowing a namespace package or one of its subpackages) fails, by name, with exit status 1.
+const PROVENANCE_CHECK: &str = "import importlib.util, os, sys
 root = os.path.realpath(os.getcwd())
 def inside(path):
     path = os.path.realpath(path)
     return path == root or path.startswith(root + os.sep)
+def finder(entry):
+    for hook in sys.path_hooks:
+        try:
+            return hook(entry)
+        except ImportError:
+            continue
+    return None
+def locate(name, entries):
+    portions = []
+    for entry in entries:
+        found = finder(entry)
+        spec = found.find_spec(name) if found is not None and hasattr(found, 'find_spec') else None
+        if spec is None:
+            continue
+        if spec.loader is not None and spec.origin not in (None, 'namespace'):
+            return [spec.origin], False
+        portions.extend(spec.submodule_search_locations or [])
+    return portions, bool(portions)
 bad = []
-for name in [line.strip() for line in sys.stdin if line.strip()]:
+def check(name, entries, depth=0):
     try:
-        spec = importlib.machinery.PathFinder.find_spec(name) or importlib.util.find_spec(name)
+        places, namespace = locate(name, entries)
+        if not places and depth == 0:
+            spec = importlib.util.find_spec(name)
+            if spec is not None and spec.origin not in (None, 'namespace', 'built-in', 'frozen'):
+                places = [spec.origin]
+            elif spec is not None:
+                places, namespace = list(spec.submodule_search_locations or []), True
     except (ImportError, ValueError):
-        spec = None
-    if spec is not None and spec.origin not in (None, 'namespace', 'built-in', 'frozen'):
-        places = [spec.origin]
-    else:
-        places = list(getattr(spec, 'submodule_search_locations', None) or [])
+        places, namespace = [], False
     print(name, '->', ', '.join(os.path.realpath(p) for p in places) or 'not found')
     if not places or not inside(places[0]):
         bad.append(name)
+        return
+    if namespace and depth < 32:
+        portion = places[0]
+        for entry in sorted(os.listdir(portion)):
+            full = os.path.join(portion, entry)
+            if os.path.isdir(full):
+                child = entry
+            elif entry.endswith('.py') and os.path.isfile(full):
+                child = entry[:-3]
+            else:
+                continue
+            if child.isidentifier() and child != '__pycache__':
+                check(name + '.' + child, places, depth + 1)
+for name in [line.strip() for line in sys.stdin if line.strip()]:
+    check(name, sys.path)
 for name in bad:
     print('ERROR: ' + name + ' does not resolve inside the checkout under test')
 sys.exit(1 if bad else 0)";
@@ -1746,7 +1786,7 @@ pub fn check_fix_changes_with(
         if frozen.contains(&path) {
             continue; // reported by the frozen-test check above
         }
-        if let Some(reason) = fix_may_not_change(&path, status, &production, &tree, read_checkpoint, read_now) {
+        if let Some(reason) = fix_may_not_change(&path, status, &production, &tree) {
             violations.push(format!("{status} {path}: {reason}"));
         }
     }
@@ -1768,25 +1808,22 @@ pub fn check_fix_changes_with(
 /// both halves are checked), or `None` when it may. In order:
 ///
 /// 1. collection controls anywhere (`conftest.py`, pytest configuration files, start-up hooks);
-/// 2. the root manifests, whose dependency fields only may change ([`manifest_violation`]);
+/// 2. the root manifests, which are frozen ([`is_root_manifest`]);
 /// 3. test infrastructure anywhere, also under `src/` or a declared package: test modules,
 ///    helpers, fixtures and data ([`is_test_infrastructure`]);
 /// 4. anything that is not declared production code ([`ProductionCode`]);
 /// 5. a new top-level module or package initializer under `src/`, which could shadow the test
 ///    runner or a dependency on the bound import path.
-fn fix_may_not_change(
-    path: &str,
-    status: &str,
-    production: &ProductionCode,
-    tree: &str,
-    read_checkpoint: FileReader<'_>,
-    read_now: FileReader<'_>,
-) -> Option<String> {
+fn fix_may_not_change(path: &str, status: &str, production: &ProductionCode, tree: &str) -> Option<String> {
     if let Some(reason) = collection_control_violation(path) {
         return Some(reason.to_string());
     }
     if is_root_manifest(path) {
-        return manifest_violation(path, status, read_checkpoint, read_now);
+        return Some(
+            "the root manifests are frozen: LYRA installs nothing, so a dependency change cannot be verified, and \
+             the regression or a conftest may read them as input"
+                .into(),
+        );
     }
     if is_test_infrastructure(path, tree) {
         return Some(
@@ -1809,8 +1846,7 @@ fn fix_may_not_change(
         Classification::Production => None,
         Classification::Unknown => Some(production.unknown_message(&BTreeSet::from([path.to_string()]))),
         Classification::TestSupport => Some(format!(
-            "not declared production code; a fix may change only the declared packages{} and the dependency \
-             fields of the root manifests",
+            "not declared production code; a fix may change only the declared packages{}",
             if production.is_empty() { String::new() } else { format!(" ({})", production.describe()) }
         )),
     }
@@ -1829,100 +1865,16 @@ fn is_test_infrastructure(path: &str, tree: &str) -> bool {
             .any(|dir| matches!(dir, "tests" | "test" | "testing" | "fixtures" | "testdata" | "test_data"))
 }
 
-/// Manifests whose dependency fields a fix may change: the repository root's
-/// `pyproject.toml`, `setup.cfg` and `requirements*.txt`. A file with the same name anywhere
-/// else (a `fixtures/pyproject.toml`) is not a manifest.
+/// The repository root's packaging and requirement files: `pyproject.toml`, `setup.cfg`,
+/// `setup.py`, `tox.ini` and `requirements*.txt`. A fix may not change them: LYRA installs
+/// nothing, so a dependency change cannot be verified in the fresh checkout, and the regression,
+/// a conftest or a plugin may read them as input in ways the recorder cannot always attribute
+/// (before the session, through `dir_fd`). A file with the same name elsewhere (a
+/// `fixtures/pyproject.toml`) is an ordinary frozen file.
 fn is_root_manifest(path: &str) -> bool {
     !path.contains('/')
-        && (path == "pyproject.toml"
-            || path == "setup.cfg"
+        && (["pyproject.toml", "setup.cfg", "setup.py", "tox.ini"].contains(&path)
             || (path.starts_with("requirements") && path.ends_with(".txt")))
-}
-
-/// A root manifest may only be modified, never added or deleted, and only in its dependency
-/// fields: `[project] dependencies` / `optional-dependencies`, `[dependency-groups]` and the
-/// poetry dependency tables in `pyproject.toml`; `install_requires` and
-/// `[options.extras_require]` in `setup.cfg`; any line of a root `requirements*.txt` (LYRA
-/// installs nothing, so these never change what runs). Pytest configuration, plugin entry
-/// points, package lists and every other field stay frozen.
-fn manifest_violation(
-    path: &str,
-    status: &str,
-    read_checkpoint: FileReader<'_>,
-    read_now: FileReader<'_>,
-) -> Option<String> {
-    let (Some(old), Some(new)) = (read_checkpoint(path), read_now(path)) else {
-        return Some("a root manifest may have its dependency fields changed, but not be added or deleted".into());
-    };
-    if guards::is_new(status) || status == "D" {
-        return Some("a root manifest may have its dependency fields changed, but not be added or deleted".into());
-    }
-    let same =
-        match path {
-            "pyproject.toml" => match (pyproject_without_dependencies(&old), pyproject_without_dependencies(&new)) {
-                (Some(old), Some(new)) => old == new,
-                (None, _) => return Some(
-                    "the frozen pyproject.toml is not valid TOML, so its dependency fields cannot be told apart from \
-                     the rest; it stays frozen"
-                        .into(),
-                ),
-                (Some(_), None) => return Some("the manifest is no longer valid TOML".into()),
-            },
-            "setup.cfg" => setup_cfg_without_dependencies(&old) == setup_cfg_without_dependencies(&new),
-            _ => true,
-        };
-    (!same).then(|| "only the dependency fields of a root manifest may change".into())
-}
-
-fn pyproject_without_dependencies(text: &str) -> Option<toml::Value> {
-    let mut doc: toml::Value = text.parse().ok()?;
-    let table = doc.as_table_mut()?;
-    table.remove("dependency-groups");
-    if let Some(project) = table.get_mut("project").and_then(toml::Value::as_table_mut) {
-        project.remove("dependencies");
-        project.remove("optional-dependencies");
-    }
-    let poetry = table.get_mut("tool").and_then(|t| t.get_mut("poetry")).and_then(toml::Value::as_table_mut);
-    if let Some(poetry) = poetry {
-        poetry.remove("dependencies");
-        poetry.remove("dev-dependencies");
-        if let Some(groups) = poetry.get_mut("group").and_then(toml::Value::as_table_mut) {
-            for group in groups.iter_mut().filter_map(|(_, g)| g.as_table_mut()) {
-                group.remove("dependencies");
-            }
-        }
-    }
-    Some(doc)
-}
-
-/// `setup.cfg` as (section, line) pairs without `[options] install_requires` (with its
-/// indented continuation lines) and `[options.extras_require]`.
-fn setup_cfg_without_dependencies(text: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let mut section = String::new();
-    let mut skipping = false;
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            section = line.trim_matches(|c| c == '[' || c == ']').trim().to_string();
-            skipping = false;
-            if section != "options.extras_require" {
-                out.push((section.clone(), String::new()));
-            }
-            continue;
-        }
-        if !raw.starts_with([' ', '\t']) {
-            let key = line.split(['=', ':']).next().unwrap_or("").trim();
-            skipping = section == "options" && key == "install_requires";
-        }
-        if !skipping && section != "options.extras_require" {
-            out.push((section.clone(), line.to_string()));
-        }
-    }
-    out
 }
 
 /// `src/<name>.<ext>` for an importable extension, or `src/<name>/__init__.<ext>`.
@@ -2326,7 +2278,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         assert!(check_fix_changes_with(&ok, &rec(), &reader(&frozen), &reader(&fixed_source)).is_ok());
         assert!(check_fix_changes_with(&[], &rec(), &reader(&frozen), &reader(&fixed_source)).is_err());
 
-        // A dependency change outside the pytest sections is allowed; a pytest section is not.
+        // The root manifest is frozen, dependency fields included, and so are pytest sections.
         let deps = pyproject.replace("name = \"x\"", "name = \"x\"\ndependencies = [\"attrs\"]");
         let now = HashMap::from([(FILE, frozen[FILE]), ("pyproject.toml", deps.as_str())]);
         assert!(check_fix_changes_with(
@@ -2335,7 +2287,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             &reader(&frozen),
             &reader(&now)
         )
-        .is_ok());
+        .is_err());
         let testpaths = pyproject.replace("[\"tests\"]", "[\"src\"]");
         let now = HashMap::from([(FILE, frozen[FILE]), ("pyproject.toml", testpaths.as_str())]);
         assert!(check_fix_changes_with(
@@ -2486,51 +2438,28 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         let err = check_with(&[("M", "src/app/data.json")], &edited, &record).unwrap_err();
         assert!(err.contains("src/app/data.json") && err.contains("locked"), "{err}");
 
-        // Root manifests: dependency fields only.
+        // Root manifests are frozen whole: LYRA installs nothing, so a dependency change cannot
+        // be verified, and a test, a conftest or a plugin may read them as input (the
+        // reviewer's conftest-at-import and dir_fd cases). Every change, any field, any form,
+        // and also a broken original, is rejected.
         let manifest = |path: &'static str, text: String| {
             let mut now = checkpoint.clone();
             now.insert(path, Box::leak(text.into_boxed_str()));
             check_with(&[("M", path)], &now, &rec())
         };
-        assert!(manifest("pyproject.toml", pyproject.replace("[\"attrs\"]", "[\"attrs>=23\", \"six\"]")).is_ok());
-        assert!(manifest(
-            "pyproject.toml",
-            format!("{pyproject}[project.optional-dependencies]\nfast = [\"ujson\"]\n[dependency-groups]\ndev = [\"ruff\"]\n")
-        )
-        .is_ok());
-        for broken in [
-            pyproject.replace("name = \"calc\"", "name = \"other\""),
-            pyproject.replace("testpaths = [\"tests\"]", "testpaths = [\"src\"]"),
-            pyproject.replace("[\"calc\", \"textkit\", \"app\"]", "[\"calc\"]"),
-            format!("{pyproject}hide = \"calc.plugin\"\n"),
-            "[project\n".to_string(),
+        for (path, text) in [
+            ("pyproject.toml", pyproject.replace("[\"attrs\"]", "[\"attrs>=23\", \"six\"]")),
+            ("pyproject.toml", format!("{pyproject}[dependency-groups]\ndev = [\"ruff\"]\n")),
+            ("pyproject.toml", pyproject.replace("testpaths = [\"tests\"]", "testpaths = [\"src\"]")),
+            ("setup.cfg", setup_cfg.replace("    six==1.16\n", "    six==1.17\n")),
+            ("requirements.txt", "attrs>=23\n".to_string()),
         ] {
-            assert!(manifest("pyproject.toml", broken.clone()).is_err(), "{broken}");
+            let err = manifest(path, text).unwrap_err();
+            assert!(err.contains(path) && err.contains("root manifests are frozen"), "{path}: {err}");
         }
-        assert!(manifest("setup.cfg", setup_cfg.replace("    six==1.16\n", "    six==1.17\n    idna>=3\n")).is_ok());
-        assert!(manifest("setup.cfg", setup_cfg.replace("test = pytest", "test = pytest\nfast = ujson")).is_ok());
-        for broken in [
-            setup_cfg.replace("packages = calc", "packages = other"),
-            setup_cfg.replace("testpaths = tests", "testpaths = src"),
-        ] {
-            assert!(manifest("setup.cfg", broken.clone()).is_err(), "{broken}");
-        }
-        assert!(manifest("requirements.txt", "attrs>=23\nsix\n".into()).is_ok());
-
-        // A frozen pyproject.toml that cannot be parsed cannot be compared field by field: it
-        // stays frozen, whatever the replacement (the reviewer's malformed-original case).
-        let mut broken = checkpoint.clone();
-        broken.insert("pyproject.toml", "[project\nname = \"calc\"\n[tool.setuptools]\npackages = [\"calc\"]\n");
-        let read_broken = reader(&broken);
-        for replacement in [
-            "[project]\nname = \"calc\"\ndependencies = [\"attrs\"]\n".to_string(),
-            "[tool.pytest.ini_options]\naddopts = \"-k not issue\"\n".to_string(),
-        ] {
-            let mut now = broken.clone();
-            now.insert("pyproject.toml", Box::leak(replacement.into_boxed_str()));
-            let changes = vec![("M".to_string(), "pyproject.toml".to_string())];
-            let err = check_fix_changes_with(&changes, &rec(), &read_broken, &reader(&now)).unwrap_err();
-            assert!(err.contains("not valid TOML") && err.contains("stays frozen"), "{err}");
+        for (status, path) in [("A", "tox.ini"), ("M", "setup.py"), ("A", "requirements-dev.txt")] {
+            let err = check_with(&[(status, path)], &checkpoint, &rec()).unwrap_err();
+            assert!(err.contains("root manifests are frozen"), "{status} {path}: {err}");
         }
     }
 
@@ -4293,7 +4222,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
     /// manifest leaves its dependency fields editable.
     #[tokio::test]
     #[ignore = "needs a provisioned python3 with pytest on PATH"]
-    async fn a_manifest_the_regression_reads_is_frozen_even_in_its_dependency_fields() {
+    async fn a_manifest_the_regression_reads_is_recorded_and_frozen() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let write = |rel: &str, text: &str| {
@@ -4331,20 +4260,174 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         let err = check_fix_changes_with(&change, &with_recorder, &read_checkpoint, &read_now).unwrap_err();
         assert!(err.contains("pyproject.toml") && err.contains("repro input"), "{err}");
 
-        // A regression that does not read the manifest: only pytest's start-up read happens,
-        // nothing is frozen, and a dependency edit stays allowed.
+        // A regression that does not read the manifest: only pytest's own configuration read
+        // happens and nothing is frozen as evidence; the manifest stays locked by the guard.
         write("pyproject.toml", manifest);
         write(FILE, "from calc import accepted\n\ndef test_issue_7_fails():\n    assert not accepted([\"bad\"]), \"bad dependencies must be rejected\"\n");
         let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
         assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Failed, "{out}");
         assert!(PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap().is_empty(), "{out}");
-        let frozen: HashMap<String, String> = [FILE, "pyproject.toml", "calc.py"]
-            .into_iter()
-            .map(|p| (p.to_string(), std::fs::read_to_string(root.join(p)).unwrap()))
-            .collect();
+    }
+
+    /// End to end with real pytest, the reviewer's follow-ups on manifest inputs: a root
+    /// `conftest.py` reads `pyproject.toml` at import time (before the session starts) and
+    /// hands a dependency value to the test through a fixture; and, on POSIX, the test reads
+    /// the manifest with `os.open(..., dir_fd=...)` after changing directory, which the audit
+    /// event cannot attribute. The recorder attributes the conftest read (it is not pytest's
+    /// configuration loader) and freezes the manifest; in both cases the guard rejects a
+    /// dependency-only edit that would make the unchanged failing test pass, because root
+    /// manifests are frozen whole.
+    #[tokio::test]
+    #[ignore = "needs a provisioned python3 with pytest on PATH"]
+    async fn manifest_reads_by_a_conftest_or_through_dir_fd_cannot_unlock_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let manifest =
+            "[project]\nname = \"calc\"\ndependencies = [\"bad\"]\n[tool.pytest.ini_options]\naddopts = \"\"\n";
+        write("pyproject.toml", manifest);
+        write("calc.py", "def accepted(deps):\n    return deps == [\"bad\"]\n");
+        write(
+            "conftest.py",
+            "import tomllib, pytest\nDEPS = tomllib.load(open(\"pyproject.toml\", \"rb\"))[\"project\"][\"dependencies\"]\n\n@pytest.fixture\ndef deps():\n    return DEPS\n",
+        );
+        write(
+            FILE,
+            "from calc import accepted\n\ndef test_issue_7_fails(deps):\n    assert not accepted(deps), \"bad dependencies must be rejected\"\n",
+        );
+        let timeout = Duration::from_secs(120);
+        let cancel = CancellationToken::new();
+        let spec = PythonPytest.reproduction_environment(PythonPytest.regression_command(&rec(), root).unwrap(), root);
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Failed, "{out}");
+        let loaded = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap();
+        assert!(loaded.contains(&"pyproject.toml".to_string()), "the conftest's read is the regression's: {out}");
+
+        let snapshot = |paths: &[&str]| -> HashMap<String, String> {
+            paths.iter().map(|p| (p.to_string(), std::fs::read_to_string(root.join(p)).unwrap())).collect()
+        };
+        let frozen = snapshot(&[FILE, "pyproject.toml", "calc.py", "conftest.py"]);
         let read_checkpoint = |p: &str| frozen.get(p).cloned();
-        write("pyproject.toml", &manifest.replace("[\"bad\"]", "[\"bad\", \"attrs\"]"));
-        check_fix_changes_with(&change, &rec(), &read_checkpoint, &read_now).unwrap();
+        let read_now = |p: &str| std::fs::read_to_string(root.join(p)).ok();
+        write("pyproject.toml", &manifest.replace("[\"bad\"]", "[\"good\"]"));
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "the attack works without the lock: {out}");
+        let change = vec![("M".to_string(), "pyproject.toml".to_string())];
+        for record in [&ReproRecord { frozen_inputs: loaded, ..rec() }, &rec()] {
+            let err = check_fix_changes_with(&change, record, &read_checkpoint, &read_now).unwrap_err();
+            assert!(err.contains("pyproject.toml"), "{err}");
+        }
+        write("pyproject.toml", manifest);
+
+        #[cfg(unix)]
+        {
+            // dir_fd after a directory change: invisible to the audit event, still locked.
+            std::fs::remove_file(root.join("conftest.py")).unwrap();
+            write("sub/.keep", "");
+            write(
+                FILE,
+                "import os, tomllib\nfrom calc import accepted\n\ndef test_issue_7_fails():\n    root = os.open(\".\", os.O_RDONLY)\n    os.chdir(\"sub\")\n    try:\n        fd = os.open(\"pyproject.toml\", os.O_RDONLY, dir_fd=root)\n        deps = tomllib.loads(os.read(fd, 1 << 16).decode())[\"project\"][\"dependencies\"]\n        os.close(fd)\n    finally:\n        os.chdir(\"..\")\n        os.close(root)\n    assert not accepted(deps), \"bad dependencies must be rejected\"\n",
+            );
+            let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+            assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Failed, "{out}");
+            let frozen = snapshot(&[FILE, "pyproject.toml", "calc.py"]);
+            let read_checkpoint = |p: &str| frozen.get(p).cloned();
+            write("pyproject.toml", &manifest.replace("[\"bad\"]", "[\"good\"]"));
+            let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+            assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "the dir_fd attack works: {out}");
+            let err = check_fix_changes_with(&change, &rec(), &read_checkpoint, &read_now).unwrap_err();
+            assert!(err.contains("root manifests are frozen"), "{err}");
+        }
+    }
+
+    /// Real Python, the reviewer's nested-namespace case: the candidate's `src/acme/sub/`
+    /// (a namespace portion, returning 41) loses to an installed regular `acme/sub/` package
+    /// elsewhere (returning 42) even though the candidate's `acme` portion comes first. The
+    /// regression is fooled; the provenance step now checks `acme.sub` against the merged
+    /// namespace path and fails by name, and passes once nothing shadows it.
+    #[tokio::test]
+    #[ignore = "needs a provisioned python3 with pytest on PATH"]
+    async fn a_regular_subpackage_elsewhere_cannot_hide_inside_a_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let timeout = Duration::from_secs(120);
+        let cancel = CancellationToken::new();
+        let write = |path: std::path::PathBuf, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let checkout = dir.path().join("checkout");
+        write(checkout.join("src/acme/sub/module.py"), "def answer():\n    return 41\n");
+        write(checkout.join("pytest.ini"), "[pytest]\n");
+        write(
+            checkout.join(FILE),
+            "from acme.sub.module import answer\n\ndef test_issue_7_fails():\n    assert answer() == 42, \"sum must be three\"\n",
+        );
+        let external = dir.path().join("site");
+        write(external.join("acme/sub/__init__.py"), "");
+        write(external.join("acme/sub/module.py"), "def answer():\n    return 42\n");
+
+        let venv = dir.path().join("venv");
+        let made = proc::run(
+            &CommandSpec::new(PYTHON, dir.path()).args(["-m", "venv", "--without-pip"]).arg(venv.to_string_lossy()),
+            timeout,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert!(made.success(), "{}", made.combined());
+        let venv_python = if cfg!(windows) { venv.join("Scripts/python.exe") } else { venv.join("bin/python") };
+        let site = |code: &str| CommandSpec::new(venv_python.to_string_lossy(), dir.path()).args(["-c", code]);
+        let purelib = proc::run(&site("import sysconfig; print(sysconfig.get_paths()['purelib'])"), timeout, &cancel)
+            .await
+            .unwrap();
+        let purelib = std::path::PathBuf::from(purelib.stdout.trim());
+        write(purelib.join("external.pth"), &format!("{}\n", external.display()));
+        let pytest_site = proc::run(
+            &CommandSpec::new(PYTHON, dir.path())
+                .args(["-c", "import os, pytest; print(os.path.dirname(os.path.dirname(pytest.__file__)))"]),
+            timeout,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        write(purelib.join("provisioned.pth"), &format!("{}\n", pytest_site.stdout.trim()));
+        let with_venv = |mut spec: CommandSpec| {
+            spec.program = venv_python.to_string_lossy().into_owned();
+            spec
+        };
+
+        let spec = with_venv(
+            PythonPytest
+                .reproduction_environment(PythonPytest.regression_command(&rec(), &checkout).unwrap(), dir.path()),
+        );
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(
+            classify_pytest(&out, ID_),
+            RegressionOutcome::Passed,
+            "precondition: external acme.sub wins: {out}"
+        );
+
+        let steps = PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), &checkout).unwrap();
+        assert_eq!(steps[0].name, "imports");
+        let env_root = dir.path().join("env");
+        let run = || async {
+            proc::run(&with_venv(PythonPytest.command_environment(steps[0].spec.clone(), &env_root)), timeout, &cancel)
+                .await
+                .unwrap()
+        };
+        let check = run().await;
+        assert!(
+            !check.success() && check.stdout.contains("ERROR: acme.sub does not resolve inside the checkout"),
+            "{}",
+            check.combined()
+        );
+        std::fs::remove_file(purelib.join("external.pth")).unwrap();
+        let check = run().await;
+        assert!(check.success(), "{}", check.combined());
     }
 
     #[test]
