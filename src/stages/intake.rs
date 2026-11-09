@@ -18,7 +18,7 @@ impl Stage for IntakeStage {
         StageId::Intake
     }
     async fn run(&self, ctx: &mut StageCtx) -> StageOutcome {
-        match intake(ctx) {
+        match intake(ctx).await {
             Ok(()) => StageOutcome::Completed,
             Err(e) => StageOutcome::failed(e),
         }
@@ -29,7 +29,7 @@ fn io_err(e: anyhow::Error) -> StageError {
     StageError::from_anyhow(ErrorKind::Io, e)
 }
 
-fn intake(ctx: &mut StageCtx) -> Result<(), StageError> {
+async fn intake(ctx: &mut StageCtx) -> Result<(), StageError> {
     let repo = ctx.state.request.repo.clone();
     if !repo.is_dir() {
         return Err(StageError::fatal(ErrorKind::Config, format!("repository path {} does not exist", repo.display())));
@@ -101,7 +101,9 @@ fn intake(ctx: &mut StageCtx) -> Result<(), StageError> {
     let resolution = crate::profile::resolve(&wt, ctx.state.request.profile.as_deref())
         .map_err(|reason| StageError::fatal(ErrorKind::Config, reason))?;
     let resolved = resolution.resolved.clone();
-    let missing = crate::profile::missing_tools(&*resolution.profile);
+    let missing = crate::profile::missing_tools(&*resolution.profile, &ctx.cancel)
+        .await
+        .map_err(|_| StageError::new(ErrorKind::Tool, "intake cancelled"))?;
     if !missing.is_empty() {
         // Retryable: installing the tool or activating the right environment fixes it.
         return Err(StageError::new(

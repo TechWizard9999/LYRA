@@ -285,59 +285,70 @@ pub fn resolve(worktree: &Path, requested: Option<&str>) -> Result<Resolution, S
     })
 }
 
+/// The run was cancelled while the tools were being checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cancelled;
+
 /// Executables from `profile.required_tools()` that cannot be used, each with the reason:
 /// not found on `PATH`, or found but not starting. Being on `PATH` is not enough: the
 /// Windows Store `python` alias is on `PATH` and only prints "Python was not found", so each
-/// tool must also answer `--version` successfully.
-pub fn missing_tools(profile: &dyn ExecutionProfile) -> Vec<String> {
-    profile
-        .required_tools()
-        .iter()
-        .filter_map(|tool| match crate::proc::resolve_program(tool) {
-            Err(_) => Some(format!("{tool} (not found on PATH)")),
-            Ok(path) => tool_starts(&path).err().map(|reason| format!("{tool} ({reason})")),
-        })
-        .collect()
+/// tool must also answer `--version` successfully. The check runs through the cancellable,
+/// output-bounded subprocess runner, which kills the whole process tree on Cancel or timeout.
+pub async fn missing_tools(
+    profile: &dyn ExecutionProfile,
+    cancel: &CancellationToken,
+) -> Result<Vec<String>, Cancelled> {
+    let mut missing = Vec::new();
+    for tool in profile.required_tools() {
+        match crate::proc::resolve_program(tool) {
+            Err(_) => missing.push(format!("{tool} (not found on PATH)")),
+            Ok(path) => match tool_starts(&path, cancel).await {
+                ToolStart::Usable => {}
+                ToolStart::Fails(reason) => missing.push(format!("{tool} ({reason})")),
+                ToolStart::Cancelled => return Err(Cancelled),
+            },
+        }
+    }
+    Ok(missing)
 }
 
-/// Whether `program --version` starts and succeeds within 30 seconds.
-pub(crate) fn tool_starts(program: &Path) -> Result<(), String> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
+const TOOL_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolStart {
+    Usable,
+    Fails(String),
+    Cancelled,
+}
+
+/// Whether `program --version` starts and succeeds, run like every other command: bounded
+/// output, a timeout, the run's cancellation token and process-tree cleanup.
+pub(crate) async fn tool_starts(program: &Path, cancel: &CancellationToken) -> ToolStart {
     let found = program.display();
-    let mut child = Command::new(program)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("found at {found} but it cannot be started: {e}"))?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("found at {found} but `--version` did not answer within 30 s"));
-            }
-            Err(e) => return Err(format!("found at {found} but it cannot be started: {e}")),
-        }
+    let spec = CommandSpec::new(program.to_string_lossy(), std::env::temp_dir()).arg("--version");
+    let out = match crate::proc::run(&spec, TOOL_CHECK_TIMEOUT, cancel).await {
+        Ok(out) => out,
+        Err(e) => return ToolStart::Fails(format!("found at {found} but it cannot be started: {e:#}")),
     };
-    if status.success() {
-        return Ok(());
+    if out.cancelled {
+        return ToolStart::Cancelled;
     }
-    let mut output = String::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        let _ = stderr.read_to_string(&mut output);
+    if out.success() {
+        return ToolStart::Usable;
     }
-    if let Some(mut stdout) = child.stdout.take() {
-        let _ = stdout.read_to_string(&mut output);
+    if out.timed_out {
+        return ToolStart::Fails(format!(
+            "found at {found} but `--version` did not answer within {} s",
+            TOOL_CHECK_TIMEOUT.as_secs()
+        ));
     }
-    let said = output.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("no output");
-    let code = status.code().map_or("a signal".to_string(), |c| format!("exit {c}"));
-    Err(format!("found at {found} but `--version` failed with {code}: {said}"))
+    if out.output_truncated || out.drain_timed_out {
+        return ToolStart::Fails(format!("found at {found} but `--version` did not behave like a version query"));
+    }
+    let said =
+        out.stderr.lines().chain(out.stdout.lines()).map(str::trim).find(|l| !l.is_empty()).unwrap_or("no output");
+    let code = out.exit_code.map_or("a signal".to_string(), |c| format!("exit {c}"));
+    ToolStart::Fails(format!("found at {found} but `--version` failed with {code}: {said}"))
 }
 
 /// The profile a saved run was resolved with. Runs written before this contract have
@@ -365,50 +376,6 @@ pub fn for_state(state: &RunState) -> Result<Box<dyn ExecutionProfile>, String> 
 
 #[cfg(test)]
 mod tests {
-    /// A tool that is on `PATH` but does not start (the Windows Store `python` alias exits
-    /// 9009 with "Python was not found") is reported; a working one is not.
-    #[test]
-    fn a_tool_on_path_must_also_start() {
-        let dir = tempfile::tempdir().unwrap();
-        #[cfg(unix)]
-        let (broken, working) = {
-            use std::os::unix::fs::PermissionsExt;
-            let write = |name: &str, body: &str| {
-                let path = dir.path().join(name);
-                std::fs::write(&path, body).unwrap();
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-                path
-            };
-            (
-                write("python-alias", "#!/bin/sh\necho 'Python was not found; run without arguments to install from the Microsoft Store' >&2\nexit 9009\n"),
-                write("python-real", "#!/bin/sh\necho 'Python 3.14.7'\n"),
-            )
-        };
-        #[cfg(windows)]
-        let (broken, working) = {
-            let write = |name: &str, body: &str| {
-                let path = dir.path().join(name);
-                std::fs::write(&path, body).unwrap();
-                path
-            };
-            (
-                write("python-alias.cmd", "@echo Python was not found; run without arguments to install from the Microsoft Store 1>&2\r\n@exit /b 9009\r\n"),
-                write("python-real.cmd", "@echo Python 3.14.7\r\n"),
-            )
-        };
-        let err = tool_starts(&broken).unwrap_err();
-        assert!(err.contains("Python was not found") && err.contains("--version` failed with exit"), "{err}");
-        assert!(tool_starts(&working).is_ok());
-        let err = tool_starts(&dir.path().join("does-not-exist")).unwrap_err();
-        assert!(err.contains("cannot be started"), "{err}");
-        // Built-in profiles on this machine: whatever is missing is reported with a reason.
-        for profile in builtin() {
-            for missing in missing_tools(&*profile) {
-                assert!(missing.contains('(') && missing.ends_with(')'), "{missing}");
-            }
-        }
-    }
-
     use super::*;
     use crate::state::RunRequest;
 
@@ -425,6 +392,104 @@ mod tests {
             },
             "claude".into(),
         )
+    }
+
+    /// A tool that is on `PATH` but does not start (the Windows Store `python` alias exits
+    /// 9009 with "Python was not found") is reported; a working one is not; a tool that hangs
+    /// is stopped by Cancel together with its descendants; a noisy one is bounded.
+    #[tokio::test]
+    async fn a_tool_on_path_must_also_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        #[cfg(unix)]
+        let shim = |name: &str, body: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        #[cfg(windows)]
+        let shim = |name: &str, body: &str| {
+            let path = dir.path().join(format!("{name}.cmd"));
+            std::fs::write(&path, body).unwrap();
+            path
+        };
+        #[cfg(unix)]
+        let (broken, working) = (
+            shim("python-alias", "echo 'Python was not found; run without arguments to install from the Microsoft Store' >&2\nexit 9009\n"),
+            shim("python-real", "echo 'Python 3.14.7'\n"),
+        );
+        #[cfg(windows)]
+        let (broken, working) = (
+            shim("python-alias", "@echo Python was not found; run without arguments to install from the Microsoft Store 1>&2\r\n@exit /b 9009\r\n"),
+            shim("python-real", "@echo Python 3.14.7\r\n"),
+        );
+        match tool_starts(&broken, &cancel).await {
+            ToolStart::Fails(err) => {
+                assert!(err.contains("Python was not found") && err.contains("--version` failed with exit"), "{err}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(tool_starts(&working, &cancel).await, ToolStart::Usable);
+        assert!(matches!(
+            tool_starts(&dir.path().join("does-not-exist"), &cancel).await,
+            ToolStart::Fails(e) if e.contains("cannot be started")
+        ));
+
+        // Built-in profiles on this machine: whatever is missing is reported with a reason.
+        for profile in builtin() {
+            for missing in missing_tools(&*profile, &cancel).await.unwrap() {
+                assert!(missing.contains('(') && missing.ends_with(')'), "{missing}");
+            }
+        }
+    }
+
+    /// Cancel during the tool check returns promptly and kills the tool's descendants too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_stops_a_hanging_tool_check_and_its_descendants() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("child.pid");
+        let hang = dir.path().join("python-hangs");
+        std::fs::write(&hang, format!("#!/bin/sh\nsleep 60 &\necho $! > '{}'\nwait\n", pidfile.display())).unwrap();
+        std::fs::set_permissions(&hang, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let pid_path = pidfile.clone();
+        tokio::spawn(async move {
+            for _ in 0..500 {
+                if pid_path.is_file() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            trigger.cancel();
+        });
+        let started = std::time::Instant::now();
+        assert_eq!(tool_starts(&hang, &cancel).await, ToolStart::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+        let pid = std::fs::read_to_string(&pidfile).unwrap().trim().to_string();
+        let mut alive = true;
+        for _ in 0..50 {
+            alive = std::process::Command::new("kill").args(["-0", &pid]).status().unwrap().success();
+            if !alive {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!alive, "descendant {pid} survived Cancel");
+
+        // A noisy tool is bounded by the runner instead of filling memory.
+        let noisy = dir.path().join("python-noisy");
+        // One 2 MB line, above the runner's per-line bound.
+        std::fs::write(&noisy, "#!/bin/sh\nhead -c 2000000 /dev/zero | tr '\\0' x\n").unwrap();
+        std::fs::set_permissions(&noisy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            tool_starts(&noisy, &CancellationToken::new()).await,
+            ToolStart::Fails(e) if e.contains("did not behave like a version query")
+        ));
     }
 
     #[test]

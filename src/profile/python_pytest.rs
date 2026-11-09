@@ -895,8 +895,9 @@ enum Classification {
 ///   or paths such as `lib/pkg`).
 ///
 /// `packages.find` without `include` declares every package below a `where` other than the
-/// root; at the root it declares nothing, because it would make every top-level directory
-/// production. A distribution name (`[project] name`, `[tool.poetry] name`, `[metadata] name`)
+/// root; at the root it declares nothing, and neither does a root pattern made only of
+/// wildcards (`include = ["*"]`), because either would make every top-level directory
+/// production, test support included. A distribution name (`[project] name`, `[tool.poetry] name`, `[metadata] name`)
 /// is not an import name: `published-project` may well ship the package `libcode`. It counts
 /// only when a package or module spelled like it exists in the checkout; otherwise the
 /// repository has to declare its packages. Read from the frozen checkout, never from the fix.
@@ -909,6 +910,9 @@ pub struct ProductionCode {
     roots: BTreeSet<(String, String)>,
     /// Exclusions of the same shape (`packages.find` `exclude`).
     excluded: BTreeSet<(String, String)>,
+    /// Root-level patterns made only of wildcards (`*`): they would make every top-level
+    /// directory production, test support included, so they declare nothing.
+    too_broad: BTreeSet<String>,
 }
 
 impl ProductionCode {
@@ -1065,6 +1069,10 @@ impl ProductionCode {
 
     fn add_root(&mut self, dir: &str, pattern: &str) {
         let dir = join_dir(dir, "");
+        if dir.is_empty() && pattern.chars().all(|c| c == '*' || c == '?') {
+            self.too_broad.insert(pattern.to_string());
+            return;
+        }
         if (dir.is_empty() || dir == "src") && identifier_re().is_match(pattern) {
             self.names.insert(pattern.to_string());
         } else {
@@ -1127,7 +1135,15 @@ impl ProductionCode {
              repository's lyra.toml; a `[project] name` counts only when a package or module spelled like it exists): \
              everything the regression loads outside them and `src/` is then frozen as test support",
             paths.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
-        )
+        ) + &if self.too_broad.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " (the declared pattern {} matches every top-level directory, test support included, so it was \
+                 ignored; name the packages)",
+                self.too_broad.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
+            )
+        }
     }
 }
 
@@ -1146,18 +1162,29 @@ fn is_name_pattern(text: &str) -> bool {
     !text.is_empty() && text.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '*' | '?'))
 }
 
-/// `fnmatch`-style matching with `*` and `?`.
+/// `fnmatch`-style matching with `*` and `?`, iterative: only the last `*` is ever
+/// backtracked to, so the work is bounded by `pattern.len() * text.len()` whatever the
+/// pattern (no exponential case for repeated stars).
 fn glob_match(pattern: &str, text: &str) -> bool {
-    fn go(p: &[u8], t: &[u8]) -> bool {
-        match (p.first(), t.first()) {
-            (None, None) => true,
-            (Some(b'*'), _) => go(&p[1..], t) || (!t.is_empty() && go(p, &t[1..])),
-            (Some(b'?'), Some(_)) => go(&p[1..], &t[1..]),
-            (Some(a), Some(b)) if a == b => go(&p[1..], &t[1..]),
-            _ => false,
+    let (p, t) = (pattern.as_bytes(), text.as_bytes());
+    let (mut pi, mut ti) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = Some((pi, ti));
+            pi += 1;
+        } else if let Some((star_pi, star_ti)) = star {
+            pi = star_pi + 1;
+            ti = star_ti + 1;
+            star = Some((star_pi, star_ti + 1));
+        } else {
+            return false;
         }
     }
-    go(pattern.as_bytes(), text.as_bytes())
+    p[pi..].iter().all(|&c| c == b'*')
 }
 
 /// `setup.cfg` values by `(section, key)`: comma- and line-separated items, with indented
@@ -3337,6 +3364,43 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             assert_eq!(classify(&files, path), want, "{path} with {files:?}");
         }
         assert!(glob_match("foo*", "foobar") && glob_match("f?o", "foo") && !glob_match("foo*", "barfoo"));
+        assert!(
+            glob_match("*", "")
+                && glob_match("a*b*c", "aXbYc")
+                && !glob_match("a*b*c", "aXbY")
+                && glob_match("**", "x")
+        );
+        // Repeated stars with a non-matching suffix: bounded work (the recursive matcher was
+        // exponential here), checked through the fix guard's own declaration path too.
+        let adversarial = format!("{}b", "a*".repeat(60));
+        let text = "a".repeat(4000);
+        let started = std::time::Instant::now();
+        assert!(!glob_match(&adversarial, &text));
+        let pyproject = format!("[tool.setuptools.packages.find]\ninclude = [\"{adversarial}\", \"calc\"]\n");
+        let files = HashMap::from([("pyproject.toml", pyproject.as_str())]);
+        let production = ProductionCode::declared(&reader(&files));
+        assert_eq!(production.classify(&format!("{text}/x.py"), "tests"), TestSupport);
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+
+        // A root pattern made only of wildcards would make every top-level directory, test
+        // support included, production: it declares nothing and says so.
+        let broad = "[tool.setuptools.packages.find]\ninclude = [\"*\"]\n";
+        let files = HashMap::from([("pyproject.toml", broad)]);
+        let production = ProductionCode::declared(&reader(&files));
+        assert_eq!(production.classify("support/helper.py", "tests"), Unknown);
+        let message = production.unknown_message(&BTreeSet::from(["support/helper.py".to_string()]));
+        assert!(message.contains("`*` matches every top-level directory"), "{message}");
+        let mixed = "[tool.setuptools.packages.find]\ninclude = [\"*\", \"?\", \"calc\"]\n";
+        let files = HashMap::from([("pyproject.toml", mixed)]);
+        let production = ProductionCode::declared(&reader(&files));
+        assert_eq!(production.classify("support/helper.py", "tests"), TestSupport);
+        assert_eq!(production.classify("calc/core.py", "tests"), Production);
+        // Below a dedicated directory a wildcard stays meaningful.
+        let files = HashMap::from([(
+            "pyproject.toml",
+            "[tool.setuptools.packages.find]\nwhere = [\"lib\"]\ninclude = [\"*\"]\n",
+        )]);
+        assert_eq!(ProductionCode::declared(&reader(&files)).classify("lib/any/x.py", "tests"), Production);
         assert_eq!(join_dir("./lib/", "."), "lib");
         // A fix to the reviewer's `foobar/core.py` passes the lock.
         let files = HashMap::from([
@@ -3803,6 +3867,60 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         check_fix_changes_with(&fix, &with_recorder, &read_checkpoint, &read_now).unwrap();
         let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
         assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "{out}");
+    }
+
+    /// End to end with real pytest, the reviewer's broad-declaration bypass: with
+    /// `include = ["*"]` the regression imports `EXPECTED` from `support/helper.py`. A
+    /// wildcard-only root pattern declares nothing, so S2 stops visibly; once the repository
+    /// names its package next to it, the helper is frozen and editing it, which would make the
+    /// unchanged failing test pass, is rejected.
+    #[tokio::test]
+    #[ignore = "needs a provisioned python3 with pytest on PATH"]
+    async fn a_wildcard_package_declaration_does_not_unfreeze_test_support() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("pytest.ini", "[pytest]\n");
+        write("pyproject.toml", "[tool.setuptools.packages.find]\ninclude = [\"*\"]\n");
+        write("calc/__init__.py", "def add(a, b):\n    return a - b\n");
+        write("support/__init__.py", "");
+        write("support/helper.py", "EXPECTED = 3\n");
+        write(FILE, "from calc import add\nfrom support.helper import EXPECTED\n\ndef test_issue_7_fails():\n    assert add(1, 2) == EXPECTED, \"sum must be three\"\n");
+        let timeout = Duration::from_secs(120);
+        let cancel = CancellationToken::new();
+        let spec = PythonPytest.reproduction_environment(PythonPytest.regression_command(&rec(), root).unwrap(), root);
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Failed, "{out}");
+        let err = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap_err();
+        assert!(err.contains("`support/helper.py`") && err.contains("`*` matches every top-level directory"), "{err}");
+
+        write("pyproject.toml", "[tool.setuptools.packages.find]\ninclude = [\"*\", \"calc\"]\n");
+        let loaded = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap();
+        assert_eq!(loaded, ["support/__init__.py", "support/helper.py"], "{out}");
+        let frozen: HashMap<String, String> =
+            [FILE, "pyproject.toml", "calc/__init__.py", "support/__init__.py", "support/helper.py"]
+                .into_iter()
+                .map(|p| (p.to_string(), std::fs::read_to_string(root.join(p)).unwrap()))
+                .collect();
+        let read_checkpoint = |p: &str| frozen.get(p).cloned();
+        let read_now = |p: &str| std::fs::read_to_string(root.join(p)).ok();
+        write("support/helper.py", "EXPECTED = -1\n");
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "the attack works without the lock: {out}");
+        let change = vec![("M".to_string(), "support/helper.py".to_string())];
+        for record in [&ReproRecord { frozen_inputs: loaded.clone(), ..rec() }, &rec()] {
+            let err = check_fix_changes_with(&change, record, &read_checkpoint, &read_now).unwrap_err();
+            assert!(err.contains("support/helper.py"), "{err}");
+        }
+        write("support/helper.py", &frozen["support/helper.py"]);
+        write("calc/__init__.py", "def add(a, b):\n    return a + b\n");
+        let fix = vec![("M".to_string(), "calc/__init__.py".to_string())];
+        check_fix_changes_with(&fix, &ReproRecord { frozen_inputs: loaded, ..rec() }, &read_checkpoint, &read_now)
+            .unwrap();
     }
 
     #[test]
