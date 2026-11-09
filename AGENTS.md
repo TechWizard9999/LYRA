@@ -4,7 +4,7 @@ This is the canonical guide for anyone (human or coding agent) changing this rep
 
 ## Purpose
 
-LYRA is a Rust harness around a coding-agent CLI (Claude Code or Codex). Given a path to an already-cloned repository (Rust via the built-in `rust-cargo` profile, Python via `python-pytest`; other languages through new execution profiles, PLAN §13) and a GitHub issue, it runs one fixed pipeline (intake → context → repro → rca → fix → verify → draft PR), enforces guards between the stages, saves every step under `~/.lyra/runs/<id>/`, and streams progress to a local dashboard. The design is [docs/PLAN.md](docs/PLAN.md); deferred designs are in [docs/RESEARCH.md](docs/RESEARCH.md).
+LYRA is a Rust harness around a coding-agent CLI (Claude Code or Codex). Given a path to an already-cloned repository (Rust via the built-in `rust-cargo` profile, Python via `python-pytest`, JavaScript/TypeScript with Vitest via `js-vitest`; other languages through new execution profiles, PLAN §13) and a GitHub issue, it runs one fixed pipeline (intake → context → repro → rca → fix → verify → draft PR), enforces guards between the stages, saves every step under `~/.lyra/runs/<id>/`, and streams progress to a local dashboard. The design is [docs/PLAN.md](docs/PLAN.md); deferred designs are in [docs/RESEARCH.md](docs/RESEARCH.md).
 
 ## Architecture map
 
@@ -18,7 +18,7 @@ LYRA is a Rust harness around a coding-agent CLI (Claude Code or Codex). Given a
 | `src/engine.rs` | fixed pipeline driver, one active run, retry-from-stage, cancel, interrupted marking |
 | `src/stages/` | S0..S6: `intake`, `context`, `repro`, `rca`, `fix`, `verify`, `pr` (`mod.rs` = `Stage` trait + `StageCtx`) |
 | `src/guards.rs` | universal repro/fix rules, expected-assertion match, scope accounting; runner rules live in the profile |
-| `src/profile/` | the `ExecutionProfile` contract, resolution and legacy mapping (`mod.rs`); the built-in profiles `rust-cargo` (`rust_cargo.rs`: Cargo/libtest commands, output parsing, Cargo guards and environment) and `python-pytest` (`python_pytest.rs`: pytest node ids, summary parsing, conftest/config locks, Python environment) |
+| `src/profile/` | the `ExecutionProfile` contract, resolution and legacy mapping (`mod.rs`); the built-in profiles `rust-cargo` (`rust_cargo.rs`: Cargo/libtest commands, output parsing, Cargo guards and environment) `python-pytest` (`python_pytest.rs`: pytest node ids, summary parsing, conftest/config locks, Python environment) and `js-vitest` (`js_vitest.rs`: the Vitest recorder, full-name selection, the declared-source allowlist, the linked `node_modules`) |
 | `src/prompts/profiles/` | per-profile prompt macros (`<profile id>.md`) that the stage prompts import as `profile` |
 | `src/providers/` | the `Agent` trait (`mod.rs`) and the Claude Code / Codex adapters |
 | `src/proc.rs` | subprocesses: hang-guard timeout, cancellation, process-tree kill, Windows `.cmd` shims |

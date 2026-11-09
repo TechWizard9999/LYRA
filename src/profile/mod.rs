@@ -14,6 +14,7 @@
 //! and is frozen for the run. Saved runs from before this contract carry no profile;
 //! [`for_state`] maps them explicitly to `rust-cargo`, the only profile that existed then.
 
+pub mod js_vitest;
 pub mod python_pytest;
 pub mod rust_cargo;
 
@@ -193,6 +194,13 @@ pub trait ExecutionProfile: Send + Sync {
     // --- environments --------------------------------------------------------------
 
     /// S2: where build outputs of the agent's worktree go (outside the worktree).
+    /// Makes the repository's installed dependencies reachable from a checkout created below
+    /// `checkout_parent` without changing anything inside it (the JavaScript profile links
+    /// `node_modules` there, where Node's upward resolution finds it). Called for the run's
+    /// worktree at Intake and for each verification checkout. Default: nothing to link.
+    fn link_dependencies(&self, _source_repo: &Path, _checkout_parent: &Path) -> Result<(), String> {
+        Ok(())
+    }
     fn reproduction_environment(&self, spec: CommandSpec, run_root: &Path) -> CommandSpec;
     /// Rejects a checkout location whose ancestors would inject toolchain configuration.
     fn check_environment_root(&self, checkout: &Path) -> Result<(), String>;
@@ -219,7 +227,7 @@ pub trait ExecutionProfile: Send + Sync {
 
 /// All built-in profiles, in detection order.
 pub fn builtin() -> Vec<Box<dyn ExecutionProfile>> {
-    vec![Box::new(rust_cargo::RustCargo), Box::new(python_pytest::PythonPytest)]
+    vec![Box::new(rust_cargo::RustCargo), Box::new(python_pytest::PythonPytest), Box::new(js_vitest::JsVitest)]
 }
 
 /// The built-in profile with this id.

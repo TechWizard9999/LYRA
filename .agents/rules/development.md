@@ -19,7 +19,7 @@ Complements the numbered rules in `AGENTS.md`; it does not repeat them.
 | Subprocesses | `proc::CommandSpec` + `run_blocking` / the async runner; never `std::process::Command` directly, so the hang guard, cancellation, and env scrubbing apply |
 | Git | `git.rs` helpers; they disable hooks and fsmonitor |
 | GitHub | `github.rs` (`gh`) |
-| Config | `config.rs`; per-repo `lyra.toml` may override `[verify]` only |
+| Config | `config.rs`; per-repo `lyra.toml` may override verify commands only (`[verify]` for `rust-cargo`, `[profiles.<id>.verify]`) plus profile declarations (`packages`, `sources`) |
 
 ## Errors
 
