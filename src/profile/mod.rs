@@ -164,6 +164,12 @@ pub trait ExecutionProfile: Send + Sync {
     fn loaded_test_inputs(&self, _output: &str, _rec: &ReproRecord, _worktree: &Path) -> Result<Vec<String>, String> {
         Ok(Vec::new())
     }
+    /// A file the toolchain itself writes while running the repro (Cargo's `Cargo.lock` in a
+    /// library that does not commit one), which the repro stage must not freeze as a test
+    /// input: a fix that changes dependencies legitimately rewrites it. Default: none.
+    fn is_toolchain_output(&self, _path: &str) -> bool {
+        false
+    }
 
     // --- guards -----------------------------------------------------------------------
 

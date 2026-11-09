@@ -188,7 +188,7 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
         .iter()
         .filter(|(status, _)| guards::is_new(status))
         .map(|(_, path)| guards::norm_path(path))
-        .filter(|path| *path != rec.test_file)
+        .filter(|path| *path != rec.test_file && !profile.is_toolchain_output(path))
         .chain(loaded)
         .collect();
     rec.frozen_inputs.sort();

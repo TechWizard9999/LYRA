@@ -134,20 +134,32 @@ const LOADED_END: &str = "LYRA-LOADED-END";
 const PYTEST_CONFIG_FILES: [&str; 4] = ["pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml"];
 
 /// Verification provenance: every project name (one per line on stdin) must be found inside
-/// the checkout under test (the working directory). `find_spec` locates a top-level name
-/// without importing it, so no project code runs. A name that is missing, resolves elsewhere
-/// (an editable install of another clone, a regular package shadowing a namespace package) or
-/// has any namespace portion outside the checkout fails, by name, with exit status 1.
-const PROVENANCE_CHECK: &str = "import importlib.util, os, sys
+/// the checkout under test (the working directory). The name is located on the import path
+/// without importing it, so no project code runs: `PathFinder` first, which searches
+/// `sys.path` exactly as an import would and ignores modules the interpreter already loaded at
+/// start-up (a project `types.py` is not mistaken for the standard library's), then the other
+/// finders (editable installs). A regular package or module must come from the checkout; a
+/// namespace package's first portion, which wins for every subpackage it holds, must be the
+/// checkout's (other portions installed by dependencies, as in `google.*`, are allowed). A name
+/// that is missing or resolves elsewhere (an editable install of another clone, a regular
+/// package shadowing a namespace package) fails, by name, with exit status 1.
+const PROVENANCE_CHECK: &str = "import importlib.machinery, importlib.util, os, sys
 root = os.path.realpath(os.getcwd())
+def inside(path):
+    path = os.path.realpath(path)
+    return path == root or path.startswith(root + os.sep)
 bad = []
 for name in [line.strip() for line in sys.stdin if line.strip()]:
-    spec = importlib.util.find_spec(name)
-    places = [spec.origin] if spec and spec.origin not in (None, 'built-in', 'frozen') else list(getattr(spec, 'submodule_search_locations', None) or [])
-    places = [os.path.realpath(p) for p in places]
-    inside = bool(places) and all(p == root or p.startswith(root + os.sep) for p in places)
-    print(name, '->', ', '.join(places) or 'not found')
-    if not inside:
+    try:
+        spec = importlib.machinery.PathFinder.find_spec(name) or importlib.util.find_spec(name)
+    except (ImportError, ValueError):
+        spec = None
+    if spec is not None and spec.origin not in (None, 'namespace', 'built-in', 'frozen'):
+        places = [spec.origin]
+    else:
+        places = list(getattr(spec, 'submodule_search_locations', None) or [])
+    print(name, '->', ', '.join(os.path.realpath(p) for p in places) or 'not found')
+    if not places or not inside(places[0]):
         bad.append(name)
 for name in bad:
     print('ERROR: ' + name + ' does not resolve inside the checkout under test')
@@ -506,56 +518,66 @@ pub fn is_generated_python_dir(relative: &Path, path: &Path) -> bool {
 }
 
 /// Every name the provenance step checks: the project's top-level packages and modules
-/// ([`importable_names`]) plus each top-level name the frozen regression imports that exists
-/// as project code anywhere in the checkout (for example a `lib/pkg` layout), which must then
-/// also resolve inside it. Third-party and standard-library imports are not project code.
+/// ([`importable_names`]) plus each top-level name the frozen regression imports, by an import
+/// statement (string literals are not imports), that exists as project code at the top of one
+/// of the checkout's import search paths: the root, `src/`, the directories of declared
+/// packages (`lib/` for `where = ["lib"]`) and pytest's `pythonpath`. A standard-library or
+/// third-party import, or a submodule that merely shares a name deeper in the tree, is not.
 pub fn provenance_names(root: &Path, test_file: &str) -> Vec<String> {
     let mut names = importable_names(root);
     if let Ok(source) = std::fs::read_to_string(root.join(test_file)) {
-        let tree = test_tree(test_file);
-        for module in imported_modules(&source) {
-            let Some(top) = module.split('.').next().filter(|t| !t.is_empty()) else { continue };
-            if identifier_re().is_match(top) && project_code_named(root, top, &tree) {
+        let read = |p: &str| std::fs::read_to_string(root.join(p)).ok();
+        let search = search_paths(&read);
+        for module in import_statement_modules(&source) {
+            let Some(top) = module.split('.').next().filter(|t| identifier_re().is_match(t)) else { continue };
+            if search.iter().any(|dir| project_code_at(&root.join(dir), top)) {
                 names.push(top.to_string());
             }
         }
     }
+    names.retain(|n| n != "__main__");
     names.sort();
     names.dedup();
     names
 }
 
-/// Whether the checkout holds project code called `name` (a directory with Python files or a
-/// `name.py`), outside the test tree, virtual environments and build output, up to four levels.
-fn project_code_named(root: &Path, name: &str, test_tree: &str) -> bool {
-    fn visit(root: &Path, dir: &Path, depth: usize, name: &str, test_tree: &str) -> bool {
-        let Ok(entries) = std::fs::read_dir(dir) else { return false };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let file_name = entry.file_name().to_string_lossy().into_owned();
-            let relative = path.strip_prefix(root).unwrap_or(&path);
-            let Ok(kind) = entry.file_type() else { continue };
-            if kind.is_file() && file_name == format!("{name}.py") {
-                return true;
-            }
-            if !kind.is_dir() || file_name.starts_with('.') || is_generated_python_dir(relative, &path) {
-                continue;
-            }
-            let rel = relative.to_string_lossy().replace('\\', "/");
-            if matches!(file_name.as_str(), "tests" | "test" | "testing") || (!test_tree.is_empty() && rel == test_tree)
-            {
-                continue;
-            }
-            if file_name == name && contains_python(&path, 0) {
-                return true;
-            }
-            if depth < 4 && visit(root, &path, depth + 1, name, test_tree) {
-                return true;
+/// The checkout's import search paths, repository-relative: the root, `src/`, every directory
+/// that holds declared packages, and the entries of pytest's `pythonpath` setting.
+fn search_paths(read: FileReader<'_>) -> BTreeSet<String> {
+    let mut dirs: BTreeSet<String> = ["".to_string(), "src".to_string()].into_iter().collect();
+    dirs.extend(ProductionCode::declared(read).roots.into_iter().map(|(dir, _)| dir));
+    dirs.extend(pytest_pythonpath(read));
+    dirs
+}
+
+/// pytest's `pythonpath` entries from `pytest.ini`, `pytest.toml`, `[tool.pytest.ini_options]`
+/// in `pyproject.toml`, `[tool:pytest]` in `setup.cfg` or `[pytest]` in `tox.ini`.
+fn pytest_pythonpath(read: FileReader<'_>) -> Vec<String> {
+    let mut entries = Vec::new();
+    if let Some(doc) = read("pyproject.toml").and_then(|t| t.parse::<toml::Value>().ok()) {
+        let value = doc.get("tool").and_then(|t| t.get("pytest")).and_then(|p| p.get("ini_options"));
+        match value.and_then(|o| o.get("pythonpath")) {
+            Some(toml::Value::String(s)) => entries.extend(s.split_whitespace().map(String::from)),
+            other => entries.extend(strings_of(other)),
+        }
+    }
+    for (file, section) in
+        [("pytest.ini", "pytest"), (".pytest.ini", "pytest"), ("setup.cfg", "tool:pytest"), ("tox.ini", "pytest")]
+    {
+        let Some(text) = read(file) else { continue };
+        for (key, values) in setup_cfg_values(&text) {
+            if key.0 == section && key.1 == "pythonpath" {
+                entries.extend(values.iter().flat_map(|v| v.split_whitespace()).map(String::from));
             }
         }
-        false
     }
-    visit(root, root, 1, name, test_tree)
+    entries.iter().map(|e| join_dir(e, "")).collect()
+}
+
+/// Whether `dir` holds project code called `name` at its top: `name.py`, or a directory
+/// `name/` with Python source (a package or a namespace portion).
+fn project_code_at(dir: &Path, name: &str) -> bool {
+    dir.join(format!("{name}.py")).is_file() || (dir.join(name).is_dir() && contains_python(&dir.join(name), 0))
 }
 
 /// Whether a directory holds Python source at any depth (up to eight levels, skipping hidden
@@ -591,8 +613,8 @@ fn contains_python(dir: &Path, depth: usize) -> bool {
 pub fn importable_names(root: &Path) -> Vec<String> {
     const NOT_PROJECT_DIRS: [&str; 8] =
         ["tests", "test", "testing", "docs", "doc", "examples", "scripts", "benchmarks"];
-    const NOT_PROJECT_MODULES: [&str; 7] =
-        ["setup", "conftest", "noxfile", "fabfile", "tasks", "manage", "sitecustomize"];
+    const NOT_PROJECT_MODULES: [&str; 8] =
+        ["setup", "conftest", "noxfile", "fabfile", "tasks", "manage", "sitecustomize", "__main__"];
     let mut names = Vec::new();
     for base in [root.to_path_buf(), root.join("src")] {
         let Ok(entries) = std::fs::read_dir(&base) else { continue };
@@ -643,6 +665,16 @@ fn import_keyword() -> &'static Regex {
 pub fn imported_modules(source: &str) -> Vec<String> {
     static STRING: OnceLock<Regex> = OnceLock::new();
     let string_re = STRING.get_or_init(|| Regex::new(r#"["']([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)["']"#).unwrap());
+    let mut modules = import_statement_modules(source);
+    modules.extend(string_re.captures_iter(source).map(|c| c[1].to_string()));
+    modules.sort();
+    modules.dedup();
+    modules
+}
+
+/// The modules named by import statements only (see [`imported_modules`], which also counts
+/// dotted names in string literals).
+fn import_statement_modules(source: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current = String::new();
     let mut depth = 0i64;
@@ -685,7 +717,6 @@ pub fn imported_modules(source: &str) -> Vec<String> {
             }
         }
     }
-    modules.extend(string_re.captures_iter(source).map(|c| c[1].to_string()));
     modules.retain(|m| valid(m));
     modules.sort();
     modules.dedup();
@@ -1566,15 +1597,16 @@ pub fn is_test_path(path: &str) -> bool {
         || name.ends_with("_test.py")
 }
 
-/// The directory tree whose infrastructure the frozen test depends on: the deepest ancestor
-/// named `tests`, `test` or `testing`, otherwise the test module's own directory (`""` for the
-/// repository root).
+/// The directory tree of test code around the frozen test: the deepest ancestor named
+/// `tests`, `test` or `testing`. A test that lives next to the code it tests
+/// (`textkit/test_lists.py`) has none: its directory is production code, so only test-named
+/// modules, `conftest.py` and test or fixture directories there count as test infrastructure.
 fn test_tree(test_file: &str) -> String {
     let parts: Vec<&str> = test_file.split('/').collect();
     let dirs = &parts[..parts.len().saturating_sub(1)];
     match dirs.iter().rposition(|d| matches!(*d, "tests" | "test" | "testing")) {
         Some(i) => dirs[..=i].join("/"),
-        None => dirs.join("/"),
+        None => String::new(),
     }
 }
 
@@ -2333,7 +2365,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         assert!(check("tests/test_other.py", "M").is_err(), "every test module is frozen");
         assert!(check("textkit/__init__.py", "M").is_ok(), "production package initializers may change");
         assert_eq!(test_tree("src/pkg/tests/unit/test_x.py"), "src/pkg/tests");
-        assert_eq!(test_tree("pkg/test_x.py"), "pkg");
+        assert_eq!(test_tree("pkg/test_x.py"), "", "a test next to the code does not make the package test code");
         assert_eq!(test_tree("test_x.py"), "");
     }
 
@@ -2831,9 +2863,15 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             // (`build/lib/...`) is still skipped by its markers.
             ("src/build/parser.py", ""),
             ("build/lib/generated/__init__.py", ""),
-            // Imported by the regression and found through its nested layout under `lib/`.
+            // Imported by the regression from `lib/`, which pytest's `pythonpath` puts on the path.
+            ("pytest.ini", "[pytest]\npythonpath = lib\n"),
             ("lib/vendor/deep/mod.py", ""),
-            (FILE, "from acme.widget import mod\nimport vendor.deep.mod\nimport os\n"),
+            // Names that are not project code at a search path's top: a stdlib import next to a
+            // nested `json.py`, a quoted word next to a nested `status.py`, a root `__main__.py`.
+            ("src/pkg/serializers/json.py", ""),
+            ("src/pkg/status.py", ""),
+            ("__main__.py", ""),
+            (FILE, "import json\nfrom acme.widget import mod\nimport vendor.deep.mod\nimport os\nSTATE = \"status\"\n"),
         ] {
             let path = root.join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2951,6 +2989,8 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         };
         write("src/nspkg/module.py", "");
         write("lib/libpkg/__init__.py", "");
+        // `lib/` is a search path because the repository declares packages there.
+        write("pyproject.toml", "[tool.setuptools.packages.find]\nwhere = [\"lib\"]\ninclude = [\"libpkg\"]\n");
         write("tools/release.py", "");
         write("tests/test_helpers.py", "");
         write(
@@ -2961,7 +3001,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         assert!(names.contains(&"nspkg".to_string()), "PEP 420 namespace package under src/: {names:?}");
         assert!(
             names.contains(&"libpkg".to_string()),
-            "project code the regression imports, outside root/src: {names:?}"
+            "project code the regression imports from a declared search path: {names:?}"
         );
         for not_project in ["os", "attrs", "tools", "test_helpers"] {
             assert!(!names.contains(&not_project.to_string()), "{not_project}: {names:?}");
@@ -4009,6 +4049,143 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             .unwrap();
         let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
         assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "{out}");
+    }
+
+    /// Real Python, the reviewer's false-failure cases for the `imports` step: a shared
+    /// `google.*` namespace whose other portion a dependency installs elsewhere passes, as do a
+    /// stdlib import next to a nested `json.py`, a quoted word next to a nested module and a
+    /// root `__main__.py`; a regular `google` package elsewhere that shadows the namespace still
+    /// fails by name. (A project module named like one the interpreter imports at start-up,
+    /// such as a root `types.py`, stops Python itself from starting, so it never reaches here.)
+    #[tokio::test]
+    #[ignore = "needs a provisioned python3 with pytest on PATH"]
+    async fn the_imports_step_accepts_shared_namespaces_and_startup_module_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let timeout = Duration::from_secs(120);
+        let cancel = CancellationToken::new();
+        let write = |path: std::path::PathBuf, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let checkout = dir.path().join("checkout");
+        write(checkout.join("src/google/cloud/mylib/__init__.py"), "def answer():\n    return 42\n");
+        write(checkout.join("__main__.py"), "print('cli')\n");
+        write(checkout.join("src/mylib_tools/serializers/json.py"), "");
+        write(checkout.join("pytest.ini"), "[pytest]\n");
+        write(
+            checkout.join(FILE),
+            "import json\nfrom google.cloud.mylib import answer\n\ndef test_issue_7_fails():\n    assert answer() == 42, \"status\"\n",
+        );
+        let external = dir.path().join("site");
+        write(external.join("google/auth/__init__.py"), "");
+
+        let venv = dir.path().join("venv");
+        let made = proc::run(
+            &CommandSpec::new(PYTHON, dir.path()).args(["-m", "venv", "--without-pip"]).arg(venv.to_string_lossy()),
+            timeout,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert!(made.success(), "{}", made.combined());
+        let venv_python = if cfg!(windows) { venv.join("Scripts/python.exe") } else { venv.join("bin/python") };
+        let purelib = proc::run(
+            &CommandSpec::new(venv_python.to_string_lossy(), dir.path())
+                .args(["-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"]),
+            timeout,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        let purelib = std::path::PathBuf::from(purelib.stdout.trim());
+        write(purelib.join("external.pth"), &format!("{}\n", external.display()));
+        let with_venv = |mut spec: CommandSpec| {
+            spec.program = venv_python.to_string_lossy().into_owned();
+            spec
+        };
+
+        let steps = PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), &checkout).unwrap();
+        assert_eq!(steps[0].name, "imports");
+        let names = steps[0].spec.stdin.clone().unwrap();
+        assert_eq!(names, "google\nmylib_tools\n", "no json, status or __main__");
+        let env_root = dir.path().join("env");
+        let run = || async {
+            proc::run(&with_venv(PythonPytest.command_environment(steps[0].spec.clone(), &env_root)), timeout, &cancel)
+                .await
+                .unwrap()
+        };
+        let check = run().await;
+        assert!(check.success(), "shared namespace and start-up names pass: {}", check.combined());
+
+        // A regular `google` package elsewhere shadows the checkout's namespace: still caught.
+        write(external.join("google/__init__.py"), "");
+        let check = run().await;
+        assert!(
+            !check.success() && check.stdout.contains("ERROR: google does not resolve inside the checkout"),
+            "{}",
+            check.combined()
+        );
+    }
+
+    /// End to end with real pytest: a test placed next to the code (`textkit/test_issue_7.py`,
+    /// no `tests/` directory) does not turn its package into test code. The recorder freezes
+    /// nothing from `textkit/`, and the fix to `textkit/lists.py` is accepted and passes.
+    #[tokio::test]
+    #[ignore = "needs a provisioned python3 with pytest on PATH"]
+    async fn a_test_next_to_the_code_leaves_its_package_editable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        const COLOCATED: &str = "textkit/test_issue_7.py";
+        const COLOCATED_ID: &str = "textkit/test_issue_7.py::test_issue_7_fails";
+        write("pytest.ini", "[pytest]\n");
+        write("pyproject.toml", "[tool.setuptools]\npackages = [\"textkit\"]\n");
+        write("textkit/__init__.py", "from .lists import first\n");
+        write("textkit/lists.py", "def first(items):\n    return items[-1]\n");
+        write("textkit/test_lists.py", "def test_existing():\n    assert True\n");
+        write(COLOCATED, "from textkit.lists import first\n\ndef test_issue_7_fails():\n    assert first([1, 2]) == 1, \"first must return the first item\"\n");
+        let record = ReproRecord {
+            test_file: COLOCATED.into(),
+            test_name: COLOCATED_ID.into(),
+            command: regression_line(COLOCATED_ID),
+            ..rec()
+        };
+        let timeout = Duration::from_secs(120);
+        let cancel = CancellationToken::new();
+        let spec = PythonPytest.reproduction_environment(PythonPytest.regression_command(&record, root).unwrap(), root);
+        let run = proc::run(&spec, timeout, &cancel).await.unwrap();
+        let out = run.combined();
+        assert_eq!(classify_pytest(&out, COLOCATED_ID), RegressionOutcome::Failed, "{out}");
+        let loaded = PythonPytest.loaded_test_inputs(&out, &record, root).unwrap();
+        assert!(loaded.iter().all(|p| !p.starts_with("textkit/") || p.contains("test_")), "{loaded:?}");
+        assert!(!loaded.contains(&"textkit/lists.py".to_string()), "{loaded:?}");
+
+        let frozen: HashMap<String, String> = [
+            COLOCATED,
+            "pytest.ini",
+            "pyproject.toml",
+            "textkit/__init__.py",
+            "textkit/lists.py",
+            "textkit/test_lists.py",
+        ]
+        .into_iter()
+        .map(|p| (p.to_string(), std::fs::read_to_string(root.join(p)).unwrap()))
+        .collect();
+        let read_checkpoint = |p: &str| frozen.get(p).cloned();
+        let read_now = |p: &str| std::fs::read_to_string(root.join(p)).ok();
+        write("textkit/lists.py", "def first(items):\n    return items[0]\n");
+        let record = ReproRecord { frozen_inputs: loaded, ..record };
+        let fix = vec![("M".to_string(), "textkit/lists.py".to_string())];
+        check_fix_changes_with(&fix, &record, &read_checkpoint, &read_now).unwrap();
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, COLOCATED_ID), RegressionOutcome::Passed, "{out}");
+        // The neighbouring test module stays frozen.
+        let change = vec![("M".to_string(), "textkit/test_lists.py".to_string())];
+        assert!(check_fix_changes_with(&change, &record, &read_checkpoint, &read_now).is_err());
     }
 
     #[test]

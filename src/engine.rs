@@ -345,10 +345,6 @@ impl Engine {
     async fn drive(self: &Arc<Self>, mut state: RunState, sink: EventSink, cancel: CancellationToken) -> Result<()> {
         let rd = self.run_dir(&state.id)?;
         let config = self.config.clone().with_repo_overrides(&state.request.repo)?;
-        sink.info(format!(
-            "effective verification: build={}; test={}; fmt={}",
-            config.verify.build, config.verify.test, config.verify.fmt
-        ));
         let pcfg = config.provider(&state.provider)?.clone();
         let agent: SharedAgent = make_agent(&state.provider, &pcfg);
 

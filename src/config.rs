@@ -22,10 +22,15 @@ pub struct Config {
     /// Per-profile settings, `[profiles.<profile id>]`.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, ProfileConfig>,
-    /// `[verify]` from the target repository's `lyra.toml`, applied to whichever profile the
-    /// repository resolves to. Never read from or written to `config.toml`.
+    /// `[verify]` from the target repository's `lyra.toml`: like the operator's `[verify]`,
+    /// it predates execution profiles and applies to `rust-cargo` only, so a mixed repository
+    /// never runs its Cargo commands as another profile's suite. Never read from or written
+    /// to `config.toml`.
     #[serde(skip)]
     pub repository_verify: VerifyCommands,
+    /// `[profiles.<id>.verify]` from the target repository's `lyra.toml`, per profile.
+    #[serde(skip)]
+    pub repository_profiles: BTreeMap<String, VerifyCommands>,
 }
 
 /// Verify commands for one profile; `None` means "not set at this level".
@@ -140,15 +145,24 @@ impl Default for Config {
             verify: VerifyConfig::default(),
             profiles: BTreeMap::new(),
             repository_verify: VerifyCommands::default(),
+            repository_profiles: BTreeMap::new(),
         }
     }
 }
 
-/// Only the `[verify]` table may be overridden per repository here; the python-pytest profile
-/// additionally reads `packages` under `[profiles.python-pytest]` from the same file itself.
+/// Only verify commands may be overridden per repository here: `[verify]` (`rust-cargo`) and
+/// `[profiles.<id>.verify]`; the python-pytest profile additionally reads `packages` under
+/// `[profiles.python-pytest]` from the same file itself.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RepoOverrides {
+    verify: Option<VerifyCommands>,
+    profiles: BTreeMap<String, RepoProfile>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RepoProfile {
     verify: Option<VerifyCommands>,
 }
 
@@ -213,16 +227,22 @@ impl Config {
             if let Some(v) = o.verify {
                 self.repository_verify = v;
             }
+            self.repository_profiles = o.profiles.into_iter().filter_map(|(id, p)| p.verify.map(|v| (id, v))).collect();
         }
         Ok(self)
     }
 
     /// The verify commands for a run with this execution profile; `None` leaves the step to
-    /// the profile's default. Precedence: repository `lyra.toml`, operator
-    /// `[profiles.<id>.verify]`, operator `[verify]` (`rust-cargo` only).
+    /// the profile's default. Precedence: repository `[profiles.<id>.verify]`, repository
+    /// `[verify]` (`rust-cargo` only), operator `[profiles.<id>.verify]`, operator `[verify]`
+    /// (`rust-cargo` only). The unscoped `[verify]` tables predate execution profiles and hold
+    /// Cargo commands, so they never reach another profile.
     pub fn verify_commands(&self, profile_id: &str) -> VerifyCommands {
+        let rust = profile_id == crate::profile::rust_cargo::ID;
+        let repo_profile = self.repository_profiles.get(profile_id).cloned().unwrap_or_default();
+        let repo_legacy = if rust { self.repository_verify.clone() } else { VerifyCommands::default() };
         let operator = self.profiles.get(profile_id).map(|p| p.verify.clone()).unwrap_or_default();
-        let legacy = if profile_id == crate::profile::rust_cargo::ID {
+        let legacy = if rust {
             VerifyCommands {
                 build: Some(self.verify.build.clone()),
                 test: Some(self.verify.test.clone()),
@@ -231,15 +251,16 @@ impl Config {
         } else {
             VerifyCommands::default()
         };
-        let pick = |repo: &Option<String>, operator: &Option<String>, legacy: &Option<String>| {
-            repo.clone().or_else(|| operator.clone()).or_else(|| legacy.clone())
-        };
-        let repo = &self.repository_verify;
-        VerifyCommands {
-            build: pick(&repo.build, &operator.build, &legacy.build),
-            test: pick(&repo.test, &operator.test, &legacy.test),
-            fmt: pick(&repo.fmt, &operator.fmt, &legacy.fmt),
-        }
+        let levels = [&repo_profile, &repo_legacy, &operator, &legacy];
+        let pick = |field: fn(&VerifyCommands) -> &Option<String>| levels.iter().find_map(|l| field(l).clone());
+        VerifyCommands { build: pick(|v| &v.build), test: pick(|v| &v.test), fmt: pick(|v| &v.fmt) }
+    }
+
+    /// One line describing the verify commands a profile will use, for the run log.
+    pub fn describe_verify_commands(&self, profile_id: &str) -> String {
+        let v = self.verify_commands(profile_id);
+        let show = |c: &Option<String>| c.clone().unwrap_or_else(|| "profile default".into());
+        format!("build={}; test={}; fmt={}", show(&v.build), show(&v.test), show(&v.fmt))
     }
 
     pub fn provider(&self, id: &str) -> Result<&ProviderConfig> {
@@ -316,11 +337,10 @@ mod tests {
         assert_eq!(rust.test.as_deref(), Some("cargo test -p core"));
         assert_eq!(rust.build.as_deref(), Some("cargo build --workspace"));
         assert_eq!(cfg.run.provider, "claude");
-        // The repository's table applies to whichever profile the repository resolves to,
-        // and the Cargo defaults never leak into another profile.
+        // The repository's unscoped table holds Cargo commands: it applies to rust-cargo only,
+        // and neither it nor the Cargo defaults leak into another profile.
         let python = cfg.verify_commands("python-pytest");
-        assert_eq!(python.test.as_deref(), Some("cargo test -p core"));
-        assert_eq!((python.build, python.fmt), (None, None));
+        assert_eq!((python.build, python.test, python.fmt), (None, None, None));
     }
 
     #[test]
@@ -339,10 +359,32 @@ mod tests {
         assert_eq!(rust.test.as_deref(), Some("cargo nextest run"));
         assert_eq!(rust.fmt.as_deref(), Some("true"), "a profile table beats the legacy table");
         assert_eq!(rust.build.as_deref(), Some("cargo build --workspace"));
-        // The default file still parses and, with a repository override, the repository wins.
-        let mut with_repo = cfg.clone();
-        with_repo.repository_verify.test = Some("python3 -m pytest tests/unit".into());
+        // A repository's per-profile table wins for that profile; its unscoped `[verify]` holds
+        // Cargo commands and applies to rust-cargo only, so a mixed repository run with the
+        // Python profile never runs `cargo test` as its suite.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lyra.toml"),
+            "[verify]\ntest = \"cargo test --workspace -p core\"\n\
+             [profiles.python-pytest]\npackages = [\"app\"]\n\
+             [profiles.python-pytest.verify]\ntest = \"python3 -m pytest tests/unit\"\n",
+        )
+        .unwrap();
+        let with_repo = cfg.clone().with_repo_overrides(dir.path()).unwrap();
         assert_eq!(with_repo.verify_commands("python-pytest").test.as_deref(), Some("python3 -m pytest tests/unit"));
+        assert_eq!(with_repo.verify_commands("rust-cargo").test.as_deref(), Some("cargo test --workspace -p core"));
+        std::fs::write(dir.path().join("lyra.toml"), "[verify]\ntest = \"cargo test --workspace\"\n").unwrap();
+        let mixed = cfg.clone().with_repo_overrides(dir.path()).unwrap();
+        assert_eq!(
+            mixed.verify_commands("python-pytest").test.as_deref(),
+            Some("python3 -m pytest -q tests"),
+            "the repository's Cargo commands never reach the Python profile"
+        );
+        assert_eq!(mixed.verify_commands("rust-cargo").test.as_deref(), Some("cargo test --workspace"));
+        assert_eq!(
+            Config::default().describe_verify_commands("python-pytest"),
+            "build=profile default; test=profile default; fmt=profile default"
+        );
         assert!(Config::parse(DEFAULT_CONFIG_TOML).unwrap().profiles.is_empty());
     }
 

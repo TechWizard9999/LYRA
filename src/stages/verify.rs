@@ -183,6 +183,11 @@ async fn verify_checkout(
     assert_checkout_unchanged(profile, worktree, candidate, &snapshot)?;
     guard(profile.check_environment(env_root))?;
 
+    ctx.events.info(format!(
+        "effective verification ({}): {}",
+        profile.id(),
+        ctx.config.describe_verify_commands(profile.id())
+    ));
     let steps = profile
         .verification_steps(&ctx.config.verify_commands(profile.id()), rec, worktree)
         .map_err(|message| StageError::fatal(ErrorKind::Config, message))?;

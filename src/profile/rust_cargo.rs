@@ -45,6 +45,9 @@ impl ExecutionProfile for RustCargo {
     fn required_tools(&self) -> &'static [&'static str] {
         &["cargo", "rustfmt"]
     }
+    fn is_toolchain_output(&self, path: &str) -> bool {
+        crate::guards::base_name(path) == "Cargo.lock"
+    }
     fn language(&self) -> &'static str {
         "Rust"
     }
@@ -1111,6 +1114,17 @@ test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; fini
 
     fn reader<'a>(map: &'a HashMap<&'a str, &'a str>) -> impl Fn(&str) -> Option<String> + 'a {
         move |p: &str| map.get(p).map(|s| s.to_string())
+    }
+
+    /// Cargo writes `Cargo.lock` while running the repro in a library that does not commit
+    /// one; it is the toolchain's output, not a test input, so a later dependency fix may
+    /// rewrite it. Python has no such file.
+    #[test]
+    fn cargo_lock_is_toolchain_output_not_a_repro_input() {
+        use crate::profile::python_pytest::PythonPytest;
+        assert!(RustCargo.is_toolchain_output("Cargo.lock") && RustCargo.is_toolchain_output("crates/x/Cargo.lock"));
+        assert!(!RustCargo.is_toolchain_output("tests/fixtures/frame.bin"));
+        assert!(!PythonPytest.is_toolchain_output("Cargo.lock"));
     }
 
     #[test]
