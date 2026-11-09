@@ -41,6 +41,7 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
     let n = issue_number(&ctx.state);
 
     // 1. Inputs from earlier stages.
+    let profile = ctx.profile()?;
     let rec = ctx.state.require_frozen_repro()?.clone();
     let rca_json = ctx
         .run_dir
@@ -70,7 +71,7 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
     let prompt = ctx
         .render("fix.md", assets::FIX_PROMPT, values)
         .map_err(|e| StageError::fatal(ErrorKind::Config, format!("rendering fix prompt: {e:#}")))?;
-    let task = ctx.agent_task(StageId::Fix, prompt, Mode::Edit, Some(assets::schema(assets::FIX_SCHEMA)));
+    let task = ctx.agent_task(StageId::Fix, prompt, Mode::Edit, Some(assets::schema(assets::FIX_SCHEMA)))?;
     ctx.events.info(format!("fix: asking the agent to make {} pass", rec.test_name));
     let agent = ctx.agent.clone();
     let events = ctx.events.clone();
@@ -103,7 +104,7 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
     if changes.is_empty() {
         return Err(StageError::new(ErrorKind::Guard, "fix produced no changes").with_details(transcript));
     }
-    if let Err(msg) = guards::check_fix_changes(&changes, &rec, &worktree, &checkpoint) {
+    if let Err(msg) = guards::check_fix_changes(&changes, &rec, &worktree, &checkpoint, &*profile) {
         let listing = changes.iter().map(|(s, p)| format!("{s}\t{p}")).collect::<Vec<_>>().join("\n");
         let diff = git::diff(&worktree, &checkpoint, None).unwrap_or_default();
         let rel = write(
@@ -119,7 +120,7 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
     git::run(&worktree, &["add", "-A"]).map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
     let diff = git::diff(&worktree, &checkpoint, None).map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
     write(ctx, "40-fix/fix.diff", format!("{diff}\n"))?;
-    let scope = guards::scope_from_diff(&diff, &culprits);
+    let scope = guards::scope_from_diff(&diff, &culprits, &|path| profile.is_test_path(path));
     for w in &scope.warnings {
         ctx.events.warn(format!("fix: {w}"));
     }
@@ -223,6 +224,7 @@ mod tests {
         let scope = guards::scope_from_diff(
             "diff --git a/src/parser.rs b/src/parser.rs\n@@ -1 +1 @@\n-a\n+b\n",
             &["src/other.rs".into()],
+            &crate::profile::rust_cargo::is_test_path,
         );
         let md = notes_markdown(&answer, &scope);
         assert!(md.contains("Fixed bounds check"));

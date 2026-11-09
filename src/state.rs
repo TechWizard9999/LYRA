@@ -3,6 +3,7 @@
 use crate::error::{ErrorKind, StageError, StopReason};
 use crate::events::StageId;
 use crate::guards::{self, ReproRecord};
+use crate::profile::{self, ResolvedProfile};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -113,6 +114,10 @@ pub struct RunState {
     /// Repository owning the issue (may differ from a local fork's origin).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue_slug: Option<String>,
+    /// Execution profile resolved by intake and frozen for the run (PLAN §13). Absent in
+    /// runs written before profiles existed; `profile::for_state` maps those to `rust-cargo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ResolvedProfile>,
     /// Commits recorded after S2 (test) and S4 (fix).
     #[serde(default)]
     pub checkpoints: BTreeMap<StageId, String>,
@@ -157,6 +162,7 @@ impl RunState {
             issue_number: None,
             repo_slug: None,
             issue_slug: None,
+            profile: None,
             checkpoints: BTreeMap::new(),
             frozen_repro: None,
             verified_commit: None,
@@ -202,12 +208,21 @@ impl RunState {
     pub fn require_frozen_repro(&self) -> Result<&ReproRecord, StageError> {
         let retry = |reason: &str| StageError::new(ErrorKind::Guard, format!("{reason}; retry from repro"));
         let rec = self.frozen_repro.as_ref().ok_or_else(|| retry("frozen reproduction record is missing"))?;
-        guards::validate_repro_record(rec).map_err(|reason| retry(&reason))?;
+        let profile = self.profile().map_err(|reason| StageError::new(ErrorKind::Config, reason))?;
+        if rec.profile.as_deref().is_some_and(|id| id != profile.id()) {
+            return Err(retry("frozen reproduction record belongs to a different execution profile"));
+        }
+        guards::validate_repro_record(rec, &*profile).map_err(|reason| retry(&reason))?;
         let checkpoint = self.checkpoints.get(&StageId::Repro).ok_or_else(|| retry("repro checkpoint is missing"))?;
         if rec.frozen_commit.as_ref() != Some(checkpoint) {
             return Err(retry("frozen reproduction record does not match the S2 checkpoint"));
         }
         Ok(rec)
+    }
+
+    /// The execution profile this run was resolved with (legacy runs: `rust-cargo`).
+    pub fn profile(&self) -> Result<Box<dyn profile::ExecutionProfile>, String> {
+        profile::for_state(self)
     }
 
     pub fn stage_status(&self, stage: StageId) -> StageStatus {
@@ -234,6 +249,10 @@ impl RunState {
         }
         if from <= StageId::Repro {
             self.frozen_repro = None;
+        }
+        if from <= StageId::Intake {
+            // Intake re-resolves the profile from the worktree it creates.
+            self.profile = None;
         }
         if from <= StageId::Pr {
             self.pr_url = None;
@@ -308,6 +327,51 @@ mod tests {
         let loaded: RunState = serde_json::from_value(value).unwrap();
         let error = loaded.require_frozen_repro().unwrap_err();
         assert!(error.message.contains("retry from repro"));
+        assert!(loaded.profile.is_none());
+        assert_eq!(loaded.profile().unwrap().id(), "rust-cargo", "legacy runs map to the only profile that existed");
+    }
+
+    #[test]
+    fn profile_is_saved_with_the_run_and_cleared_only_by_an_intake_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = RunState::new("r1".into(), req(), "claude".into());
+        st.profile = Some(ResolvedProfile {
+            id: "rust-cargo".into(),
+            version: profile::CONTRACT_VERSION,
+            project_dir: String::new(),
+            evidence: vec!["Cargo.toml".into()],
+        });
+        st.save(dir.path()).unwrap();
+        let back = RunState::load(dir.path()).unwrap();
+        assert_eq!(back.profile, st.profile);
+        let text = std::fs::read_to_string(RunState::path(dir.path())).unwrap();
+        assert!(text.contains("\"id\": \"rust-cargo\""));
+        st.invalidate_from(StageId::Context);
+        assert!(st.profile.is_some());
+        st.invalidate_from(StageId::Intake);
+        assert!(st.profile.is_none());
+    }
+
+    #[test]
+    fn frozen_record_from_another_profile_or_unknown_profile_cannot_certify() {
+        let mut state = RunState::new("r".into(), req(), "claude".into());
+        let mut record = frozen_record();
+        record.profile = Some("python-pytest".into());
+        state.frozen_repro = Some(record);
+        state.checkpoints.insert(StageId::Repro, "s2".into());
+        let error = state.require_frozen_repro().unwrap_err();
+        assert!(error.message.contains("different execution profile"), "{error:?}");
+        state.frozen_repro = Some(frozen_record());
+        assert!(state.require_frozen_repro().is_ok());
+        state.profile = Some(ResolvedProfile {
+            id: "python-pytest".into(),
+            version: profile::CONTRACT_VERSION,
+            project_dir: String::new(),
+            evidence: vec![],
+        });
+        let error = state.require_frozen_repro().unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Config);
+        assert!(error.message.contains("python-pytest"), "{error:?}");
     }
 
     #[test]

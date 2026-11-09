@@ -8,7 +8,7 @@ description: Change the behaviour of one pipeline stage (intake, context, repro,
 ## Read first
 - `docs/PLAN.md` §3 for the stage you are changing (and §3.x for repro/rca/fix/verify/pr).
 - `.agents/rules/development.md` and `.agents/rules/security.md`.
-- The stage file, its prompt in `src/prompts/`, its schema in `src/schemas/`, and its guard functions in `src/guards.rs`.
+- The stage file, its prompt in `src/prompts/`, its schema in `src/schemas/`, its universal guard functions in `src/guards.rs`, and the runner-specific rules in the execution profile (`src/profile/`, `rust-cargo` today).
 
 ## Know the model
 - Each stage takes `StageCtx` (run dir, mutable `RunState`, config, agent, events, cancel token) and returns `StageOutcome`: `Completed`, `Stopped { reason, message }`, or `Failed { error }`.
@@ -19,7 +19,7 @@ description: Change the behaviour of one pipeline stage (intake, context, repro,
 
 ## Steps
 1. Decide failed vs stopped. Stopped is only for a deliberate wall (`NotReproduced`, `RcaUnresolved`, `VerifyFailed`, `PolicyNotAcknowledged`, `NoPushAccess`). Everything else is `Failed` with the right `ErrorKind`. A new `StopReason` is a contract change; use `change-contract`.
-2. Put rule logic (diff checks, output parsing, matching) in `guards.rs` as pure functions with tests (`add-guard`), not inline in the stage.
+2. Put rule logic (diff checks, output parsing, matching) in pure functions with tests (`add-guard`), not inline in the stage: language-independent rules in `guards.rs`, anything that names Cargo or a test runner's output in the profile. Stages call the `ExecutionProfile` contract and never name Cargo.
 3. Prompt text changes go in `src/prompts/<stage>.md`; keep untrusted input inside `BEGIN/END UNTRUSTED DATA` blocks. Output shape changes go in `src/schemas/<stage>.schema.json` and the Rust type that deserializes it (`add-prompt-or-schema`).
 4. New files go through `RunDir` under `artifacts/<NN-stage>/` and emit `artifact_written` (`add-artifact`).
 5. Honour cancellation (`ctx.cancel`) and the hang guard (`ctx.timeout()`) for every subprocess or agent call.

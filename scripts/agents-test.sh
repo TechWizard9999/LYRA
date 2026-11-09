@@ -40,4 +40,29 @@ echo "extra" >> "$tmp/.claude/skills/add-guard/SKILL.md"
 if ( cd "$tmp" && sh scripts/agents.sh check >/dev/null 2>&1 ); then echo "FAIL drift not detected"; failures=$((failures + 1)); else echo "ok   drift between trees"; fi
 rm -rf "$tmp"
 
+# ---- pre-commit hook: it must judge the staged blobs, not the working tree ----
+hook_case() {  # <expect pass|fail> <label> <staging snippet>
+  want="$1"; label="$2"; stage="$3"
+  new_copy
+  mkdir -p "$tmp/scripts/git-hooks"
+  cp "$root/scripts/git-hooks/pre-commit" "$tmp/scripts/git-hooks/pre-commit"
+  (
+    cd "$tmp"
+    git init -q
+    git add -A
+    git -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -q -m base
+    # edit the skill in BOTH trees so the working tree is consistent, then stage only some of it
+    for tree in .agents/skills .claude/skills; do echo "edited" >> "$tree/add-guard/SKILL.md"; done
+    eval "$stage"
+  )
+  if ( cd "$tmp" && sh scripts/git-hooks/pre-commit >/dev/null 2>&1 ); then got=pass; else got=fail; fi
+  if [ "$got" = "$want" ]; then echo "ok   hook: $label"; else echo "FAIL hook: $label (expected $want, got $got)"; failures=$((failures + 1)); fi
+  rm -rf "$tmp"
+}
+
+hook_case fail "only .agents/skills staged, working copies match" 'git add .agents/skills'
+hook_case fail "only .claude/skills staged"                         'git add .claude/skills'
+hook_case pass "both copies staged"                                 'git add .agents/skills .claude/skills'
+hook_case pass "no skill files staged"                              'echo x > notes.txt; git add notes.txt'
+
 [ "$failures" -eq 0 ] && echo "all checker tests passed" || { echo "$failures checker test(s) failed"; exit 1; }

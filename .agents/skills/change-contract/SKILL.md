@@ -8,7 +8,7 @@ description: Checklist for changing a shared contract module (error, events, sta
 Contract modules: `error`, `events`, `state`, `config`, `artifacts`, `proc`, `git`, `providers/mod.rs`, `stages/mod.rs`, `engine`. Details in `.agents/rules/contracts.md`.
 
 ## Before editing
-1. Ask whether a change is needed or whether a stage-local or `guards.rs` change would do. Prefer the smaller blast radius.
+1. Ask whether a change is needed or whether a stage-local, `guards.rs` or profile-local change would do. (`ExecutionProfile` in `src/profile/mod.rs` is a contract too: a trait change reaches every profile and the profile record saved in `run.json`.) Prefer the smaller blast radius.
 2. Find every user: `rg` for the type/function across `src/`, including `web/` (`views.rs`, `api.rs`, `static/app.js`) and `main.rs`.
 3. Check what is serialized: `RunState`/`RunRequest` (`run.json`), `Event`/`EventKind`/`AgentEvent` (`events.jsonl`, SSE, dashboard JS), `StageError`/`StopReason`/`StageOutcome`, config TOML, artifact JSON.
 

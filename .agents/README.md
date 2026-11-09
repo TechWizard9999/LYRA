@@ -21,6 +21,7 @@ Claude Code only discovers skills under `.claude/skills/`. Codex reads `.agents/
 ```sh
 ./scripts/agents.sh sync            # regenerate .claude/skills (after editing a skill)
 ./scripts/agents.sh check           # fail if .claude/skills drifted (CI runs this)
+./scripts/agents.sh check-staged    # the same check on the staged blobs (the pre-commit hook runs this)
 ./scripts/agents.sh install-hooks   # commit-msg + pre-commit hooks for this clone
 ```
 

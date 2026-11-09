@@ -1,7 +1,8 @@
 #!/usr/bin/env sh
 # Manage the agent context in .agents/.
 #   sync           regenerate .claude/skills from .agents/skills (Claude Code only reads .claude/skills)
-#   check          fail if a skill is malformed or .claude/skills drifted from .agents/skills
+#   check          fail if a skill is malformed or .claude/skills drifted from .agents/skills (working tree)
+#   check-staged   the same check on the staged blobs (what a commit would contain); used by the pre-commit hook
 #   install-hooks  point this clone's git hooks at scripts/git-hooks
 set -eu
 cd "$(dirname "$0")/.."
@@ -49,6 +50,26 @@ check() {
   echo "ok: $dst matches $src"
 }
 
+# The commit contains the index, not the working tree: a contributor can edit both copies and stage only one.
+# Export the staged tree and compare the staged .agents/skills with the staged .claude/skills.
+check_staged() {
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  tree="$(git write-tree)" || { echo "!! cannot read the index (unresolved merge?)"; exit 1; }
+  for path in "$src" "$dst"; do
+    git archive "$tree" "$path" 2>/dev/null | tar -x -C "$tmp" 2>/dev/null || true
+  done
+  if [ ! -d "$tmp/$src" ]; then echo "!! $src is missing from the staged tree"; exit 1; fi
+  ( src="$tmp/$src"; validate ) || exit 1
+  if [ ! -d "$tmp/$dst" ] || ! diff -r -x "$marker" "$tmp/$src" "$tmp/$dst" >/dev/null 2>&1; then
+    echo "!! the staged $dst differs from the staged $src, so this commit would carry stale skill copies."
+    echo "   run ./scripts/agents.sh sync and stage both directories (git add .agents/skills .claude/skills)"
+    diff -rq -x "$marker" "$tmp/$src" "$tmp/$dst" 2>/dev/null | sed "s#$tmp/##g" || true
+    exit 1
+  fi
+  echo "ok: staged $dst matches staged $src"
+}
+
 install_hooks() {
   git config core.hooksPath scripts/git-hooks
   chmod +x scripts/git-hooks/* 2>/dev/null || true
@@ -58,6 +79,7 @@ install_hooks() {
 case "${1:-}" in
   sync) sync ;;
   check) check ;;
+  check-staged) check_staged ;;
   install-hooks) install_hooks ;;
-  *) echo "usage: scripts/agents.sh sync|check|install-hooks"; exit 2 ;;
+  *) echo "usage: scripts/agents.sh sync|check|check-staged|install-hooks"; exit 2 ;;
 esac

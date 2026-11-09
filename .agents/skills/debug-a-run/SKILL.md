@@ -25,7 +25,7 @@ Open `run.json`: `status` (`queued|running|stopped|failed|done|interrupted|cance
 | context | `10-context/{related.json,git-history.md,repo.json,instructions.md,summary.json}`; a policy collection error fails visibly |
 | repro | `20-repro/repro.json`, `output.txt`, source-binding evidence; was it a compile error, "0 tests", or an unrelated panic (all non-reproductions)? |
 | rca | `30-rca/rca.json`; "worktree changed" means the read-only guard tripped |
-| fix | `40-fix/{fix.diff,notes.md,scope.json}`; which lock did the guard cite (test file, registration, dev-deps, `[[test]]`, `.cargo/config*`)? |
+| fix | `40-fix/{fix.diff,notes.md,scope.json}`; which lock did the guard cite? Universal: the frozen test file. `rust-cargo` profile: registration, dev-deps, `[[test]]`, `autotests`, `.cargo/config*`. `artifacts/profile.json` says which profile the run resolved. |
 | verify | `50-verify/{build,repro-after,tests,fmt}.txt`, `source-binding.txt`, `result.json` |
 | pr | `60-pr/{body.md,url.txt}`; existing PR state, fork/push access, policy acknowledgement |
 

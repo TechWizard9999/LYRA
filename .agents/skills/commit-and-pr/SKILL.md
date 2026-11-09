@@ -37,7 +37,9 @@ Work on `feat/<topic>` or `fix/<topic>`, never `main` (protected: PR, one approv
 ## Checks
 fmt, clippy -D warnings, cargo test, node tests: <results>
 ```
-Open the PR for human review. Never merge it yourself. A PR from a coding agent should say so only if the team's policy asks for disclosure, and must not add a co-author trailer to commits.
+Open the PR for human review. Merging is a separate step: do it only when a maintainer explicitly asks you to for a specific, reviewed PR, and only when the repository's protections and policies allow it (approvals after the last push, resolved conversations, passing checks, signed commits). Without that explicit instruction, leave the PR for a human. A PR from a coding agent should say so only if the team's policy asks for disclosure, and must not add a co-author trailer to commits.
+
+The draft-only rule is about the **product**: PRs that LYRA's own pipeline creates for a target repository are always drafts for the exact verified commit, and LYRA never merges them (AGENTS.md rule 7). It does not forbid a contributor from doing repository maintenance they were explicitly authorized to do on this repository.
 
 ## After opening
 Respond to review by pushing new commits (not force-pushing over reviewed history unless asked); new pushes dismiss stale approvals, which is expected.

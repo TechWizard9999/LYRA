@@ -5,7 +5,7 @@ description: Add or modify an agent runtime adapter (Claude Code, Codex, or a ne
 
 # Add or change a provider adapter
 
-Note: `providers/mod.rs` is a contract; read `.agents/rules/contracts.md`. More runtimes (Copilot CLI, OpenCode, generic command) are deferred designs in `docs/RESEARCH.md` §1. A new runtime is a scoped feature: confirm with maintainers first, since PLAN §1 ships two.
+Note: `providers/mod.rs` is a contract; read `.agents/rules/contracts.md`. More runtimes (Copilot CLI, OpenCode, generic command) are deferred designs in `docs/RESEARCH.md` §1. A new runtime is a scoped feature: PLAN §1 ships two. If the task you were given already covers the new runtime (an issue or maintainer request names it), go ahead. If you are proposing it yourself, find or open an issue and get a maintainer's agreement before building it.
 
 ## Read first
 - `docs/PLAN.md` §4 (adapter table) and `.agents/rules/security.md` (agent isolation).

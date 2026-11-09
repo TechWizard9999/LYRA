@@ -1,6 +1,8 @@
-//! S5 Verify (PLAN §3.4), no agent: build, run the repro test (it must pass, exactly one test),
-//! the full test suite, then `cargo fmt --check`. Logs go to `50-verify/`, the outcome to
-//! `result.json`; success records `verified_commit = HEAD`.
+//! S5 Verify (PLAN §3.4), no agent: in a fresh detached checkout of the fix checkpoint, run the
+//! profile's verification steps (build, the repro test which must pass as exactly one test, the
+//! suite, the formatter). Logs go to `50-verify/`, the outcome to `result.json`; success records
+//! `verified_commit = HEAD`. The harness owns the checkout, snapshots, timeouts and cleanup; the
+//! execution profile owns the toolchain environment and commands.
 
 use super::repro::{write, write_json};
 use super::{Stage, StageCtx};
@@ -8,7 +10,8 @@ use crate::error::{ErrorKind, StageError, StageOutcome, StopReason};
 use crate::events::StageId;
 use crate::git;
 use crate::guards::{self, ReproRecord};
-use crate::proc::{self, CommandSpec};
+use crate::proc;
+use crate::profile::ExecutionProfile;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -49,6 +52,7 @@ impl Stage for VerifyStage {
 
 async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
     ctx.state.verified_commit = None;
+    let profile = ctx.profile()?;
     let rec = ctx.state.require_frozen_repro()?.clone();
     let candidate = ctx
         .state
@@ -66,17 +70,20 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
         ctx.state.attempt_count(StageId::Verify),
         time::OffsetDateTime::now_utc().unix_timestamp_nanos()
     );
-    let root = verification_root(&ctx.run_dir.root, &suffix)?;
+    let root = verification_root(&ctx.run_dir.root, &suffix, &*profile)?;
     let worktree = root.join("checkout");
-    let cargo_home = root.join("cargo-home");
-    let target = root.join("target");
     // Own the root before any fallible setup, including worktree creation.
-    let cleanup = VerificationWorktree { source: source.clone(), root, path: worktree.clone(), timeout: ctx.timeout() };
-    std::fs::create_dir_all(&cargo_home).map_err(|e| StageError::new(ErrorKind::Io, e.to_string()))?;
+    let cleanup = VerificationWorktree {
+        source: source.clone(),
+        root: root.clone(),
+        path: worktree.clone(),
+        timeout: ctx.timeout(),
+    };
+    profile.create_environment(&root).map_err(|e| StageError::new(ErrorKind::Io, e.to_string()))?;
     git::verification_worktree(&source, &worktree, &candidate)
         .map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
     ctx.events.info(format!("verify: isolated checkout at {}", worktree.display()));
-    let outcome = verify_checkout(ctx, &rec, &candidate, &worktree, &cargo_home, &target).await;
+    let outcome = verify_checkout(ctx, &*profile, &rec, &candidate, &worktree, &root).await;
     drop(cleanup);
     outcome
 }
@@ -99,7 +106,9 @@ impl Drop for VerificationWorktree {
     }
 }
 
-fn verification_root(preferred: &Path, suffix: &str) -> Result<PathBuf, StageError> {
+/// An owned root for the checkout and the profile's environment, outside any ancestor the
+/// profile rejects (for Cargo: inherited `.cargo/config`, which HOME and TEMP often carry).
+fn verification_root(preferred: &Path, suffix: &str, profile: &dyn ExecutionProfile) -> Result<PathBuf, StageError> {
     let bases = vec![preferred.to_path_buf(), std::env::temp_dir()];
     #[cfg(windows)]
     let bases = {
@@ -127,9 +136,7 @@ fn verification_root(preferred: &Path, suffix: &str) -> Result<PathBuf, StageErr
             }
         };
         let root = parent.join(format!("lyra-verify-{}-{suffix}", std::process::id()));
-        // Cargo searches every ancestor, even HOME/.cargo when CARGO_HOME is
-        // overridden. Windows TEMP is commonly below HOME as well.
-        if ensure_no_ancestor_cargo_config(&root.join("checkout")).is_err() {
+        if profile.check_environment_root(&root.join("checkout")).is_err() {
             continue;
         }
         match std::fs::create_dir(&root) {
@@ -140,82 +147,70 @@ fn verification_root(preferred: &Path, suffix: &str) -> Result<PathBuf, StageErr
     Err(StageError::new(
         ErrorKind::Config,
         format!(
-            "cannot create a verification workspace outside inherited Cargo configuration; choose a writable LYRA_HOME outside those ancestors. {}",
+            "cannot create a verification workspace outside inherited toolchain configuration; choose a writable LYRA_HOME outside those ancestors. {}",
             failures.join("; ")
         ),
     ))
 }
 
+fn guard(result: Result<(), String>) -> Result<(), StageError> {
+    result.map_err(|message| StageError::new(ErrorKind::Guard, message))
+}
+
 async fn verify_checkout(
     ctx: &mut StageCtx,
+    profile: &dyn ExecutionProfile,
     rec: &ReproRecord,
     candidate: &str,
     worktree: &Path,
-    cargo_home: &Path,
-    target: &Path,
+    env_root: &Path,
 ) -> Result<StageOutcome, StageError> {
-    ensure_no_ancestor_cargo_config(worktree)?;
+    guard(profile.check_environment_root(worktree))?;
     let checkpoint = rec.frozen_commit.as_deref().expect("validated frozen record");
     let changes = git::changed_files(worktree, checkpoint).map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
-    guards::check_fix_changes(&changes, rec, worktree, checkpoint)
-        .map_err(|msg| StageError::new(ErrorKind::Guard, msg))?;
-    ensure_empty_cargo_config(cargo_home)?;
-    let snapshot = prepare_lockfile(ctx, candidate, worktree, cargo_home, target).await?;
-    let binding = CommandSpec::new("cargo", worktree).args(
-        guards::repro_test_args(&rec.krate, &rec.test_name)
-            .map_err(|message| StageError::new(ErrorKind::Guard, message))?,
-    );
+    guard(guards::check_fix_changes(&changes, rec, worktree, checkpoint, profile))?;
+    guard(profile.check_environment(env_root))?;
+    let snapshot = prepare_baseline(ctx, profile, candidate, worktree, env_root).await?;
+    let binding = profile.regression_command(rec, worktree).map_err(|m| StageError::new(ErrorKind::Guard, m))?;
     super::repro::check_source_binding(
         ctx,
+        profile,
         rec,
-        controlled_cargo_environment(binding, cargo_home, target),
+        profile.command_environment(binding, env_root),
         "50-verify/source-binding.txt",
     )
     .await?;
-    assert_checkout_unchanged(worktree, candidate, &snapshot)?;
-    ensure_empty_cargo_config(cargo_home)?;
+    assert_checkout_unchanged(profile, worktree, candidate, &snapshot)?;
+    guard(profile.check_environment(env_root))?;
 
-    let steps: [(&str, String, &str); 4] = [
-        ("build", ctx.config.verify.build.clone(), "50-verify/build.txt"),
-        ("repro", guards::repro_test_command(&rec.krate, &rec.test_name), "50-verify/repro-after.txt"),
-        ("tests", ctx.config.verify.test.clone(), "50-verify/tests.txt"),
-        ("fmt", ctx.config.verify.fmt.clone(), "50-verify/fmt.txt"),
-    ];
+    let steps = profile
+        .verification_steps(&ctx.config.verify, rec, worktree)
+        .map_err(|message| StageError::fatal(ErrorKind::Config, message))?;
     let mut result = VerifyResult {
         repository_overrides: repository_verify_overrides(&ctx.state.request.repo)?,
         ..VerifyResult::default()
     };
 
-    for (name, line, log_rel) in steps {
-        ensure_no_ancestor_cargo_config(worktree)?;
-        ensure_empty_cargo_config(cargo_home)?;
-        let spec = if name == "repro" {
-            CommandSpec::new("cargo", worktree).args(
-                guards::repro_test_args(&rec.krate, &rec.test_name)
-                    .map_err(|msg| StageError::new(ErrorKind::Guard, msg))?,
-            )
-        } else {
-            CommandSpec::from_line(&line, worktree).map_err(|_| {
-                StageError::fatal(ErrorKind::Config, format!("verify step '{name}' has an empty command"))
-            })?
-        };
-        let spec = controlled_cargo_environment(spec, cargo_home, target);
-        ctx.events.info(format!("verify: {name}: `{}`", spec.display()));
+    for step in steps {
+        guard(profile.check_environment_root(worktree))?;
+        guard(profile.check_environment(env_root))?;
+        let spec = profile.command_environment(step.spec, env_root);
+        ctx.events.info(format!("verify: {}: `{}`", step.name, spec.display()));
         let run = proc::run(&spec, ctx.timeout(), &ctx.cancel)
             .await
             .map_err(|e| StageError::from_anyhow(ErrorKind::Tool, e))?;
         let output = run.combined();
-        let log = write(ctx, log_rel, &output)?;
+        let log = write(ctx, step.log, &output)?;
         let mut ok = run.success();
         let mut reason: Option<String> = None;
-        if name == "repro" {
-            if let Err(e) = guards::assert_test_passed(&output, &rec.test_name) {
+        if step.regression {
+            if let Err(e) = profile.assert_passed(&output, rec) {
                 ok = false;
                 reason = Some(e);
             }
         }
         result.steps.push(StepResult {
-            name: name.to_string(),
+            name: step.name.to_string(),
             command: spec.display(),
             ok: ok && !run.timed_out && !run.cancelled,
             exit_code: run.exit_code,
@@ -229,21 +224,21 @@ async fn verify_checkout(
         }
         if run.timed_out {
             write_json(ctx, "50-verify/result.json", &result)?;
-            let msg = format!("{name} timed out after {}s: `{}`", ctx.timeout().as_secs(), spec.display());
+            let msg = format!("{} timed out after {}s: `{}`", step.name, ctx.timeout().as_secs(), spec.display());
             return Err(StageError::new(ErrorKind::Timeout, msg).with_details(log));
         }
-        if let Err(error) = assert_checkout_unchanged(worktree, candidate, &snapshot) {
+        if let Err(error) = assert_checkout_unchanged(profile, worktree, candidate, &snapshot) {
             write_json(ctx, "50-verify/result.json", &result)?;
             return Err(error.with_details(log));
         }
-        ensure_empty_cargo_config(cargo_home)?;
+        guard(profile.check_environment(env_root))?;
         if !ok {
             write_json(ctx, "50-verify/result.json", &result)?;
-            let first = reason.unwrap_or_else(|| first_error_line(&output, run.exit_code));
-            ctx.events.warn(format!("verify: {name} failed: {first}"));
-            return Ok(StageOutcome::stopped(StopReason::VerifyFailed, format!("{name} failed: {first}")));
+            let first = reason.unwrap_or_else(|| profile.explain_failure(&output, run.exit_code));
+            ctx.events.warn(format!("verify: {} failed: {first}", step.name));
+            return Ok(StageOutcome::stopped(StopReason::VerifyFailed, format!("{} failed: {first}", step.name)));
         }
-        ctx.events.info(format!("verify: {name} ok ({} ms)", run.duration.as_millis()));
+        ctx.events.info(format!("verify: {} ok ({} ms)", step.name, run.duration.as_millis()));
     }
 
     result.ok = true;
@@ -253,51 +248,57 @@ async fn verify_checkout(
     Ok(StageOutcome::Completed)
 }
 
-fn controlled_cargo_environment(spec: CommandSpec, cargo_home: &Path, target: &Path) -> CommandSpec {
-    let mut spec = spec.scrubbed();
-    spec.env
-        .retain(|(key, _)| !key.eq_ignore_ascii_case("CARGO_HOME") && !key.eq_ignore_ascii_case("CARGO_TARGET_DIR"));
-    spec.env.push(("CARGO_HOME".into(), cargo_home.to_string_lossy().into_owned()));
-    spec.env.push(("CARGO_TARGET_DIR".into(), target.to_string_lossy().into_owned()));
-    spec
-}
-
-/// Library repositories may intentionally omit Cargo.lock. Generate that one
-/// Cargo output before freezing the verification baseline, then protect it like
-/// every other file throughout discovery, build, tests and formatting.
-async fn prepare_lockfile(
+/// Freezes the checkout baseline. When the profile needs a generated input first (for Cargo:
+/// a missing `Cargo.lock`), run that one preparation and require that it created nothing else;
+/// the generated files are then protected like every other file.
+async fn prepare_baseline(
     ctx: &StageCtx,
+    profile: &dyn ExecutionProfile,
     candidate: &str,
     worktree: &Path,
-    cargo_home: &Path,
-    target: &Path,
+    env_root: &Path,
 ) -> Result<SourceSnapshot, StageError> {
     let before = source_snapshot(worktree).map_err(|e| StageError::from_anyhow(ErrorKind::Io, e))?;
-    if before.contains_key(Path::new("Cargo.lock")) {
+    let Some(prep) = profile.preparation(worktree, &|path| before.contains_key(path)) else {
         return Ok(before);
-    }
-    let spec =
-        controlled_cargo_environment(CommandSpec::new("cargo", worktree).arg("generate-lockfile"), cargo_home, target);
-    ctx.events.info(format!("verify: preparing missing lockfile: `{}`", spec.display()));
+    };
+    let spec = profile.command_environment(prep.spec, env_root);
+    ctx.events.info(format!("verify: preparing {}: `{}`", prep.name, spec.display()));
     let run =
         proc::run(&spec, ctx.timeout(), &ctx.cancel).await.map_err(|e| StageError::from_anyhow(ErrorKind::Tool, e))?;
-    let log = write(ctx, "50-verify/lockfile.txt", run.combined())?;
+    let log = write(ctx, prep.log, run.combined())?;
     if !run.success() {
         let kind = if run.timed_out { ErrorKind::Timeout } else { ErrorKind::Tool };
-        return Err(StageError::new(kind, "preparing the verification Cargo.lock failed").with_details(log));
+        return Err(StageError::new(kind, format!("preparing the verification {} failed", prep.name)).with_details(log));
     }
     let mut after = source_snapshot(worktree).map_err(|e| StageError::from_anyhow(ErrorKind::Io, e))?;
-    let generated = after.remove(Path::new("Cargo.lock"));
-    if !matches!(generated, Some(SourceEntry::File(_))) || after != before {
+    let mut generated = Vec::new();
+    for path in &prep.creates {
+        match after.remove(path) {
+            Some(entry @ SourceEntry::File(_)) => generated.push((path.clone(), entry)),
+            _ => {
+                return Err(StageError::new(
+                    ErrorKind::Guard,
+                    format!("{} preparation did not create the regular file {}", prep.name, path.display()),
+                )
+                .with_details(log))
+            }
+        }
+    }
+    if after != before {
         return Err(StageError::new(
             ErrorKind::Guard,
-            "lockfile preparation must only create Cargo.lock; candidate source or configuration changed",
+            format!(
+                "{} preparation must only create {}; candidate source or configuration changed",
+                prep.name,
+                prep.creates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+            ),
         )
         .with_details(log));
     }
-    after.insert(PathBuf::from("Cargo.lock"), generated.expect("checked generated regular lockfile"));
-    assert_checkout_unchanged(worktree, candidate, &after)?;
-    ensure_empty_cargo_config(cargo_home)?;
+    after.extend(generated);
+    assert_checkout_unchanged(profile, worktree, candidate, &after)?;
+    guard(profile.check_environment(env_root))?;
     Ok(after)
 }
 
@@ -313,31 +314,6 @@ fn repository_verify_overrides(repo: &Path) -> Result<bool, StageError> {
     Ok(value.get("verify").and_then(toml::Value::as_table).is_some_and(|table| !table.is_empty()))
 }
 
-fn ensure_empty_cargo_config(cargo_home: &Path) -> Result<(), StageError> {
-    if ["config", "config.toml"].iter().any(|name| std::fs::symlink_metadata(cargo_home.join(name)).is_ok()) {
-        return Err(StageError::new(ErrorKind::Guard, "verification Cargo home contains unexpected configuration"));
-    }
-    Ok(())
-}
-
-fn ensure_no_ancestor_cargo_config(worktree: &Path) -> Result<(), StageError> {
-    for ancestor in worktree.parent().into_iter().flat_map(Path::ancestors) {
-        for name in ["config", "config.toml"] {
-            let path = ancestor.join(".cargo").join(name);
-            if std::fs::symlink_metadata(&path).is_ok() {
-                return Err(StageError::new(
-                    ErrorKind::Guard,
-                    format!(
-                        "verification would inherit Cargo configuration from {}; move LYRA_HOME outside that directory",
-                        path.display()
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SourceEntry {
     File(Vec<u8>),
@@ -346,7 +322,7 @@ pub(crate) enum SourceEntry {
 
 pub(crate) type SourceSnapshot = BTreeMap<PathBuf, SourceEntry>;
 
-/// Includes ignored/untracked files; target and Cargo caches live outside this checkout.
+/// Includes ignored/untracked files; build outputs and caches live outside this checkout.
 pub(crate) fn source_snapshot(root: &Path) -> anyhow::Result<SourceSnapshot> {
     fn visit(root: &Path, directory: &Path, files: &mut SourceSnapshot) -> anyhow::Result<()> {
         for entry in std::fs::read_dir(directory)? {
@@ -374,8 +350,13 @@ pub(crate) fn source_snapshot(root: &Path) -> anyhow::Result<SourceSnapshot> {
     Ok(files)
 }
 
-fn assert_checkout_unchanged(root: &Path, candidate: &str, snapshot: &SourceSnapshot) -> Result<(), StageError> {
-    ensure_no_ancestor_cargo_config(root)?;
+fn assert_checkout_unchanged(
+    profile: &dyn ExecutionProfile,
+    root: &Path,
+    candidate: &str,
+    snapshot: &SourceSnapshot,
+) -> Result<(), StageError> {
+    guard(profile.check_environment_root(root))?;
     let head = git::head(root).map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
     let now = source_snapshot(root).map_err(|e| StageError::from_anyhow(ErrorKind::Io, e))?;
     if head != candidate || &now != snapshot {
@@ -397,61 +378,10 @@ fn assert_checkout_unchanged(root: &Path, candidate: &str, snapshot: &SourceSnap
     Ok(())
 }
 
-/// The line that best explains a failed command: the first compiler error, panic, rustfmt
-/// diff header or `test ... FAILED`; otherwise the exit code.
-fn first_error_line(output: &str, exit_code: Option<i32>) -> String {
-    for line in output.lines().map(str::trim) {
-        if line.starts_with("error")
-            || line.contains("panicked at")
-            || line.starts_with("Diff in ")
-            || (line.starts_with("test ") && line.ends_with("FAILED"))
-        {
-            return line.to_string();
-        }
-    }
-    match exit_code {
-        Some(c) => format!("exit code {c}"),
-        None => "process was killed".to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn controlled_cargo_paths_override_inherited_configuration() {
-        let home = Path::new("controlled-cargo-home");
-        let target = Path::new("controlled-target");
-        let spec = controlled_cargo_environment(
-            CommandSpec::new("cargo", ".")
-                .env("CARGO_HOME", "untrusted-home")
-                .env("CARGO_TARGET_DIR", "untrusted-target"),
-            home,
-            target,
-        );
-        assert!(spec.clear_env);
-        assert_eq!(
-            spec.env.iter().filter(|(k, _)| k.eq_ignore_ascii_case("CARGO_HOME")).collect::<Vec<_>>(),
-            vec![&("CARGO_HOME".into(), "controlled-cargo-home".into())]
-        );
-        assert!(!spec.env.iter().any(|(_, value)| value.starts_with("untrusted-")));
-    }
-
-    #[test]
-    fn ancestor_and_injected_cargo_configuration_are_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let checkout = dir.path().join("run").join("checkout");
-        std::fs::create_dir_all(&checkout).unwrap();
-        std::fs::create_dir_all(dir.path().join(".cargo")).unwrap();
-        std::fs::write(dir.path().join(".cargo/config.toml"), "[build]\nrustc-wrapper = 'fake'").unwrap();
-        assert!(ensure_no_ancestor_cargo_config(&checkout).unwrap_err().message.contains("inherit Cargo"));
-        let home = dir.path().join("cargo-home");
-        std::fs::create_dir_all(&home).unwrap();
-        assert!(ensure_empty_cargo_config(&home).is_ok());
-        std::fs::write(home.join("config"), "[alias]\ntest = 'fake'").unwrap();
-        assert!(ensure_empty_cargo_config(&home).is_err());
-    }
+    use crate::profile::rust_cargo::{self, RustCargo};
 
     #[test]
     fn snapshot_detects_source_and_ignored_config_changes() {
@@ -475,6 +405,19 @@ mod tests {
         assert_ne!(source_snapshot(dir.path()).unwrap(), before);
         std::fs::remove_file(dir.path().join("Cargo.lock")).unwrap();
         assert_ne!(source_snapshot(dir.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn verification_root_skips_ancestors_the_profile_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let preferred = dir.path().join("home/.lyra/run");
+        std::fs::create_dir_all(&preferred).unwrap();
+        std::fs::create_dir_all(dir.path().join("home/.cargo")).unwrap();
+        std::fs::write(dir.path().join("home/.cargo/config.toml"), "[build]\n").unwrap();
+        let root = verification_root(&preferred, "t", &RustCargo).unwrap();
+        assert!(!root.starts_with(dunce::canonicalize(dir.path().join("home")).unwrap()), "{}", root.display());
+        assert!(RustCargo.check_environment_root(&root.join("checkout")).is_ok());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -508,12 +451,28 @@ mod tests {
             .contains(&path.to_string_lossy().replace('\\', "/")));
     }
 
+    fn fixture_state(repository: &Path, id: &str, issue: &str) -> crate::state::RunState {
+        use crate::state::{RunRequest, RunState};
+        let mut state = RunState::new(
+            id.into(),
+            RunRequest {
+                repo: repository.to_path_buf(),
+                issue: issue.into(),
+                issue_text: None,
+                provider: None,
+                policy_acknowledged: false,
+            },
+            "claude".into(),
+        );
+        state.profile = rust_cargo::detect(repository);
+        state
+    }
+
     #[tokio::test]
     async fn library_without_lockfile_verifies_outside_home_cargo_configuration() {
         use crate::artifacts::RunDir;
         use crate::config::Config;
         use crate::events::EventSink;
-        use crate::state::{RunRequest, RunState};
 
         let temporary = tempfile::tempdir().unwrap();
         let fake_home = temporary.path().join("home");
@@ -551,23 +510,13 @@ mod tests {
         let record: ReproRecord = serde_json::from_value(serde_json::json!({
             "reproduced": true, "crate": "lyra_verify_library", "test_file": "tests/issue_7.rs",
             "test_name": "issue_7_expected", "expected": "issue remains",
-            "command": guards::repro_test_command("lyra_verify_library", "issue_7_expected"),
-            "frozen_commit": repro_commit
+            "command": rust_cargo::repro_test_command("lyra_verify_library", "issue_7_expected"),
+            "frozen_commit": repro_commit, "profile": "rust-cargo"
         }))
         .unwrap();
         let config = Config::default();
         let agent = crate::providers::make_agent("claude", config.provider("claude").unwrap());
-        let mut state = RunState::new(
-            "library".into(),
-            RunRequest {
-                repo: repository.clone(),
-                issue: "7".into(),
-                issue_text: None,
-                provider: None,
-                policy_acknowledged: false,
-            },
-            "claude".into(),
-        );
+        let mut state = fixture_state(&repository, "library", "7");
         state.checkpoints.insert(StageId::Repro, record.frozen_commit.clone().unwrap());
         state.checkpoints.insert(StageId::Fix, candidate.clone());
         state.frozen_repro = Some(record);
@@ -579,7 +528,7 @@ mod tests {
             events: EventSink::memory("library"),
             cancel: CancellationToken::new(),
         };
-        assert!(ensure_no_ancestor_cargo_config(&repository).is_err());
+        assert!(RustCargo.check_environment_root(&repository).is_err());
         assert_eq!(run_inner(&mut ctx).await.unwrap(), StageOutcome::Completed);
         assert_eq!(ctx.state.verified_commit.as_deref(), Some(candidate.as_str()));
         assert!(ctx.run_dir.read("50-verify/lockfile.txt").is_ok());
@@ -598,8 +547,6 @@ mod tests {
         use crate::artifacts::RunDir;
         use crate::config::Config;
         use crate::events::EventSink;
-        use crate::state::{RunRequest, RunState};
-        use tokio_util::sync::CancellationToken;
 
         let temporary = tempfile::tempdir().unwrap();
         let run_dir = RunDir::new(temporary.path().join("run"));
@@ -631,13 +578,13 @@ mod tests {
         let record: ReproRecord = serde_json::from_value(serde_json::json!({
             "reproduced": true, "crate": "lyra_verify_fixture", "test_file": "tests/issue_7.rs",
             "test_name": "issue_7_expected", "expected": "issue remains",
-            "command": guards::repro_test_command("lyra_verify_fixture", "issue_7_expected"),
+            "command": rust_cargo::repro_test_command("lyra_verify_fixture", "issue_7_expected"),
             "frozen_commit": repro_commit
         }))
         .unwrap();
         let mut tampered = record.clone();
         tampered.test_name = "unrelated_pass".into();
-        tampered.command = guards::repro_test_command(&tampered.krate, &tampered.test_name);
+        tampered.command = rust_cargo::repro_test_command(&tampered.krate, &tampered.test_name);
         run_dir.write_json("20-repro/repro.json", &tampered).unwrap();
         // An ignored configuration in the agent's checkout must not reach verification.
         std::fs::create_dir_all(repository.join(".cargo")).unwrap();
@@ -649,17 +596,9 @@ mod tests {
 
         let config = Config::default();
         let agent = crate::providers::make_agent("claude", config.provider("claude").unwrap());
-        let mut state = RunState::new(
-            "test-run".into(),
-            RunRequest {
-                repo: repository,
-                issue: "7".into(),
-                issue_text: None,
-                provider: None,
-                policy_acknowledged: false,
-            },
-            "claude".into(),
-        );
+        // A legacy run: no saved profile and no profile tag on the record.
+        let mut state = fixture_state(&repository, "test-run", "7");
+        state.profile = None;
         state.checkpoints.insert(StageId::Repro, record.frozen_commit.clone().unwrap());
         state.checkpoints.insert(StageId::Fix, candidate);
         state.frozen_repro = Some(record);
@@ -686,8 +625,6 @@ mod tests {
         use crate::artifacts::RunDir;
         use crate::config::Config;
         use crate::events::EventSink;
-        use crate::state::{RunRequest, RunState};
-        use tokio_util::sync::CancellationToken;
 
         let temporary = tempfile::tempdir().unwrap();
         let run_dir = RunDir::new(temporary.path().join("run"));
@@ -731,25 +668,16 @@ mod tests {
         let record: ReproRecord = serde_json::from_value(serde_json::json!({
             "reproduced": true, "crate": "lyra_redirect_fixture", "test_file": "src/parent/issue_7_tests.rs",
             "test_name": "parent::issue_7_tests::issue_7_expected", "registration_file": "src/parent/mod.rs",
-            "expected": "assertion failed", "command": guards::repro_test_command("lyra_redirect_fixture", "parent::issue_7_tests::issue_7_expected"),
+            "expected": "assertion failed", "command": rust_cargo::repro_test_command("lyra_redirect_fixture", "parent::issue_7_tests::issue_7_expected"),
             "frozen_commit": repro_commit
         })).unwrap();
         // The source file and immediate registration are unchanged, so the old lock passes.
         let changes = git::changed_files(&repository, record.frozen_commit.as_deref().unwrap()).unwrap();
-        guards::check_fix_changes(&changes, &record, &repository, record.frozen_commit.as_deref().unwrap()).unwrap();
+        guards::check_fix_changes(&changes, &record, &repository, record.frozen_commit.as_deref().unwrap(), &RustCargo)
+            .unwrap();
         let config = Config::default();
         let agent = crate::providers::make_agent("claude", config.provider("claude").unwrap());
-        let mut state = RunState::new(
-            "redirect".into(),
-            RunRequest {
-                repo: repository,
-                issue: "7".into(),
-                issue_text: None,
-                provider: None,
-                policy_acknowledged: false,
-            },
-            "claude".into(),
-        );
+        let mut state = fixture_state(&repository, "redirect", "7");
         state.checkpoints.insert(StageId::Repro, record.frozen_commit.clone().unwrap());
         state.checkpoints.insert(StageId::Fix, candidate);
         state.frozen_repro = Some(record);
@@ -764,19 +692,6 @@ mod tests {
         let error = run_inner(&mut ctx).await.unwrap_err();
         assert!(error.message.contains("still discovered"), "{error:?}");
         assert!(ctx.state.verified_commit.is_none());
-    }
-
-    #[test]
-    fn first_error_line_picks_the_explaining_line() {
-        let build =
-            "   Compiling foo v0.1.0\nwarning: unused import\nerror[E0308]: mismatched types\n --> src/x.rs:1:1\n";
-        assert_eq!(first_error_line(build, Some(101)), "error[E0308]: mismatched types");
-        let tests = "running 2 tests\ntest a ... ok\ntest b ... FAILED\n\nfailures:\n\n---- b stdout ----\nthread 'b' panicked at src/x.rs:3:5:\nboom\n";
-        assert_eq!(first_error_line(tests, Some(101)), "test b ... FAILED");
-        let fmt = "Diff in C:\\src\\foo\\src\\x.rs:12:\n-    a\n+a\n";
-        assert!(first_error_line(fmt, Some(1)).starts_with("Diff in "));
-        assert_eq!(first_error_line("nothing useful\n", Some(3)), "exit code 3");
-        assert_eq!(first_error_line("", None), "process was killed");
     }
 
     #[test]

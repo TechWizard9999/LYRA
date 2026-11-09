@@ -13,7 +13,8 @@ Get the diff (`git diff main...HEAD` or the PR). Read it fully before judging. R
 - [ ] LYRA still never clones; PRs are draft only; PR head == `verified_commit`; nothing auto-merges.
 - [ ] No guard weakened, bypassed, or made advisory. Fail-closed on unknown/truncated input.
 - [ ] S1/S3 remain read-only with the change-detection scan intact.
-- [ ] Locked items in S4 still locked (test file, registration, dev-deps, `[[test]]`, `autotests`, `.cargo/config*`, test command).
+- [ ] Locked items in S4 still locked: the frozen test file (universal) and the profile's set (`rust-cargo`: registration, dev-deps, `[[test]]`, `autotests`, `.cargo/config*`, test command).
+- [ ] `guards.rs`, the engine, stages and dashboard name no toolchain; Cargo and runner specifics stay in the profile.
 - [ ] Prompts only in `src/prompts`, schemas only in `src/schemas`; untrusted input stays inside UNTRUSTED DATA blocks.
 - [ ] Artifacts under `artifacts/<NN-stage>/`, written via `RunDir`, `artifact_written` emitted.
 

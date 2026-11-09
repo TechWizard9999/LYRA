@@ -11,7 +11,10 @@ These apply to humans and to coding agents working on this repository.
 
 ## Pull requests
 
-Open PRs as you normally would for review; they are for humans to merge. LYRA itself must never auto-merge or open non-draft PRs for the repos it works on, and nothing here changes that.
+Open PRs as you normally would for review; humans merge them. Two different things, kept apart:
+
+- **LYRA the product** never auto-merges and never opens non-draft PRs for the repositories it works on (AGENTS.md rule 7). That is pipeline behaviour and nothing here changes it.
+- **A contributor or coding agent working on this repository** may do maintenance a maintainer explicitly asked for (merging a reviewed PR, closing or labelling an issue, cutting a release) when the repository's protections and policies allow it. Without an explicit instruction, don't merge your own PR or anyone else's.
 
 The description must include:
 

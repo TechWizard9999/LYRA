@@ -97,6 +97,13 @@ fn intake(ctx: &mut StageCtx) -> Result<(), StageError> {
     git::worktree_add(&repo, &wt, &branch, &base).map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
     ctx.events.info(format!("worktree {} on {branch} from {default} @ {}", wt.display(), git::short(&base)));
 
+    // Execution profile (PLAN §13): resolved once from the worktree, frozen for the run.
+    let (resolved, _) = crate::profile::resolve(&wt).map_err(|reason| StageError::fatal(ErrorKind::Config, reason))?;
+    let p = ctx.run_dir.write_json("profile.json", &resolved).map_err(io_err)?;
+    ctx.events.artifact(p);
+    ctx.events.info(format!("execution profile: {} ({})", resolved.id, resolved.evidence.join(", ")));
+    ctx.state.profile = Some(resolved);
+
     // Contribution / AI policy text, as of the base commit.
     let policy = read_policy(&wt)?;
     ctx.state.has_policy = !policy.is_empty();

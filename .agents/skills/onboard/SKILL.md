@@ -6,7 +6,7 @@ description: Get a new developer (or agent) productive on LYRA - prerequisites, 
 # Onboard to LYRA
 
 ## 1. What LYRA is (2 minutes)
-A Rust harness around Claude Code or Codex. Input: a path to an already-cloned Rust repo plus a GitHub issue. It runs one fixed pipeline, intake → context → repro → rca → fix → verify → draft PR, enforces guards between stages, saves everything under `~/.lyra/runs/<id>/`, and streams to a localhost dashboard. Read `README.md` (flow + stage table), then skim `docs/PLAN.md` §1–§3.
+A Rust harness around Claude Code or Codex. Input: a path to an already-cloned repository (Rust today, through the built-in `rust-cargo` execution profile; PLAN §13) plus a GitHub issue. It runs one fixed pipeline, intake → context → repro → rca → fix → verify → draft PR, enforces guards between stages, saves everything under `~/.lyra/runs/<id>/`, and streams to a localhost dashboard. Read `README.md` (flow + stage table), then skim `docs/PLAN.md` §1–§3.
 
 ## 2. Set up
 Prerequisites and troubleshooting are in `SETUP.md`. Short version: Rust stable (`rustup`), `git`, GitHub CLI authenticated (`gh auth login`), Node (only for the dashboard JS tests), and at least one runtime (`claude` and/or `codex`).
@@ -32,7 +32,7 @@ All must pass on a clean checkout with no network, `gh` login, or agent CLI. If 
 2. `src/events.rs`, `src/state.rs`, `src/error.rs`: the vocabulary (`StageId`, `RunState`, `StageOutcome`, `StopReason`).
 3. `src/engine.rs`: how a run is driven, retried, cancelled.
 4. `src/stages/mod.rs` then `repro.rs`: the shape of a stage and the most guarded one.
-5. `src/guards.rs`: the rules that make results trustworthy.
+5. `src/guards.rs` (universal rules) and `src/profile/` (the `ExecutionProfile` contract and the `rust-cargo` profile, where Cargo-specific rules live): the rules that make results trustworthy.
 6. `src/providers/mod.rs` and `claude.rs`: how an agent is called and isolated.
 7. `src/web/server.rs`: request guards and the dashboard.
 8. `src/prompts/` and `src/schemas/`: what we ask agents and the shape we require.

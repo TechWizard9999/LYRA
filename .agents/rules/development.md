@@ -12,7 +12,7 @@ Complements the numbered rules in `AGENTS.md`; it does not repeat them.
 
 | Change | Location |
 |---|---|
-| Stage behaviour | `src/stages/<stage>.rs`; rule logic that must be unit-testable lives in `src/guards.rs` |
+| Stage behaviour | `src/stages/<stage>.rs`; universal rule logic lives in `src/guards.rs`; runner/toolchain rules live in the execution profile (`src/profile/`, see `add-guard`) |
 | Agent prompt text | `src/prompts/*.md` (minijinja); never a string literal in Rust |
 | Structured agent output shape | `src/schemas/*.json`, validated with `jsonschema` independent of the runtime |
 | Run files | through `artifacts::RunDir` (`write`, `write_json`, `read_json`, `stage_dir`); never build run paths by hand |
