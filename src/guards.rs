@@ -176,9 +176,33 @@ pub fn check_fix_changes(
     checkpoint: &str,
     profile: &dyn ExecutionProfile,
 ) -> Result<(), String> {
-    let read_checkpoint = |p: &str| crate::git::show_file(worktree, checkpoint, p).ok();
+    let read_checkpoint = checkpoint_reader(worktree, checkpoint);
     let read_now = |p: &str| std::fs::read_to_string(worktree.join(p)).ok();
     profile.check_fix_changes(changes, rec, &read_checkpoint, &read_now)
+}
+
+/// Reads files at `checkpoint`. Profiles probe many candidate paths (every place an import
+/// could resolve), so the commit's file list is taken once with `git ls-tree` and a path that
+/// is not in it returns `None` without starting a process; contents are cached. If the
+/// listing fails, every read falls back to `git show`.
+fn checkpoint_reader<'a>(worktree: &'a Path, checkpoint: &'a str) -> impl Fn(&str) -> Option<String> + 'a {
+    let listing: Option<std::collections::HashSet<String>> =
+        crate::git::run(worktree, &["ls-tree", "-r", "-z", "--name-only", checkpoint])
+            .ok()
+            .map(|out| out.split('\0').filter(|p| !p.is_empty()).map(norm_path).collect());
+    let cache = std::cell::RefCell::new(std::collections::HashMap::<String, Option<String>>::new());
+    move |p: &str| {
+        let path = norm_path(p);
+        if listing.as_ref().is_some_and(|files| !files.contains(&path)) {
+            return None;
+        }
+        if let Some(hit) = cache.borrow().get(&path) {
+            return hit.clone();
+        }
+        let content = crate::git::show_file(worktree, checkpoint, &path).ok();
+        cache.borrow_mut().insert(path, content.clone());
+        content
+    }
 }
 
 fn normalise_text(s: &str) -> String {
@@ -539,6 +563,34 @@ new file mode 100644
         let changes = git::changed_files(wt, &checkpoint).unwrap();
         let err = check_fix_changes(&changes, &rec(), wt, &checkpoint, &RustCargo).unwrap_err();
         assert!(err.contains("tests/issue_123.rs"), "{err}");
+    }
+
+    /// The checkpoint reader answers from the commit, not the worktree: listed files are read
+    /// (and cached), unlisted ones are `None` without a `git show`, and later worktree edits do
+    /// not leak in.
+    #[test]
+    fn checkpoint_reader_reads_the_commit_and_skips_unlisted_paths() {
+        use crate::git;
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path();
+        git::run(wt, &["init", "-q", "-b", "main"]).unwrap();
+        git::run(wt, &["config", "user.email", "t@example.com"]).unwrap();
+        git::run(wt, &["config", "user.name", "T"]).unwrap();
+        std::fs::create_dir_all(wt.join("pkg")).unwrap();
+        std::fs::write(wt.join("pkg/core.py"), "x = 1\n").unwrap();
+        let sha = git::commit_all(wt, "init").unwrap();
+        std::fs::write(wt.join("pkg/core.py"), "x = 2\n").unwrap();
+        std::fs::write(wt.join("pkg/new.py"), "y = 1\n").unwrap();
+        let read = checkpoint_reader(wt, &sha);
+        assert_eq!(read("pkg/core.py").as_deref().map(str::trim), Some("x = 1"));
+        assert_eq!(read("pkg\\core.py").as_deref().map(str::trim), Some("x = 1"), "normalised path, cached");
+        assert_eq!(read("pkg/new.py"), None, "not in the commit");
+        assert_eq!(read("pkg/missing.py"), None);
+        let started = std::time::Instant::now();
+        for i in 0..2000 {
+            assert_eq!(read(&format!("pkg/probe_{i}.py")), None);
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "unlisted probes start no process");
     }
 
     /// A fix must not make the locked test pass by changing the data it reads: every file the

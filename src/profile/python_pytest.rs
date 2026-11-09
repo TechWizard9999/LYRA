@@ -133,6 +133,11 @@ const LOADED_END: &str = "LYRA-LOADED-END";
 
 const PYTEST_CONFIG_FILES: [&str; 4] = ["pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml"];
 
+/// Directory names that are never source (caches and installed-package folders). Virtual
+/// environments and build output are recognised by markers in [`is_generated_python_dir`],
+/// so `src/env/` or `src/build/` stay visible.
+const GENERATED_DIRS: [&str; 3] = ["__pycache__", "node_modules", "site-packages"];
+
 /// Verification provenance: every project name (one per line on stdin) must be found inside
 /// the checkout under test (the working directory). The name is located on the import path
 /// without importing it, so no project code runs: `PathFinder` first, which searches
@@ -296,9 +301,7 @@ impl ExecutionProfile for PythonPytest {
         ]
     }
     fn generated_dirs(&self) -> &'static [&'static str] {
-        // Only names that are never source. Virtual environments and build output are
-        // recognised by markers in `is_generated_dir`, so `src/env/` or `src/build/` stay visible.
-        &["__pycache__", "node_modules", "site-packages"]
+        &GENERATED_DIRS
     }
     fn is_generated_dir(&self, relative: &Path, path: &Path) -> bool {
         is_generated_python_dir(relative, path)
@@ -498,7 +501,7 @@ impl ExecutionProfile for PythonPytest {
 /// holds only archives. A package directory that merely shares one of those names is source.
 pub fn is_generated_python_dir(relative: &Path, path: &Path) -> bool {
     let Some(name) = relative.file_name().and_then(|n| n.to_str()) else { return false };
-    if ["__pycache__", "node_modules", "site-packages"].contains(&name) || name.ends_with(".egg-info") {
+    if GENERATED_DIRS.contains(&name) || name.ends_with(".egg-info") {
         return true;
     }
     if path.join("pyvenv.cfg").is_file() {
@@ -1932,18 +1935,9 @@ fn controlled_python_environment(spec: CommandSpec, caches: Option<&Path>) -> Co
 /// pytest looks for configuration and `conftest.py` in ancestors of the checkout when the
 /// repository does not pin them; refuse a verification root below such files.
 fn ensure_no_ancestor_pytest_config(checkout: &Path) -> Result<(), String> {
-    const NAMES: [&str; 8] = [
-        "pytest.ini",
-        ".pytest.ini",
-        "pytest.toml",
-        ".pytest.toml",
-        "conftest.py",
-        "pyproject.toml",
-        "setup.cfg",
-        "tox.ini",
-    ];
+    let names = PYTEST_CONFIG_FILES.iter().chain(&["conftest.py", "pyproject.toml", "setup.cfg", "tox.ini"]);
     for ancestor in checkout.parent().into_iter().flat_map(Path::ancestors) {
-        for name in NAMES {
+        for name in names.clone() {
             let path = ancestor.join(name);
             if std::fs::symlink_metadata(&path).is_ok() {
                 return Err(format!(
@@ -4186,6 +4180,19 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         // The neighbouring test module stays frozen.
         let change = vec![("M".to_string(), "textkit/test_lists.py".to_string())];
         assert!(check_fix_changes_with(&change, &record, &read_checkpoint, &read_now).is_err());
+    }
+
+    /// The lists that must agree stay in agreement: every pytest configuration file is a
+    /// manifest (so it reaches the context snapshot) and generated directories are one list.
+    #[test]
+    fn configuration_and_generated_lists_agree() {
+        for name in PYTEST_CONFIG_FILES {
+            assert!(PythonPytest.manifest_names().contains(&name), "{name} missing from manifest_names");
+        }
+        assert_eq!(PythonPytest.generated_dirs(), GENERATED_DIRS);
+        for name in GENERATED_DIRS {
+            assert!(is_generated_python_dir(Path::new(name), Path::new("/nonexistent")), "{name}");
+        }
     }
 
     #[test]
