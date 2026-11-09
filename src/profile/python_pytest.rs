@@ -175,9 +175,12 @@ const GENERATED_DIRS: [&str; 3] = ["__pycache__", "node_modules", "site-packages
 
 /// Verification provenance: every project name (one per line on stdin) must be found inside
 /// the checkout under test (the working directory). The name is located on the import path
-/// without importing it, so no project code runs: the `sys.path_hooks` finders over `sys.path`
-/// first, which search exactly as an import would and ignore modules the interpreter already
-/// loaded at start-up, then the other finders (editable installs). A regular package or module must come from the checkout; a
+/// without importing it, so no project code runs, by asking the `sys.meta_path` finders in
+/// order, exactly as an import does: a custom finder that an editable install or a start-up
+/// hook puts before `PathFinder` decides, and the output names the finder that answered.
+/// pytest's `pythonpath` entries (passed as arguments) go first on `sys.path`, as pytest puts
+/// them. Recursion stops at 32 nested namespace levels, a guard against cyclic links, far
+/// deeper than real namespace packages. A regular package or module must come from the checkout; a
 /// namespace package's first portion must be the checkout's (other portions installed by
 /// dependencies, as in `google.*`, are allowed), and then every module and subpackage in that
 /// portion is checked the same way against the merged namespace path, recursively: an
@@ -185,8 +188,9 @@ const GENERATED_DIRS: [&str; 3] = ["__pycache__", "node_modules", "site-packages
 /// caught as `acme.sub`. Namespace packages run no code, so nothing is imported. A name that is
 /// missing or resolves elsewhere (an editable install of another clone, a regular package
 /// shadowing a namespace package or one of its subpackages) fails, by name, with exit status 1.
-const PROVENANCE_CHECK: &str = "import importlib.util, os, sys
+const PROVENANCE_CHECK: &str = "import importlib.machinery, os, sys
 root = os.path.realpath(os.getcwd())
+sys.path[0:0] = [os.path.join(root, entry) for entry in sys.argv[1:]]
 def inside(path):
     path = os.path.realpath(path)
     return path == root or path.startswith(root + os.sep)
@@ -197,31 +201,46 @@ def finder(entry):
         except ImportError:
             continue
     return None
-def locate(name, entries):
+def portions_of(name, entries):
     portions = []
     for entry in entries:
         found = finder(entry)
         spec = found.find_spec(name) if found is not None and hasattr(found, 'find_spec') else None
         if spec is None:
             continue
-        if spec.loader is not None and spec.origin not in (None, 'namespace'):
+        if spec.origin not in (None, 'namespace'):
             return [spec.origin], False
         portions.extend(spec.submodule_search_locations or [])
-    return portions, bool(portions)
+    return portions, True
+def resolve(name, path):
+    for meta in sys.meta_path:
+        if meta is importlib.machinery.PathFinder and path is not None:
+            places, namespace = portions_of(name, path)
+            if places:
+                return places, namespace, 'PathFinder'
+            continue
+        find = getattr(meta, 'find_spec', None)
+        if find is None:
+            continue
+        try:
+            spec = find(name, path)
+        except (ImportError, ValueError, KeyError):
+            continue
+        if spec is None:
+            continue
+        who = getattr(meta, '__name__', type(meta).__name__)
+        if spec.origin not in (None, 'namespace'):
+            return [spec.origin], False, who
+        if path is None:
+            return list(spec.submodule_search_locations or []), True, who
+        places, _ = portions_of(name, path)
+        return places, True, who
+    return [], False, 'no finder'
 bad = []
-def check(name, entries, depth=0):
-    try:
-        places, namespace = locate(name, entries)
-        if not places and depth == 0:
-            spec = importlib.util.find_spec(name)
-            if spec is not None and spec.origin not in (None, 'namespace', 'built-in', 'frozen'):
-                places = [spec.origin]
-            elif spec is not None:
-                places, namespace = list(spec.submodule_search_locations or []), True
-    except (ImportError, ValueError):
-        places, namespace = [], False
-    print(name, '->', ', '.join(os.path.realpath(p) for p in places) or 'not found')
-    if not places or not inside(places[0]):
+def check(name, path=None, depth=0):
+    places, namespace, who = resolve(name, path)
+    print(name, '->', ', '.join(p if p in ('built-in', 'frozen') else os.path.realpath(p) for p in places) or 'not found', '(' + who + ')')
+    if not places or places[0] in ('built-in', 'frozen') or not inside(places[0]):
         bad.append(name)
         return
     if namespace and depth < 32:
@@ -235,9 +254,9 @@ def check(name, entries, depth=0):
             else:
                 continue
             if child.isidentifier() and child != '__pycache__':
-                check(name + '.' + child, places, depth + 1)
+                check(name + '.' + child, list(places), depth + 1)
 for name in [line.strip() for line in sys.stdin if line.strip()]:
-    check(name, sys.path)
+    check(name)
 for name in bad:
     print('ERROR: ' + name + ' does not resolve inside the checkout under test')
 sys.exit(1 if bad else 0)";
@@ -274,7 +293,7 @@ pub fn detect(worktree: &Path) -> Option<ResolvedProfile> {
             .flatten()
             .flatten()
             .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| n.ends_with(".txt") && n.contains("requirements"))
+            .filter(|n| is_requirements_file(n))
             .collect();
         requirements.sort();
         evidence.extend(requirements.into_iter().filter(|n| read(n).is_some_and(|t| declares_pytest(&t))));
@@ -285,6 +304,26 @@ pub fn detect(worktree: &Path) -> Option<ResolvedProfile> {
         project_dir: String::new(),
         evidence,
     })
+}
+
+/// `requirements*.txt` or `*-requirements.txt` / `*_requirements.txt` (`dev-requirements.txt`),
+/// not any file that merely contains the word (`myrequirements.txt`).
+fn is_requirements_file(name: &str) -> bool {
+    name.ends_with(".txt")
+        && (name.starts_with("requirements")
+            || name.ends_with("-requirements.txt")
+            || name.ends_with("_requirements.txt"))
+}
+
+/// Reads files below `root`; a path ending in `/` asks whether that directory exists and
+/// answers `Some("")` (the same convention as the guard's checkpoint reader).
+pub fn worktree_reader(root: &Path) -> impl Fn(&str) -> Option<String> + '_ {
+    move |p: &str| {
+        if let Some(dir) = p.strip_suffix('/') {
+            return root.join(dir).is_dir().then(String::new);
+        }
+        std::fs::read_to_string(root.join(p)).ok()
+    }
 }
 
 /// A predicate on an INI/TOML section header (without brackets).
@@ -458,7 +497,7 @@ impl ExecutionProfile for PythonPytest {
         assert_test_passed(output, rec.test_name.trim())
     }
     fn loaded_test_inputs(&self, output: &str, rec: &ReproRecord, worktree: &Path) -> Result<Vec<String>, String> {
-        let read = |p: &str| std::fs::read_to_string(worktree.join(p)).ok();
+        let read = worktree_reader(worktree);
         parse_loaded_modules(output, &guards::norm_path(&rec.test_file), &ProductionCode::declared(&read))
     }
     fn assert_absent_from_discovery(&self, output: &str, rec: &ReproRecord) -> Result<(), String> {
@@ -521,6 +560,8 @@ impl ExecutionProfile for PythonPytest {
                 // Names travel on stdin: no command-line length limit, so none is left unchecked.
                 spec: CommandSpec::new(PYTHON, worktree)
                     .args(["-c", PROVENANCE_CHECK])
+                    // pytest's `pythonpath` entries, which the regression ran with.
+                    .args(pytest_pythonpath(&worktree_reader(worktree)))
                     .shown(format!(
                         "{PYTHON} -c <LYRA import-provenance check: {} project names on stdin>",
                         names.len()
@@ -601,7 +642,7 @@ pub fn is_generated_python_dir(relative: &Path, path: &Path) -> bool {
 pub fn provenance_names(root: &Path, test_file: &str) -> Vec<String> {
     let mut names = importable_names(root);
     if let Ok(source) = std::fs::read_to_string(root.join(test_file)) {
-        let read = |p: &str| std::fs::read_to_string(root.join(p)).ok();
+        let read = worktree_reader(root);
         let search = search_paths(&read);
         for module in import_statement_modules(&source) {
             let Some(top) = module.split('.').next().filter(|t| identifier_re().is_match(t)) else { continue };
@@ -1023,6 +1064,9 @@ pub struct ProductionCode {
     /// Root-level patterns made only of wildcards (`*`): they would make every top-level
     /// directory production, test support included, so they declare nothing.
     too_broad: BTreeSet<String>,
+    /// Declarations naming a package or module that does not exist in the frozen checkout: a
+    /// stale entry would otherwise let a fix create it as new "production" code.
+    missing: BTreeSet<String>,
 }
 
 impl ProductionCode {
@@ -1132,7 +1176,28 @@ impl ProductionCode {
                 }
             }
         }
+        code.drop_missing(read);
         code
+    }
+
+    /// Keeps only literal declarations that exist in the checkout read through `read`: a module
+    /// `<name>.py`, a package `<name>/__init__.py`, or a directory `<name>/` (a namespace
+    /// package; readers answer `dir/` queries). Glob patterns only ever match existing paths.
+    fn drop_missing(&mut self, read: FileReader<'_>) {
+        let exists = |dir: &str, name: &str| {
+            let base = join_dir(dir, name);
+            [format!("{base}.py"), format!("{base}/__init__.py"), format!("{base}/")].iter().any(|p| read(p).is_some())
+        };
+        let (names, missing): (BTreeSet<String>, BTreeSet<String>) =
+            std::mem::take(&mut self.names).into_iter().partition(|n| exists("", n) || exists("src", n));
+        self.names = names;
+        self.missing.extend(missing);
+        type Roots = BTreeSet<(String, String)>;
+        let (roots, missing): (Roots, Roots) = std::mem::take(&mut self.roots)
+            .into_iter()
+            .partition(|(dir, glob)| glob.contains(['*', '?']) || exists(dir, glob));
+        self.roots = roots;
+        self.missing.extend(missing.into_iter().map(|(dir, glob)| join_dir(&dir, &glob)));
     }
 
     /// A dotted package or module name (`pkg`, `pkg.sub`, a glob `pkg*`) below `base`.
@@ -1245,7 +1310,14 @@ impl ProductionCode {
              repository's lyra.toml; a `[project] name` counts only when a package or module spelled like it exists, \
              at the root or under `src/`): everything the regression loads outside them is then frozen as test support",
             paths.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
-        ) + &if self.too_broad.is_empty() {
+        ) + &if self.missing.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " (declared but not present in the checkout, so ignored: {})",
+                self.missing.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
+            )
+        } + &if self.too_broad.is_empty() {
             String::new()
         } else {
             format!(
@@ -2036,8 +2108,14 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         }
     }
 
+    /// A checkout given as a map of files; `dir/` asks whether a directory exists.
     fn reader<'a>(map: &'a HashMap<&'a str, &'a str>) -> impl Fn(&str) -> Option<String> + 'a {
-        move |p: &str| map.get(p).map(|s| s.to_string())
+        move |p: &str| {
+            if p.ends_with('/') {
+                return map.keys().any(|k| k.starts_with(p)).then(String::new);
+            }
+            map.get(p).map(|s| s.to_string())
+        }
     }
 
     /// Packaging metadata declaring `calc` as the production code of the fixture repositories:
@@ -2100,6 +2178,12 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
                 "{line:?}"
             );
         }
+        // Only requirements files count, not any file containing the word.
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("myrequirements.txt"), "pytest\n").unwrap();
+        assert!(detect(other.path()).is_none(), "myrequirements.txt is not a requirements file");
+        std::fs::write(other.path().join("dev-requirements.txt"), "pytest\n").unwrap();
+        assert_eq!(detect(other.path()).unwrap().evidence, vec!["dev-requirements.txt"]);
         for line in ["pytest-cov-but-not-really-pytestish\n", "pytest_cov\n", "# pytest\n", "notpytest\n"] {
             std::fs::write(dir.path().join("requirements-dev.txt"), line).unwrap();
             assert!(detect(dir.path()).is_none(), "{line:?}");
@@ -2326,6 +2410,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         let frozen = HashMap::from([
             (FILE, "from tests.helpers import expected\n"),
             ("pyproject.toml", "[tool.setuptools]\npackages = [\"textkit\"]\n"),
+            ("textkit/__init__.py", ""),
         ]);
         let read = reader(&frozen);
         let check = |path: &str, status: &str| {
@@ -2840,7 +2925,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         assert_eq!(provenance_names(root, FILE), ["acme", "build", "calc", "pkg", "toplevel", "vendor"]);
         let steps = PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), root).unwrap();
         assert_eq!(steps.iter().map(|s| s.name).collect::<Vec<_>>(), ["imports", "repro", "tests"]);
-        assert_eq!(steps[0].spec.args.len(), 2, "names travel on stdin, not argv");
+        assert_eq!(steps[0].spec.args[2..], ["lib".to_string()], "pytest's pythonpath; names travel on stdin");
         assert_eq!(steps[0].spec.stdin.as_deref(), Some("acme\nbuild\ncalc\npkg\ntoplevel\nvendor\n"));
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(
@@ -3263,6 +3348,16 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             ("setup.cfg", "[metadata]\nname = cfg-dist\n[options]\npackages =\n    cfgpkg\n    cfgpkg.sub\npy_modules = single, other\n[options.extras_require]\ntest = pytest\n"),
             ("lyra.toml", "[verify]\ntest = \"python3 -m pytest\"\n[profiles.python-pytest]\npackages = [\"declared\", \"bad-name!\"]\n"),
             ("my_project/__init__.py", ""),
+            // Every declared package or module exists in the checkout: a declaration naming
+            // nothing is ignored (see the stale-declaration case below).
+            ("cli.py", ""),
+            ("src/verse/__init__.py", ""),
+            ("src/hatched/__init__.py", ""),
+            ("flat.py", ""),
+            ("cfgpkg/__init__.py", ""),
+            ("single.py", ""),
+            ("other.py", ""),
+            ("declared/", ""),
         ]);
         let production = ProductionCode::declared(&reader(&files));
         // `my_project` counts because `my_project/__init__.py` exists; the distribution names
@@ -3317,6 +3412,26 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         assert_eq!(none.classify("support/helpers.py", "tests"), Classification::Unknown);
         assert_eq!(none.classify("calc.py", "tests"), Classification::Unknown);
         // A broken pyproject declares nothing rather than failing the parse silently elsewhere.
+        // Copilot's stale declaration: `packages = ["support"]` with no `support/` in the
+        // checkout. It is ignored, so a fix cannot create `support/helpers.py` as "production"
+        // code (a regression may import it behind `try/except ImportError`); the message says so.
+        let stale = HashMap::from([
+            ("pyproject.toml", "[tool.setuptools]\npackages = [\"support\", \"calc\"]\n"),
+            ("calc/__init__.py", ""),
+        ]);
+        let production = ProductionCode::declared(&reader(&stale));
+        assert_eq!(production.names, BTreeSet::from(["calc".to_string()]));
+        assert_eq!(production.classify("support/helpers.py", "tests"), Classification::TestSupport);
+        let message = ProductionCode::declared(&reader(&HashMap::from([(
+            "pyproject.toml",
+            "[tool.setuptools]\npackages = [\"support\"]\n",
+        )])))
+        .unknown_message(&BTreeSet::from(["support/helpers.py".to_string()]));
+        assert!(message.contains("declared but not present in the checkout, so ignored: `support`"), "{message}");
+        // A namespace package (a directory, no `__init__.py`) is present too.
+        let namespace =
+            HashMap::from([("pyproject.toml", "[tool.setuptools]\npackages = [\"ns\"]\n"), ("src/ns/mod.py", "")]);
+        assert_eq!(ProductionCode::declared(&reader(&namespace)).names, BTreeSet::from(["ns".to_string()]));
         assert!(ProductionCode::declared(&|p: &str| (p == "pyproject.toml").then(|| "[project\nname=".to_string()))
             .names
             .is_empty());
@@ -3328,7 +3443,9 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
     #[test]
     fn package_declarations_resolve_to_their_actual_paths() {
         let classify = |files: &[(&str, &str)], path: &str| {
-            let map: HashMap<&str, &str> = files.iter().copied().collect();
+            // The classified path exists in the checkout, so its package directory does too.
+            let mut map: HashMap<&str, &str> = files.iter().copied().collect();
+            map.insert(path, "");
             let production = ProductionCode::declared(&reader(&map));
             production.classify(path, "tests")
         };
@@ -3349,9 +3466,9 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             // The reviewer's two layouts.
             (vec![("pyproject.toml", find_foo)], "foobar/core.py", Production),
             (vec![("pyproject.toml", find_foo)], "bar/core.py", TestSupport),
-            (vec![("pyproject.toml", poetry)], "lib/pkg/core.py", Production),
-            (vec![("pyproject.toml", poetry)], "pkg/core.py", TestSupport),
-            (vec![("pyproject.toml", poetry)], "lib/other/core.py", TestSupport),
+            (vec![("pyproject.toml", poetry), ("lib/pkg/__init__.py", "")], "lib/pkg/core.py", Production),
+            (vec![("pyproject.toml", poetry), ("lib/pkg/__init__.py", "")], "pkg/core.py", TestSupport),
+            (vec![("pyproject.toml", poetry), ("lib/pkg/__init__.py", "")], "lib/other/core.py", TestSupport),
             // find without include is as broad as `*`: it declares nothing, wherever it searches.
             (vec![("pyproject.toml", find_lib)], "lib/anything/x.py", Unknown),
             (vec![("pyproject.toml", find_lib)], "support/helpers.py", Unknown),
@@ -3362,17 +3479,17 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             // At the root, find without include declares nothing (support code would become production).
             (vec![("pyproject.toml", "[tool.setuptools.packages.find]\n")], "support/helpers.py", Unknown),
             // package-dir: a base for the package list, and per-package directories.
-            (vec![("pyproject.toml", base)], "lib/pkg/a.py", Production),
-            (vec![("pyproject.toml", base)], "pkg/a.py", TestSupport),
-            (vec![("pyproject.toml", mapped)], "code/pkgsrc/a.py", Production),
+            (vec![("pyproject.toml", base), ("lib/pkg/__init__.py", "")], "lib/pkg/a.py", Production),
+            (vec![("pyproject.toml", base), ("lib/pkg/__init__.py", "")], "pkg/a.py", TestSupport),
+            (vec![("pyproject.toml", mapped), ("code/pkgsrc/__init__.py", "")], "code/pkgsrc/a.py", Production),
             // hatch and lyra.toml paths.
-            (vec![("pyproject.toml", hatch)], "lib/hatched/a.py", Production),
-            (vec![("lyra.toml", lyra)], "vendor/mine/a.py", Production),
-            (vec![("lyra.toml", lyra)], "vendor/theirs/a.py", TestSupport),
+            (vec![("pyproject.toml", hatch), ("lib/hatched/__init__.py", "")], "lib/hatched/a.py", Production),
+            (vec![("lyra.toml", lyra), ("vendor/mine/__init__.py", "")], "vendor/mine/a.py", Production),
+            (vec![("lyra.toml", lyra), ("vendor/mine/__init__.py", "")], "vendor/theirs/a.py", TestSupport),
             // setup.cfg find: and package_dir.
             (vec![("setup.cfg", cfg_find)], "lib/core_utils/a.py", Production),
             (vec![("setup.cfg", cfg_find)], "lib/other/a.py", TestSupport),
-            (vec![("setup.cfg", cfg_dir)], "lib/pkg/a.py", Production),
+            (vec![("setup.cfg", cfg_dir), ("lib/pkg/__init__.py", "")], "lib/pkg/a.py", Production),
         ];
         for (files, path, want) in cases {
             assert_eq!(classify(&files, path), want, "{path} with {files:?}");
@@ -3391,7 +3508,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         let started = std::time::Instant::now();
         assert!(!glob_match(&adversarial, &text));
         let pyproject = format!("[tool.setuptools.packages.find]\ninclude = [\"{adversarial}\", \"calc\"]\n");
-        let files = HashMap::from([("pyproject.toml", pyproject.as_str())]);
+        let files = HashMap::from([("pyproject.toml", pyproject.as_str()), ("calc/__init__.py", "")]);
         let production = ProductionCode::declared(&reader(&files));
         assert_eq!(production.classify(&format!("{text}/x.py"), "tests"), TestSupport);
         assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
@@ -3405,7 +3522,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         let message = production.unknown_message(&BTreeSet::from(["support/helper.py".to_string()]));
         assert!(message.contains("`*` matches every package in its search path"), "{message}");
         let mixed = "[tool.setuptools.packages.find]\ninclude = [\"*\", \"?\", \"calc\"]\n";
-        let files = HashMap::from([("pyproject.toml", mixed)]);
+        let files = HashMap::from([("pyproject.toml", mixed), ("calc/__init__.py", "")]);
         let production = ProductionCode::declared(&reader(&files));
         assert_eq!(production.classify("support/helper.py", "tests"), TestSupport);
         assert_eq!(production.classify("calc/core.py", "tests"), Production);
@@ -3418,7 +3535,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         let message = production.unknown_message(&BTreeSet::from(["lib/support/helper.py".to_string()]));
         assert!(message.contains("`lib/*` matches every package in its search path"), "{message}");
         let named = "[tool.setuptools.packages.find]\nwhere = [\"lib\"]\ninclude = [\"*\", \"pkg\"]\n";
-        let files = HashMap::from([("pyproject.toml", named)]);
+        let files = HashMap::from([("pyproject.toml", named), ("lib/pkg/__init__.py", "")]);
         let production = ProductionCode::declared(&reader(&files));
         assert_eq!(production.classify("lib/support/helper.py", "tests"), TestSupport);
         assert_eq!(production.classify("lib/pkg/core.py", "tests"), Production);
@@ -4164,6 +4281,16 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         for name in GENERATED_DIRS {
             assert!(is_generated_python_dir(Path::new(name), Path::new("/nonexistent")), "{name}");
         }
+        // Build output is recognised by markers only at the root: `src/build/` with the same
+        // markers is source.
+        let dir = tempfile::tempdir().unwrap();
+        for rel in ["build/lib/x.py", "src/build/lib/x.py"] {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        assert!(is_generated_python_dir(Path::new("build"), &dir.path().join("build")));
+        assert!(!is_generated_python_dir(Path::new("src/build"), &dir.path().join("src/build")));
     }
 
     /// End to end with real pytest, the reviewer's directory-changing read: the test enters
@@ -4427,6 +4554,138 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         );
         std::fs::remove_file(purelib.join("external.pth")).unwrap();
         let check = run().await;
+        assert!(check.success(), "{}", check.combined());
+    }
+
+    /// Real Python, the reviewer's import-machinery case: a start-up hook (a `.pth` import
+    /// line, as editable installs use) puts a custom finder before `PathFinder` that resolves
+    /// `pkg` to an external copy returning 42, while the candidate's `src/pkg` returns 41. The
+    /// regression is fooled; the `imports` step asks `sys.meta_path` in order, sees the custom
+    /// finder's answer, and fails by name. Without the hook it passes.
+    #[tokio::test]
+    #[ignore = "needs a provisioned python3 with pytest on PATH"]
+    async fn a_custom_finder_before_the_path_finder_cannot_hide_external_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let timeout = Duration::from_secs(120);
+        let cancel = CancellationToken::new();
+        let write = |path: std::path::PathBuf, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let checkout = dir.path().join("checkout");
+        write(checkout.join("src/pkg/__init__.py"), "def answer():\n    return 41\n");
+        write(checkout.join("pytest.ini"), "[pytest]\n");
+        write(
+            checkout.join(FILE),
+            "from pkg import answer\n\ndef test_issue_7_fails():\n    assert answer() == 42, \"sum must be three\"\n",
+        );
+        let external = dir.path().join("site");
+        write(external.join("pkg/__init__.py"), "def answer():\n    return 42\n");
+        write(
+            external.join("lyra_test_finder.py"),
+            &format!(
+                "import importlib.util, sys\nROOT = {:?}\nclass Finder:\n    def find_spec(self, name, path=None, target=None):\n        if name == 'pkg':\n            return importlib.util.spec_from_file_location('pkg', ROOT + '/pkg/__init__.py', submodule_search_locations=[ROOT + '/pkg'])\n        return None\ndef install():\n    sys.meta_path.insert(0, Finder())\n",
+                external.to_string_lossy().replace('\\', "/")
+            ),
+        );
+
+        let venv = dir.path().join("venv");
+        let made = proc::run(
+            &CommandSpec::new(PYTHON, dir.path()).args(["-m", "venv", "--without-pip"]).arg(venv.to_string_lossy()),
+            timeout,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert!(made.success(), "{}", made.combined());
+        let venv_python = if cfg!(windows) { venv.join("Scripts/python.exe") } else { venv.join("bin/python") };
+        let purelib = proc::run(
+            &CommandSpec::new(venv_python.to_string_lossy(), dir.path())
+                .args(["-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"]),
+            timeout,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        let purelib = std::path::PathBuf::from(purelib.stdout.trim());
+        let pytest_site = proc::run(
+            &CommandSpec::new(PYTHON, dir.path())
+                .args(["-c", "import os, pytest; print(os.path.dirname(os.path.dirname(pytest.__file__)))"]),
+            timeout,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        write(purelib.join("provisioned.pth"), &format!("{}\n", pytest_site.stdout.trim()));
+        write(
+            purelib.join("zz_finder.pth"),
+            &format!("{}\nimport lyra_test_finder; lyra_test_finder.install()\n", external.display()),
+        );
+        let with_venv = |mut spec: CommandSpec| {
+            spec.program = venv_python.to_string_lossy().into_owned();
+            spec
+        };
+
+        let spec = with_venv(
+            PythonPytest
+                .reproduction_environment(PythonPytest.regression_command(&rec(), &checkout).unwrap(), dir.path()),
+        );
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "precondition: the finder wins: {out}");
+
+        let steps = PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), &checkout).unwrap();
+        assert_eq!(steps[0].name, "imports");
+        let env_root = dir.path().join("env");
+        let run = || async {
+            proc::run(&with_venv(PythonPytest.command_environment(steps[0].spec.clone(), &env_root)), timeout, &cancel)
+                .await
+                .unwrap()
+        };
+        let check = run().await;
+        assert!(
+            !check.success()
+                && check.stdout.contains("ERROR: pkg does not resolve inside the checkout")
+                && check.stdout.contains("(Finder)"),
+            "{}",
+            check.combined()
+        );
+        std::fs::remove_file(purelib.join("zz_finder.pth")).unwrap();
+        let check = run().await;
+        assert!(check.success(), "{}", check.combined());
+    }
+
+    /// End to end with real pytest, the reviewer's `pythonpath` case: `[pytest] pythonpath =
+    /// lib` with `lib/pkg`, which the regression imports. The `imports` step runs with the same
+    /// search path pytest used, so a correct fix passes verification instead of failing with
+    /// `pkg -> not found`.
+    #[tokio::test]
+    #[ignore = "needs a provisioned python3 with pytest on PATH"]
+    async fn the_imports_step_uses_pytests_pythonpath() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("pytest.ini", "[pytest]\npythonpath = lib\n");
+        write("lib/pkg/__init__.py", "def answer():\n    return 42\n");
+        write(
+            FILE,
+            "from pkg import answer\n\ndef test_issue_7_fails():\n    assert answer() == 42, \"sum must be three\"\n",
+        );
+        let timeout = Duration::from_secs(120);
+        let cancel = CancellationToken::new();
+        let spec = PythonPytest.reproduction_environment(PythonPytest.regression_command(&rec(), root).unwrap(), root);
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "{out}");
+        let steps = PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), root).unwrap();
+        assert_eq!(steps[0].name, "imports");
+        assert_eq!(steps[0].spec.stdin.as_deref(), Some("pkg\n"));
+        let env_root = dir.path().join("env");
+        let check = proc::run(&PythonPytest.command_environment(steps[0].spec.clone(), &env_root), timeout, &cancel)
+            .await
+            .unwrap();
         assert!(check.success(), "{}", check.combined());
     }
 

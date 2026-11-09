@@ -192,7 +192,7 @@ async fn verify_checkout(
         .verification_steps(&ctx.config.verify_commands(profile.id()), rec, worktree)
         .map_err(|message| StageError::fatal(ErrorKind::Config, message))?;
     let mut result = VerifyResult {
-        repository_overrides: repository_verify_overrides(&ctx.state.request.repo)?,
+        repository_overrides: repository_verify_overrides(&ctx.state.request.repo, profile.id())?,
         ..VerifyResult::default()
     };
 
@@ -307,7 +307,10 @@ async fn prepare_baseline(
     Ok(after)
 }
 
-fn repository_verify_overrides(repo: &Path) -> Result<bool, StageError> {
+/// Whether the repository's `lyra.toml` overrides a verify command this profile uses: its
+/// `[profiles.<id>.verify]` table, or the top-level `[verify]` (which applies to `rust-cargo`
+/// only, see `Config::verify_commands`). The PR body must disclose it.
+fn repository_verify_overrides(repo: &Path, profile_id: &str) -> Result<bool, StageError> {
     let path = repo.join("lyra.toml");
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -316,7 +319,9 @@ fn repository_verify_overrides(repo: &Path) -> Result<bool, StageError> {
     };
     let value: toml::Value = toml::from_str(&text)
         .map_err(|error| StageError::new(ErrorKind::Config, format!("parsing {}: {error}", path.display())))?;
-    Ok(value.get("verify").and_then(toml::Value::as_table).is_some_and(|table| !table.is_empty()))
+    let non_empty = |v: Option<&toml::Value>| v.and_then(toml::Value::as_table).is_some_and(|t| !t.is_empty());
+    let profile_table = value.get("profiles").and_then(|p| p.get(profile_id)).and_then(|p| p.get("verify"));
+    Ok(non_empty(profile_table) || (profile_id == crate::profile::rust_cargo::ID && non_empty(value.get("verify"))))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -386,6 +391,32 @@ fn assert_checkout_unchanged(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The PR body discloses repository verify overrides that apply to the run's profile:
+    /// `[profiles.<id>.verify]` for that profile, and top-level `[verify]` for rust-cargo only.
+    #[test]
+    fn repository_verify_overrides_are_detected_per_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!repository_verify_overrides(dir.path(), "python-pytest").unwrap(), "no lyra.toml");
+        std::fs::write(
+            dir.path().join("lyra.toml"),
+            "[profiles.python-pytest.verify]\ntest = \"python3 -m pytest -q\"\n",
+        )
+        .unwrap();
+        assert!(repository_verify_overrides(dir.path(), "python-pytest").unwrap());
+        assert!(!repository_verify_overrides(dir.path(), "rust-cargo").unwrap());
+        std::fs::write(dir.path().join("lyra.toml"), "[verify]\ntest = \"cargo test -p core\"\n").unwrap();
+        assert!(repository_verify_overrides(dir.path(), "rust-cargo").unwrap());
+        assert!(
+            !repository_verify_overrides(dir.path(), "python-pytest").unwrap(),
+            "unscoped [verify] is rust-cargo only"
+        );
+        std::fs::write(dir.path().join("lyra.toml"), "[profiles.python-pytest]\npackages = [\"app\"]\n").unwrap();
+        assert!(
+            !repository_verify_overrides(dir.path(), "python-pytest").unwrap(),
+            "packages alone is not a verify override"
+        );
+    }
     use crate::profile::rust_cargo::{self, RustCargo};
 
     #[test]

@@ -192,6 +192,17 @@ fn checkpoint_reader<'a>(worktree: &'a Path, checkpoint: &'a str) -> impl Fn(&st
             .map(|out| out.split('\0').filter(|p| !p.is_empty()).map(norm_path).collect());
     let cache = std::cell::RefCell::new(std::collections::HashMap::<String, Option<String>>::new());
     move |p: &str| {
+        // `dir/` asks whether a directory exists at the checkpoint (`Some("")`).
+        if let Some(dir) = p.strip_suffix('/') {
+            let prefix = format!("{}/", norm_path(dir));
+            return match &listing {
+                Some(files) => files.iter().any(|f| f.starts_with(&prefix)).then(String::new),
+                None => crate::git::run(worktree, &["ls-tree", "-d", checkpoint, norm_path(dir).as_str()])
+                    .ok()
+                    .filter(|out| !out.trim().is_empty())
+                    .map(|_| String::new()),
+            };
+        }
         let path = norm_path(p);
         if listing.as_ref().is_some_and(|files| !files.contains(&path)) {
             return None;
@@ -586,6 +597,8 @@ new file mode 100644
         assert_eq!(read("pkg\\core.py").as_deref().map(str::trim), Some("x = 1"), "normalised path, cached");
         assert_eq!(read("pkg/new.py"), None, "not in the commit");
         assert_eq!(read("pkg/missing.py"), None);
+        assert_eq!(read("pkg/").as_deref(), Some(""), "directory query");
+        assert_eq!(read("other/"), None);
         let started = std::time::Instant::now();
         for i in 0..2000 {
             assert_eq!(read(&format!("pkg/probe_{i}.py")), None);

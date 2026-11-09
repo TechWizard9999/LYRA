@@ -251,6 +251,7 @@ impl Config {
         } else {
             VerifyCommands::default()
         };
+        // Highest precedence first; for each command the first level that sets it wins.
         let levels = [&repo_profile, &repo_legacy, &operator, &legacy];
         let pick = |field: fn(&VerifyCommands) -> &Option<String>| levels.iter().find_map(|l| field(l).clone());
         VerifyCommands { build: pick(|v| &v.build), test: pick(|v| &v.test), fmt: pick(|v| &v.fmt) }
