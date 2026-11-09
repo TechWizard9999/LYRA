@@ -293,16 +293,18 @@ pub struct Cancelled;
 /// not found on `PATH`, or found but not starting. Being on `PATH` is not enough: the
 /// Windows Store `python` alias is on `PATH` and only prints "Python was not found", so each
 /// tool must also answer `--version` successfully. The check runs through the cancellable,
-/// output-bounded subprocess runner, which kills the whole process tree on Cancel or timeout.
+/// output-bounded subprocess runner, which kills the whole process tree on Cancel or when the
+/// run's hang guard (`run.timeout_minutes`, passed as `timeout`) expires.
 pub async fn missing_tools(
     profile: &dyn ExecutionProfile,
+    timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<Vec<String>, Cancelled> {
     let mut missing = Vec::new();
     for tool in profile.required_tools() {
         match crate::proc::resolve_program(tool) {
             Err(_) => missing.push(format!("{tool} (not found on PATH)")),
-            Ok(path) => match tool_starts(&path, cancel).await {
+            Ok(path) => match tool_starts(&path, timeout, cancel).await {
                 ToolStart::Usable => {}
                 ToolStart::Fails(reason) => missing.push(format!("{tool} ({reason})")),
                 ToolStart::Cancelled => return Err(Cancelled),
@@ -312,8 +314,6 @@ pub async fn missing_tools(
     Ok(missing)
 }
 
-const TOOL_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ToolStart {
     Usable,
@@ -322,11 +322,12 @@ pub(crate) enum ToolStart {
 }
 
 /// Whether `program --version` starts and succeeds, run like every other command: bounded
-/// output, a timeout, the run's cancellation token and process-tree cleanup.
-pub(crate) async fn tool_starts(program: &Path, cancel: &CancellationToken) -> ToolStart {
+/// output, the run's hang guard as its timeout, the run's cancellation token and
+/// process-tree cleanup.
+pub(crate) async fn tool_starts(program: &Path, timeout: Duration, cancel: &CancellationToken) -> ToolStart {
     let found = program.display();
     let spec = CommandSpec::new(program.to_string_lossy(), std::env::temp_dir()).arg("--version");
-    let out = match crate::proc::run(&spec, TOOL_CHECK_TIMEOUT, cancel).await {
+    let out = match crate::proc::run(&spec, timeout, cancel).await {
         Ok(out) => out,
         Err(e) => return ToolStart::Fails(format!("found at {found} but it cannot be started: {e:#}")),
     };
@@ -338,8 +339,9 @@ pub(crate) async fn tool_starts(program: &Path, cancel: &CancellationToken) -> T
     }
     if out.timed_out {
         return ToolStart::Fails(format!(
-            "found at {found} but `--version` did not answer within {} s",
-            TOOL_CHECK_TIMEOUT.as_secs()
+            "found at {found} but `--version` did not answer within the run's hang guard ({} s, \
+             `run.timeout_minutes`)",
+            timeout.as_secs()
         ));
     }
     if out.output_truncated || out.drain_timed_out {
@@ -425,24 +427,52 @@ mod tests {
             shim("python-alias", "@echo Python was not found; run without arguments to install from the Microsoft Store 1>&2\r\n@exit /b 9009\r\n"),
             shim("python-real", "@echo Python 3.14.7\r\n"),
         );
-        match tool_starts(&broken, &cancel).await {
+        match tool_starts(&broken, GUARD, &cancel).await {
             ToolStart::Fails(err) => {
                 assert!(err.contains("Python was not found") && err.contains("--version` failed with exit"), "{err}")
             }
             other => panic!("{other:?}"),
         }
-        assert_eq!(tool_starts(&working, &cancel).await, ToolStart::Usable);
+        assert_eq!(tool_starts(&working, GUARD, &cancel).await, ToolStart::Usable);
         assert!(matches!(
-            tool_starts(&dir.path().join("does-not-exist"), &cancel).await,
+            tool_starts(&dir.path().join("does-not-exist"), GUARD, &cancel).await,
             ToolStart::Fails(e) if e.contains("cannot be started")
         ));
 
         // Built-in profiles on this machine: whatever is missing is reported with a reason.
         for profile in builtin() {
-            for missing in missing_tools(&*profile, &cancel).await.unwrap() {
+            for missing in missing_tools(&*profile, GUARD, &cancel).await.unwrap() {
                 assert!(missing.contains('(') && missing.ends_with(')'), "{missing}");
             }
         }
+    }
+
+    /// The run's default hang guard (`run.timeout_minutes = 30`).
+    const GUARD: Duration = Duration::from_secs(30 * 60);
+
+    /// The tool check honours the configured hang guard: a working but slow interpreter
+    /// passes under a guard longer than its start-up and is reported (and stopped) under a
+    /// shorter one; nothing in between is a fixed limit of its own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_tool_check_uses_the_configured_hang_guard() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let slow = dir.path().join("python-slow");
+        std::fs::write(&slow, "#!/bin/sh\nsleep 2\necho 'Python 3.14.7'\n").unwrap();
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cancel = CancellationToken::new();
+        assert_eq!(tool_starts(&slow, Duration::from_secs(20), &cancel).await, ToolStart::Usable);
+        let started = std::time::Instant::now();
+        match tool_starts(&slow, Duration::from_millis(500), &cancel).await {
+            ToolStart::Fails(e) => assert!(e.contains("hang guard") && e.contains("run.timeout_minutes"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(2), "stopped at the guard: {:?}", started.elapsed());
+        // The configured value reaches the check: `Config::timeout` is what Intake passes.
+        let mut config = crate::config::Config::default();
+        config.run.timeout_minutes = 45;
+        assert_eq!(config.timeout(), Duration::from_secs(45 * 60));
     }
 
     /// Cancel during the tool check returns promptly and kills the tool's descendants too.
@@ -468,7 +498,7 @@ mod tests {
             trigger.cancel();
         });
         let started = std::time::Instant::now();
-        assert_eq!(tool_starts(&hang, &cancel).await, ToolStart::Cancelled);
+        assert_eq!(tool_starts(&hang, GUARD, &cancel).await, ToolStart::Cancelled);
         assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
         let pid = std::fs::read_to_string(&pidfile).unwrap().trim().to_string();
         let mut alive = true;
@@ -487,7 +517,7 @@ mod tests {
         std::fs::write(&noisy, "#!/bin/sh\nhead -c 2000000 /dev/zero | tr '\\0' x\n").unwrap();
         std::fs::set_permissions(&noisy, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(matches!(
-            tool_starts(&noisy, &CancellationToken::new()).await,
+            tool_starts(&noisy, GUARD, &CancellationToken::new()).await,
             ToolStart::Fails(e) if e.contains("did not behave like a version query")
         ));
     }

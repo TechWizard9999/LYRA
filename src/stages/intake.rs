@@ -101,7 +101,7 @@ async fn intake(ctx: &mut StageCtx) -> Result<(), StageError> {
     let resolution = crate::profile::resolve(&wt, ctx.state.request.profile.as_deref())
         .map_err(|reason| StageError::fatal(ErrorKind::Config, reason))?;
     let resolved = resolution.resolved.clone();
-    let missing = crate::profile::missing_tools(&*resolution.profile, &ctx.cancel)
+    let missing = crate::profile::missing_tools(&*resolution.profile, ctx.timeout(), &ctx.cancel)
         .await
         .map_err(|_| StageError::new(ErrorKind::Tool, "intake cancelled"))?;
     if !missing.is_empty() {
