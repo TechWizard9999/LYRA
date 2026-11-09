@@ -52,6 +52,11 @@ const DISCOVERY_WRAPPER: &str =
 /// process it started (`LYRA-SPAWN`), all observed through an audit hook installed before
 /// pytest starts:
 ///
+/// - Relative paths are resolved against the working directory at the moment of the open, so
+///   a test that changes directory (`os.chdir("fixtures"); open("case.json")`) is recorded as
+///   reading `fixtures/case.json`; if that directory no longer exists the path is reported as
+///   unresolved and Repro rejects the run. (`os.open(..., dir_fd=...)` is not visible in the
+///   audit event; any such file is still covered by the fix-stage allowlist.)
 /// - `open` (raised by `open`, `io.open`, `os.open` and `pathlib`) counts as a read when the
 ///   file already existed and the open can read it without truncating it first: `r`, `r+`,
 ///   `a+`, `rb`… and `os.open` with `O_RDONLY` or `O_RDWR` without `O_TRUNC`. Only `w`/`w+`
@@ -68,6 +73,7 @@ const PYTEST_RECORDER: &str = "import os, sys, pytest
 cwd = os.getcwd()
 reads = set()
 spawns = []
+unresolved = []
 active = True
 SPAWNS = ('subprocess.Popen', 'os.system', 'os.exec', 'os.posix_spawn', 'os.spawn', 'os.fork', 'os.forkpty', 'os.startfile')
 def lyra_path(path):
@@ -77,7 +83,13 @@ def lyra_path(path):
         path = os.fspath(path)
     if not isinstance(path, str):
         return None
-    return path if os.path.isabs(path) else os.path.join(cwd, path)
+    if os.path.isabs(path):
+        return path
+    try:
+        return os.path.join(os.getcwd(), path)
+    except OSError:
+        unresolved.append(path)
+        return None
 def lyra_existing(path):
     try:
         return path is not None and os.path.isfile(path)
@@ -124,11 +136,14 @@ for path in sorted(reads):
         print('LYRA-READ ' + inside(path))
 for spawn in spawns:
     print('LYRA-SPAWN ' + spawn)
+for path in unresolved:
+    print('LYRA-UNRESOLVED ' + path.replace(chr(10), ' ')[:200])
 print('LYRA-LOADED-END')
 sys.exit(code)";
 const LOADED_PREFIX: &str = "LYRA-LOADED ";
 const READ_PREFIX: &str = "LYRA-READ ";
 const SPAWN_PREFIX: &str = "LYRA-SPAWN ";
+const UNRESOLVED_PREFIX: &str = "LYRA-UNRESOLVED ";
 const LOADED_END: &str = "LYRA-LOADED-END";
 
 const PYTEST_CONFIG_FILES: [&str; 4] = ["pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml"];
@@ -851,6 +866,14 @@ pub fn parse_loaded_modules(output: &str, test_file: &str, production: &Producti
             "the regression started a child process ({}), whose file reads LYRA cannot observe, so it cannot \
              establish which test inputs to lock; reproduce the bug by calling the project's code in-process",
             spawns.iter().map(|s| format!("`{}`", s.trim())).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    let unresolved: Vec<&str> = output.lines().filter_map(|l| l.trim().strip_prefix(UNRESOLVED_PREFIX)).collect();
+    if !unresolved.is_empty() {
+        return Err(format!(
+            "the regression opened {} relative to a working directory that no longer exists, so LYRA cannot establish \
+             which files it read",
+            unresolved.iter().map(|p| format!("`{}`", p.trim())).collect::<Vec<_>>().join(", ")
         ));
     }
     let tree = test_tree(test_file);
@@ -3200,6 +3223,9 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             "LYRA-LOADED-END",
             "LYRA-SPAWN subprocess.Popen /usr/bin/python3\nLYRA-SPAWN os.system cat fixtures/input.json\nLYRA-LOADED-END",
         );
+        let lost = report.replace("LYRA-LOADED-END", "LYRA-UNRESOLVED case.json\nLYRA-LOADED-END");
+        let unresolved = parse_loaded_modules(&lost, FILE, &declared()).unwrap_err();
+        assert!(unresolved.contains("`case.json`") && unresolved.contains("cannot establish"), "{unresolved}");
         let err = parse_loaded_modules(&spawned, FILE, &declared()).unwrap_err();
         for expected in [
             "child process",
@@ -4193,6 +4219,53 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         for name in GENERATED_DIRS {
             assert!(is_generated_python_dir(Path::new(name), Path::new("/nonexistent")), "{name}");
         }
+    }
+
+    /// End to end with real pytest, the reviewer's directory-changing read: the test enters
+    /// `fixtures/` and reads `case.json` there. The recorder resolves the relative path at the
+    /// time of the open and freezes `fixtures/case.json`; changing it would make the unchanged
+    /// failing test pass and is rejected, both through the recorded input and by the allowlist.
+    #[tokio::test]
+    #[ignore = "needs a provisioned python3 with pytest on PATH"]
+    async fn reads_after_a_directory_change_are_recorded_where_they_happen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("pytest.ini", "[pytest]\n");
+        write("pyproject.toml", PYPROJECT);
+        write("calc.py", "def add(a, b):\n    return a - b\n");
+        write("fixtures/case.json", "[1, 2, 3]\n");
+        write(
+            FILE,
+            "import json, os\nfrom calc import add\n\ndef test_issue_7_fails():\n    os.chdir(\"fixtures\")\n    try:\n        a, b, expected = json.load(open(\"case.json\"))\n    finally:\n        os.chdir(\"..\")\n    assert add(a, b) == expected, \"sum must be three\"\n",
+        );
+        let timeout = Duration::from_secs(120);
+        let cancel = CancellationToken::new();
+        let spec = PythonPytest.reproduction_environment(PythonPytest.regression_command(&rec(), root).unwrap(), root);
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Failed, "{out}");
+        assert!(out.contains("LYRA-READ fixtures/case.json"), "{out}");
+        let loaded = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap();
+        assert_eq!(loaded, ["fixtures/case.json"], "{out}");
+
+        let frozen: HashMap<String, String> = [FILE, "pyproject.toml", "calc.py", "fixtures/case.json"]
+            .into_iter()
+            .map(|p| (p.to_string(), std::fs::read_to_string(root.join(p)).unwrap()))
+            .collect();
+        let read_checkpoint = |p: &str| frozen.get(p).cloned();
+        let read_now = |p: &str| std::fs::read_to_string(root.join(p)).ok();
+        write("fixtures/case.json", "[4, 1, 3]\n");
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "the attack works without the lock: {out}");
+        let change = vec![("M".to_string(), "fixtures/case.json".to_string())];
+        let with_recorder = ReproRecord { frozen_inputs: loaded, ..rec() };
+        let err = check_fix_changes_with(&change, &with_recorder, &read_checkpoint, &read_now).unwrap_err();
+        assert!(err.contains("fixtures/case.json") && err.contains("repro input"), "recorded evidence: {err}");
+        assert!(check_fix_changes_with(&change, &rec(), &read_checkpoint, &read_now).is_err(), "allowlist alone");
     }
 
     #[test]
