@@ -62,6 +62,10 @@ const DISCOVERY_WRAPPER: &str =
 ///   `a+`, `rb`… and `os.open` with `O_RDONLY` or `O_RDWR` without `O_TRUNC`. Only `w`/`w+`
 ///   (and `O_TRUNC`), which discard the content, and write-only opens are not reads.
 /// - `sqlite3.connect` of an existing database file counts as a read.
+/// - pytest itself reads the root `pyproject.toml`, `setup.cfg` and `tox.ini` while it
+///   configures, before the session starts (marked by a `pytest_sessionstart` hook); those
+///   reads are not regression inputs. The same file read during the session (the test parses
+///   its own manifest) is one, and is frozen whole, dependency fields included.
 /// - `subprocess.Popen`, `os.system`, `os.exec`, `os.posix_spawn`, `os.spawn`, `os.fork`,
 ///   `os.forkpty` and `os.startfile` start a process whose reads this interpreter cannot see,
 ///   so the inputs of such a regression cannot be established and Repro rejects it.
@@ -72,6 +76,8 @@ const DISCOVERY_WRAPPER: &str =
 const PYTEST_RECORDER: &str = "import os, sys, pytest
 cwd = os.getcwd()
 reads = set()
+session_reads = set()
+session_started = False
 spawns = []
 unresolved = []
 active = True
@@ -109,10 +115,14 @@ def lyra_audit(event, args):
         path = lyra_path(path)
         if readable and not truncating and lyra_existing(path):
             reads.add(path)
+            if session_started:
+                session_reads.add(path)
     elif event == 'sqlite3.connect':
         path = lyra_path(args[0]) if args else None
         if lyra_existing(path):
             reads.add(path)
+            if session_started:
+                session_reads.add(path)
     elif event in SPAWNS:
         what = args[0] if args else ''
         if isinstance(what, (list, tuple)):
@@ -120,8 +130,12 @@ def lyra_audit(event, args):
         if isinstance(what, bytes):
             what = os.fsdecode(what)
         spawns.append(event + ' ' + str(what).replace(chr(10), ' ')[:200])
+class LyraSession:
+    def pytest_sessionstart(self, session):
+        global session_started
+        session_started = True
 sys.addaudithook(lyra_audit)
-code = int(pytest.main(sys.argv[1:]))
+code = int(pytest.main(sys.argv[1:], plugins=[LyraSession()]))
 active = False
 root = os.path.realpath(cwd)
 def inside(path):
@@ -131,8 +145,11 @@ for module in list(sys.modules.values()):
     path = getattr(module, '__file__', None)
     if isinstance(path, str) and inside(path):
         print('LYRA-LOADED ' + inside(path))
+ROOT_SETUP = ('pyproject.toml', 'setup.cfg', 'tox.ini', 'setup.py')
 for path in sorted(reads):
     if os.path.isfile(path) and inside(path):
+        if inside(path) in ROOT_SETUP and path not in session_reads:
+            continue
         print('LYRA-READ ' + inside(path))
 for spawn in spawns:
     print('LYRA-SPAWN ' + spawn)
@@ -911,16 +928,12 @@ pub fn parse_loaded_modules(output: &str, test_file: &str, production: &Producti
 }
 
 /// A file the run read that counts as an input of the regression: anything but byte-code,
-/// path files, pytest configuration files (frozen anywhere by the collection guard) and the
-/// root packaging files pytest itself reads at start-up (`pyproject.toml`, `setup.cfg`,
-/// `tox.ini`, `setup.py`, governed by the manifest and allowlist rules). A file with a
-/// configuration-like name anywhere else, such as `fixtures/pyproject.toml`, is data.
+/// path files and pytest configuration files (frozen anywhere by the collection guard). The
+/// recorder already leaves out pytest's own start-up reads of the root packaging files, so a
+/// root `pyproject.toml` that is reported was read by the regression and is frozen whole.
 fn is_data_input(path: &str) -> bool {
-    const ROOT_CONFIGURATION: [&str; 4] = ["pyproject.toml", "setup.cfg", "tox.ini", "setup.py"];
     let name = guards::base_name(path);
-    !(name.ends_with(".pyc") || name.ends_with(".pth"))
-        && !PYTEST_CONFIG_FILES.contains(&name)
-        && !ROOT_CONFIGURATION.contains(&path)
+    !(name.ends_with(".pyc") || name.ends_with(".pth")) && !PYTEST_CONFIG_FILES.contains(&name)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -3204,6 +3217,8 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
                 "data/golden.bin",
                 "fixtures/input.json",
                 "helpers.py",
+                "pyproject.toml",
+                "setup.cfg",
                 "src/other/schema.json",
                 "src/support/helper.py",
                 "support/__init__.py",
@@ -3214,7 +3229,8 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
                 "tests/test_helpers.py"
             ],
             "declared `calc` modules (at the root or under `src/`) stay editable; undeclared modules under `src/` and \
-             every non-source file the run read are frozen; configuration belongs to its guard, caches to nobody"
+             every non-source file the run read are frozen, root manifests the recorder reports as the \
+             regression's own reads included; pytest configuration belongs to its guard, caches to nobody"
         );
         let err = parse_loaded_modules("1 failed in 0.02s\nLYRA-LOADED tests/test_helpers.py\n", FILE, &declared())
             .unwrap_err();
@@ -4266,6 +4282,69 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         let err = check_fix_changes_with(&change, &with_recorder, &read_checkpoint, &read_now).unwrap_err();
         assert!(err.contains("fixtures/case.json") && err.contains("repro input"), "recorded evidence: {err}");
         assert!(check_fix_changes_with(&change, &rec(), &read_checkpoint, &read_now).is_err(), "allowlist alone");
+    }
+
+    /// End to end with real pytest, the reviewer's manifest-as-input case: the regression
+    /// reads the root `pyproject.toml` itself (its `[project] dependencies`) and passes the
+    /// value to production code. pytest's own start-up read of the file is not an input, but
+    /// this read happens during the session, so the manifest is frozen: an edit to the
+    /// dependency field alone, which would make the unchanged failing test pass, is rejected
+    /// even though dependency fields are otherwise editable. A test that does not read the
+    /// manifest leaves its dependency fields editable.
+    #[tokio::test]
+    #[ignore = "needs a provisioned python3 with pytest on PATH"]
+    async fn a_manifest_the_regression_reads_is_frozen_even_in_its_dependency_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let manifest =
+            "[project]\nname = \"calc\"\ndependencies = [\"bad\"]\n[tool.pytest.ini_options]\naddopts = \"\"\n";
+        write("pyproject.toml", manifest);
+        write("calc.py", "def accepted(deps):\n    return deps == [\"bad\"]\n");
+        write(
+            FILE,
+            "import tomllib\nfrom calc import accepted\n\ndef test_issue_7_fails():\n    deps = tomllib.load(open(\"pyproject.toml\", \"rb\"))[\"project\"][\"dependencies\"]\n    assert not accepted(deps), \"bad dependencies must be rejected\"\n",
+        );
+        let timeout = Duration::from_secs(120);
+        let cancel = CancellationToken::new();
+        let spec = PythonPytest.reproduction_environment(PythonPytest.regression_command(&rec(), root).unwrap(), root);
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Failed, "{out}");
+        let loaded = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap();
+        assert_eq!(loaded, ["pyproject.toml"], "the regression's own read of the manifest: {out}");
+
+        let frozen: HashMap<String, String> = [FILE, "pyproject.toml", "calc.py"]
+            .into_iter()
+            .map(|p| (p.to_string(), std::fs::read_to_string(root.join(p)).unwrap()))
+            .collect();
+        let read_checkpoint = |p: &str| frozen.get(p).cloned();
+        let read_now = |p: &str| std::fs::read_to_string(root.join(p)).ok();
+        write("pyproject.toml", &manifest.replace("[\"bad\"]", "[\"good\"]"));
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "the attack works without the lock: {out}");
+        let change = vec![("M".to_string(), "pyproject.toml".to_string())];
+        let with_recorder = ReproRecord { frozen_inputs: loaded, ..rec() };
+        let err = check_fix_changes_with(&change, &with_recorder, &read_checkpoint, &read_now).unwrap_err();
+        assert!(err.contains("pyproject.toml") && err.contains("repro input"), "{err}");
+
+        // A regression that does not read the manifest: only pytest's start-up read happens,
+        // nothing is frozen, and a dependency edit stays allowed.
+        write("pyproject.toml", manifest);
+        write(FILE, "from calc import accepted\n\ndef test_issue_7_fails():\n    assert not accepted([\"bad\"]), \"bad dependencies must be rejected\"\n");
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Failed, "{out}");
+        assert!(PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap().is_empty(), "{out}");
+        let frozen: HashMap<String, String> = [FILE, "pyproject.toml", "calc.py"]
+            .into_iter()
+            .map(|p| (p.to_string(), std::fs::read_to_string(root.join(p)).unwrap()))
+            .collect();
+        let read_checkpoint = |p: &str| frozen.get(p).cloned();
+        write("pyproject.toml", &manifest.replace("[\"bad\"]", "[\"bad\", \"attrs\"]"));
+        check_fix_changes_with(&change, &rec(), &read_checkpoint, &read_now).unwrap();
     }
 
     #[test]
