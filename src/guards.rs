@@ -56,6 +56,11 @@ pub struct ReproRecord {
     /// absent in records written before profiles existed (all of them `rust-cargo`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// Every other file the repro stage created (fixtures, package initializers), frozen with
+    /// the test through Fix and Verify. Set by the harness from the S2 diff; empty in records
+    /// written before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frozen_inputs: Vec<String>,
 }
 
 fn validate_repro_path(path: &str) -> Result<(), String> {
@@ -171,34 +176,77 @@ pub fn check_fix_changes(
     checkpoint: &str,
     profile: &dyn ExecutionProfile,
 ) -> Result<(), String> {
-    let read_checkpoint = |p: &str| crate::git::show_file(worktree, checkpoint, p).ok();
+    let read_checkpoint = checkpoint_reader(worktree, checkpoint);
     let read_now = |p: &str| std::fs::read_to_string(worktree.join(p)).ok();
     profile.check_fix_changes(changes, rec, &read_checkpoint, &read_now)
+}
+
+/// Reads files at `checkpoint`. Profiles probe many candidate paths (every place an import
+/// could resolve), so the commit's file list is taken once with `git ls-tree` and a path that
+/// is not in it returns `None` without starting a process; contents are cached. If the
+/// listing fails, every read falls back to `git show`.
+fn checkpoint_reader<'a>(worktree: &'a Path, checkpoint: &'a str) -> impl Fn(&str) -> Option<String> + 'a {
+    let listing: Option<std::collections::HashSet<String>> =
+        crate::git::run(worktree, &["ls-tree", "-r", "-z", "--name-only", checkpoint])
+            .ok()
+            .map(|out| out.split('\0').filter(|p| !p.is_empty()).map(norm_path).collect());
+    let cache = std::cell::RefCell::new(std::collections::HashMap::<String, Option<String>>::new());
+    move |p: &str| {
+        // `dir/` asks whether a directory exists at the checkpoint (`Some("")`).
+        if let Some(dir) = p.strip_suffix('/') {
+            let prefix = format!("{}/", norm_path(dir));
+            return match &listing {
+                Some(files) => files.iter().any(|f| f.starts_with(&prefix)).then(String::new),
+                None => crate::git::run(worktree, &["ls-tree", "-d", checkpoint, norm_path(dir).as_str()])
+                    .ok()
+                    .filter(|out| !out.trim().is_empty())
+                    .map(|_| String::new()),
+            };
+        }
+        let path = norm_path(p);
+        if listing.as_ref().is_some_and(|files| !files.contains(&path)) {
+            return None;
+        }
+        if let Some(hit) = cache.borrow().get(&path) {
+            return hit.clone();
+        }
+        let content = crate::git::show_file(worktree, checkpoint, &path).ok();
+        cache.borrow_mut().insert(path, content.clone());
+        content
+    }
 }
 
 fn normalise_text(s: &str) -> String {
     s.replace("\r\n", "\n").trim_end().to_string()
 }
 
-/// The universal part of every test lock: the frozen test file is byte-for-byte its S2 form
-/// (git's own comparison first, then the content after newline normalisation, because
-/// `git show` trims and autocrlf may differ). Returns the violations for the profile to extend.
+/// The universal part of every test lock: the frozen test file and every input the repro
+/// stage created with it (`frozen_inputs`: fixtures, package initializers) are byte-for-byte
+/// their S2 form (git's own comparison first, then the content after newline normalisation,
+/// because `git show` trims and autocrlf may differ). A fix cannot make the locked test pass
+/// by changing the data it reads. Returns the violations for the profile to extend.
 pub fn frozen_test_violations(
     changes: &[(String, String)],
     rec: &ReproRecord,
     read_checkpoint: &dyn Fn(&str) -> Option<String>,
     read_now: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<String> {
-    let test_file = norm_path(&rec.test_file);
     let mut violations = Vec::new();
-    if changes.iter().any(|(_, p)| norm_path(p) == test_file) {
-        violations.push(format!("{test_file}: the repro test file was modified or removed (it is locked)"));
-    } else {
-        match (read_checkpoint(&test_file), read_now(&test_file)) {
+    let frozen = std::iter::once((norm_path(&rec.test_file), "the repro test file"))
+        .chain(rec.frozen_inputs.iter().map(|p| (norm_path(p), "a repro input")));
+    for (path, what) in frozen {
+        if path.is_empty() {
+            continue;
+        }
+        if changes.iter().any(|(_, p)| norm_path(p) == path) {
+            violations.push(format!("{path}: {what} was modified, replaced or removed (it is locked)"));
+            continue;
+        }
+        match (read_checkpoint(&path), read_now(&path)) {
             (Some(frozen), Some(now)) if normalise_text(&frozen) != normalise_text(&now) => {
-                violations.push(format!("{test_file}: content differs from its frozen form"));
+                violations.push(format!("{path}: content of {what} differs from its frozen form"));
             }
-            (Some(_), None) => violations.push(format!("{test_file}: the repro test file was deleted")),
+            (Some(_), None) => violations.push(format!("{path}: {what} was deleted")),
             _ => {}
         }
     }
@@ -318,6 +366,7 @@ mod tests {
             frozen_commit: None,
             frozen_len: None,
             profile: None,
+            frozen_inputs: Vec::new(),
         }
     }
 
@@ -525,6 +574,114 @@ new file mode 100644
         let changes = git::changed_files(wt, &checkpoint).unwrap();
         let err = check_fix_changes(&changes, &rec(), wt, &checkpoint, &RustCargo).unwrap_err();
         assert!(err.contains("tests/issue_123.rs"), "{err}");
+    }
+
+    /// The checkpoint reader answers from the commit, not the worktree: listed files are read
+    /// (and cached), unlisted ones are `None` without a `git show`, and later worktree edits do
+    /// not leak in.
+    #[test]
+    fn checkpoint_reader_reads_the_commit_and_skips_unlisted_paths() {
+        use crate::git;
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path();
+        git::run(wt, &["init", "-q", "-b", "main"]).unwrap();
+        git::run(wt, &["config", "user.email", "t@example.com"]).unwrap();
+        git::run(wt, &["config", "user.name", "T"]).unwrap();
+        std::fs::create_dir_all(wt.join("pkg")).unwrap();
+        std::fs::write(wt.join("pkg/core.py"), "x = 1\n").unwrap();
+        let sha = git::commit_all(wt, "init").unwrap();
+        std::fs::write(wt.join("pkg/core.py"), "x = 2\n").unwrap();
+        std::fs::write(wt.join("pkg/new.py"), "y = 1\n").unwrap();
+        let read = checkpoint_reader(wt, &sha);
+        assert_eq!(read("pkg/core.py").as_deref().map(str::trim), Some("x = 1"));
+        assert_eq!(read("pkg\\core.py").as_deref().map(str::trim), Some("x = 1"), "normalised path, cached");
+        assert_eq!(read("pkg/new.py"), None, "not in the commit");
+        assert_eq!(read("pkg/missing.py"), None);
+        assert_eq!(read("pkg/").as_deref(), Some(""), "directory query");
+        assert_eq!(read("other/"), None);
+        let started = std::time::Instant::now();
+        for i in 0..2000 {
+            assert_eq!(read(&format!("pkg/probe_{i}.py")), None);
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "unlisted probes start no process");
+    }
+
+    /// A fix must not make the locked test pass by changing the data it reads: every file the
+    /// repro stage created is frozen with the test, for every profile.
+    #[test]
+    fn repro_created_fixtures_are_locked_through_fix_for_every_profile() {
+        use crate::git;
+        use crate::profile::{python_pytest::PythonPytest, ExecutionProfile};
+        let cases: [(&dyn ExecutionProfile, &str, &str, &str); 2] = [
+            (&RustCargo, "Cargo.toml", "tests/issue_123.rs", "tests/fixtures/frame.bin"),
+            (&PythonPytest, "pytest.ini", "tests/test_issue_123.py", "tests/fixtures/input.json"),
+        ];
+        for (profile, manifest, test_file, fixture) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let wt = dir.path();
+            // A production source file of the profile's language.
+            let source = if profile.id() == "python-pytest" { "src/core.py" } else { "src/core.rs" };
+            git::run(wt, &["init", "-q", "-b", "main"]).unwrap();
+            git::run(wt, &["config", "user.email", "t@example.com"]).unwrap();
+            git::run(wt, &["config", "user.name", "T"]).unwrap();
+            std::fs::write(wt.join(manifest), "[package]\nname = \"foo\"\nversion = \"0.1.0\"\n").unwrap();
+            std::fs::create_dir_all(wt.join("src")).unwrap();
+            std::fs::write(wt.join(source), "buggy\n").unwrap();
+            if profile.id() == "python-pytest" {
+                // Production code is what the repository declares.
+                std::fs::write(wt.join("pyproject.toml"), "[tool.setuptools]\npy-modules = [\"core\"]\n").unwrap();
+            }
+            git::commit_all(wt, "init").unwrap();
+
+            // S2: the test plus a fixture holding the input that triggers the bug.
+            std::fs::create_dir_all(wt.join("tests/fixtures")).unwrap();
+            std::fs::write(wt.join(test_file), "reads tests/fixtures and fails on the buggy input\n").unwrap();
+            std::fs::write(wt.join(fixture), "{\"frame\": [1, 2]}\n").unwrap();
+            let mut record = rec();
+            record.test_file = test_file.into();
+            record.test_name = if profile.id() == "python-pytest" {
+                format!("{test_file}::test_issue_123_rejects_short_frame")
+            } else {
+                "issue_123_rejects_short_frame".into()
+            };
+            record.command = profile.regression_command_line(&record);
+            record.frozen_inputs = vec![fixture.into()];
+            let checkpoint = git::commit_all(wt, "test: failing repro for #123").unwrap();
+
+            // A real production fix passes the lock.
+            std::fs::write(wt.join(source), "fixed\n").unwrap();
+            let changes = git::changed_files(wt, &checkpoint).unwrap();
+            assert_eq!(check_fix_changes(&changes, &record, wt, &checkpoint, profile), Ok(()), "{}", profile.id());
+
+            // Changing only the fixture to a non-triggering input is rejected...
+            std::fs::write(wt.join(source), "buggy\n").unwrap();
+            std::fs::write(wt.join(fixture), "{\"frame\": [1, 2, 3, 4]}\n").unwrap();
+            let changes = git::changed_files(wt, &checkpoint).unwrap();
+            let err = check_fix_changes(&changes, &record, wt, &checkpoint, profile).unwrap_err();
+            assert!(err.contains(fixture) && err.contains("repro input"), "{}: {err}", profile.id());
+            // ...as is deleting it...
+            std::fs::remove_file(wt.join(fixture)).unwrap();
+            let changes = git::changed_files(wt, &checkpoint).unwrap();
+            assert!(check_fix_changes(&changes, &record, wt, &checkpoint, profile).unwrap_err().contains(fixture));
+            // ...or replacing it, even alongside a production change.
+            std::fs::write(wt.join(fixture), "[]\n").unwrap();
+            std::fs::write(wt.join(source), "fixed\n").unwrap();
+            let changes = git::changed_files(wt, &checkpoint).unwrap();
+            assert!(check_fix_changes(&changes, &record, wt, &checkpoint, profile).unwrap_err().contains(fixture));
+        }
+    }
+
+    #[test]
+    fn frozen_inputs_round_trip_and_old_records_load_without_them() {
+        let mut record = rec();
+        record.frozen_inputs = vec!["tests/fixtures/a.json".into()];
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(json["frozen_inputs"], serde_json::json!(["tests/fixtures/a.json"]));
+        let mut old = json.clone();
+        old.as_object_mut().unwrap().remove("frozen_inputs");
+        let loaded: ReproRecord = serde_json::from_value(old).unwrap();
+        assert!(loaded.frozen_inputs.is_empty());
+        assert!(serde_json::to_value(&loaded).unwrap().get("frozen_inputs").is_none());
     }
 
     #[cfg(unix)]

@@ -18,6 +18,9 @@ pub struct NewRunForm {
     pub issue_text: String,
     #[serde(default)]
     pub provider: String,
+    /// Execution profile id, or empty for detection.
+    #[serde(default)]
+    pub profile: String,
     /// Checkbox: present ("on") when ticked.
     #[serde(default)]
     pub policy_acknowledged: Option<String>,
@@ -87,6 +90,15 @@ pub fn home(v: &HomeView) -> Markup {
                             select name="provider" {
                                 @for p in &v.providers {
                                     option value=(p) selected[p.as_str() == selected] { (p) }
+                                }
+                            }
+                        }
+                        label {
+                            span { "Execution profile" }
+                            select name="profile" {
+                                option value="" selected[v.form.profile.is_empty()] { "auto-detect" }
+                                @for p in crate::profile::builtin() {
+                                    option value=(p.id()) selected[v.form.profile == p.id()] { (p.id()) }
                                 }
                             }
                         }
@@ -397,6 +409,7 @@ mod tests {
             issue_text: None,
             provider: None,
             policy_acknowledged: false,
+            profile: None,
         };
         RunState::new("demo-7-20261104-101500".into(), req, "claude".into())
     }

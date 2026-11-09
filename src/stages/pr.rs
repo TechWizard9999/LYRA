@@ -272,6 +272,48 @@ mod tests {
         assert!(!b.contains("&#x60;") && !b.contains("&quot;"), "no HTML escaping");
     }
 
+    /// A Python reproduction runs through an embedded recorder program; the PR must show the
+    /// plain pytest command on one line, inside inline code and inside the verification table.
+    #[test]
+    fn python_reproduction_commands_render_as_one_copyable_line() {
+        use crate::profile::{python_pytest::PythonPytest, ExecutionProfile};
+        use std::path::Path;
+        let rec = crate::guards::ReproRecord {
+            reproduced: true,
+            krate: String::new(),
+            test_file: "tests/test_issue_7.py".into(),
+            test_name: "tests/test_issue_7.py::test_issue_7_fails".into(),
+            command: String::new(),
+            expected: "sum must be three".into(),
+            observed: String::new(),
+            registration_file: None,
+            notes: String::new(),
+            frozen_commit: None,
+            frozen_len: None,
+            profile: Some("python-pytest".into()),
+            frozen_inputs: Vec::new(),
+        };
+        let command = PythonPytest.regression_command_line(&rec);
+        let executed = PythonPytest.regression_command(&rec, Path::new("/w")).unwrap();
+        assert!(executed.args.iter().any(|a| a.contains('\n')), "the recorder really is multi-line");
+        assert_eq!(executed.display(), command);
+        assert!(
+            !command.contains('\n') && command.chars().all(|c| c.is_ascii_alphanumeric() || " -_./:=".contains(c)),
+            "valid as typed in sh and PowerShell: {command}"
+        );
+        let mut v = sample();
+        v["repro"] = json!({"reproduced": true, "crate": "", "test_file": rec.test_file, "test_name": rec.test_name,
+            "command": command, "expected": rec.expected, "observed": "", "registration_file": null, "notes": "", "frozen_commit": "aaa"});
+        v["verify"]["steps"] = json!([{"name": "repro", "command": executed.display(), "ok": true, "exit_code": 0, "duration_ms": 400, "log": "50-verify/repro-after.txt"}]);
+        let body = pr_body(&v).unwrap();
+        // Whole lines, so the command and nothing else is on each (`lines()` also accepts the
+        // CRLF a Windows checkout with `core.autocrlf` gives the template).
+        let has_line = |line: String| body.lines().any(|l| l == line);
+        assert!(has_line(format!("- Run it: `{command}`")), "{body}");
+        assert!(has_line(format!("| repro | `{command}` | pass | 0.4 s |")), "{body}");
+        assert!(!body.contains("pytest.main"), "no recorder source in the PR: {body}");
+    }
+
     #[test]
     fn body_tolerates_missing_artifacts() {
         let mut v = sample();

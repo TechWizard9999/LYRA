@@ -100,6 +100,7 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
     // Fields supplied by the model cannot claim that a checkpoint already exists.
     rec.frozen_commit = None;
     rec.frozen_len = None;
+    rec.frozen_inputs = Vec::new();
     rec.profile = Some(profile.id().to_string());
 
     // 3. Only the allowed files may have changed.
@@ -170,6 +171,10 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
         }
     }
     ctx.events.info(format!("repro: test {} fails with the expected text", rec.test_name));
+    // Test-side modules and test support the failing run actually loaded are frozen with the test.
+    let loaded = profile
+        .loaded_test_inputs(&output, &rec, &worktree)
+        .map_err(|msg| StageError::new(ErrorKind::Guard, msg).with_details(&out_rel))?;
 
     // 5. Build scripts may have written files; guard that final diff before committing.
     if std::fs::read(&abs_test).map_err(|e| StageError::new(ErrorKind::Io, e.to_string()))? != tested_source {
@@ -178,6 +183,16 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
     let changes = git::changed_files(&worktree, &base).map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
     guards::check_repro_changes(&changes, &rec, &worktree, &base, &*profile)
         .map_err(|msg| StageError::new(ErrorKind::Guard, msg))?;
+    // Everything else this stage created is a test input: frozen with the test (PLAN §3.3).
+    rec.frozen_inputs = changes
+        .iter()
+        .filter(|(status, _)| guards::is_new(status))
+        .map(|(_, path)| guards::norm_path(path))
+        .filter(|path| *path != rec.test_file && !profile.is_toolchain_output(path))
+        .chain(loaded)
+        .collect();
+    rec.frozen_inputs.sort();
+    rec.frozen_inputs.dedup();
     let sha = git::commit_all(&worktree, &format!("test: failing repro for #{n}"))
         .map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
     ctx.state.checkpoints.insert(StageId::Repro, sha.clone());
@@ -376,6 +391,7 @@ mod tests {
                 issue_text: None,
                 provider: None,
                 policy_acknowledged: false,
+                profile: None,
             },
             "claude".into(),
         );
@@ -402,6 +418,7 @@ mod tests {
             frozen_commit: None,
             frozen_len: None,
             profile: Some(rust_cargo::ID.into()),
+            frozen_inputs: Vec::new(),
         };
         (temporary, ctx, record)
     }
@@ -544,6 +561,7 @@ mod tests {
             frozen_commit: Some("abc123".into()),
             frozen_len: Some(10),
             profile: Some("rust-cargo".into()),
+            frozen_inputs: Vec::new(),
         };
         let md = repro_markdown(&rec, 9);
         assert!(md.starts_with("# Repro for #9"));
@@ -555,19 +573,39 @@ mod tests {
 
     #[test]
     fn prompt_renders_with_and_without_context() {
-        let mut env = minijinja::Environment::new();
-        env.add_template("repro.md", assets::REPRO_PROMPT).unwrap();
-        let t = env.get_template("repro.md").unwrap();
-        let full = t
-            .render(json!({"issue": "# Bug", "context_summary": "{\"crate\":\"foo\"}", "instructions": "use fmt", "repo_json": "{}", "issue_number": 7}))
-            .unwrap();
+        use crate::profile::python_pytest::PythonPytest;
+        use crate::stages::render_prompt;
+        let render = |profile: &dyn ExecutionProfile, values| {
+            render_prompt(profile, "repro.md", assets::REPRO_PROMPT, values).unwrap()
+        };
+        let full = render(
+            &RustCargo,
+            json!({"issue": "# Bug", "context_summary": "{\"crate\":\"foo\"}", "instructions": "use fmt", "repo_json": "{}", "issue_number": 7}),
+        );
+        assert!(full.contains("in the Rust repository"));
         assert!(full.contains("tests/issue_7.rs"));
         assert!(full.contains("mod issue_7_tests;"));
         assert!(full.contains("Repository instructions"));
         assert!(full.contains("use fmt"));
-        let bare = t.render(json!({"issue": "# Bug", "context_summary": "", "instructions": "", "repo_json": "", "issue_number": 7})).unwrap();
+        assert!(full.contains("the crate most likely involved"));
+        let bare = render(
+            &RustCargo,
+            json!({"issue": "# Bug", "context_summary": "", "instructions": "", "repo_json": "", "issue_number": 7}),
+        );
         assert!(!bare.contains("Repository instructions"));
         assert!(!bare.contains("Repository facts"));
         assert!(bare.contains("-- --exact"));
+
+        let python = render(
+            &PythonPytest,
+            json!({"issue": "# Bug", "context_summary": "{}", "instructions": "", "repo_json": "{}", "issue_number": 7}),
+        );
+        assert!(python.contains("in the Python repository"));
+        assert!(python.contains("`test_issue_7.py`"));
+        assert!(python.contains("tests/test_issue_7.py::test_issue_7_rejects_short_frame"));
+        assert!(python.contains("registration_file`: null"));
+        for rust in ["cargo", "Cargo.toml", "#[test]", "crate most likely"] {
+            assert!(!python.contains(rust), "{rust} leaked into the Python prompt");
+        }
     }
 }

@@ -9,7 +9,7 @@ Fixes {% if issue_ref %}{{ issue_ref }}{% else %}#{{ issue_number }}{% endif %}{
 {% if repro -%}
 A regression test was written before the fix and failed on the recorded assertion.
 
-- Test: `{{ repro.test_name }}` in `{{ repro.test_file }}`{% if repro.crate %} (crate `{{ repro.crate }}`){% endif %}
+- Test: `{{ repro.test_name }}` in `{{ repro.test_file }}`{% if repro.crate %} (project `{{ repro.crate }}`){% endif %}
 - Run it: `{{ repro.command }}`
 - Failed before the fix with: `{{ repro.expected }}`
 {%- if repro.notes %}

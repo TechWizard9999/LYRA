@@ -2,8 +2,8 @@
 //! repository's toolchain and test runner, behind one runner-neutral contract. The
 //! engine, the seven stages and the guards call this contract; they never name Cargo.
 //!
-//! Two concerns live behind the same trait object because one built-in profile serves
-//! both today, but they are kept distinct in the method groups below: the
+//! Two concerns live behind the same trait object because each built-in profile pairs one
+//! toolchain with one runner today, but they are kept distinct in the method groups below: the
 //! **project/toolchain profile** (source and manifest patterns, repository description,
 //! environment preparation, verification commands) and the **test-runner integration**
 //! (exact test identity, selection, discovery binding, evidence classification, the
@@ -12,11 +12,12 @@
 //! Resolution happens once, in intake, from files that exist in the worktree. The
 //! result is saved as [`ResolvedProfile`] in `run.json` and `artifacts/profile.json`
 //! and is frozen for the run. Saved runs from before this contract carry no profile;
-//! [`for_state`] maps them explicitly to the only profile that ever existed.
+//! [`for_state`] maps them explicitly to `rust-cargo`, the only profile that existed then.
 
+pub mod python_pytest;
 pub mod rust_cargo;
 
-use crate::config::VerifyConfig;
+use crate::config::VerifyCommands;
 use crate::guards::ReproRecord;
 use crate::proc::{CommandOutput, CommandSpec};
 use crate::state::RunState;
@@ -95,8 +96,17 @@ pub type FileReader<'a> = &'a dyn Fn(&str) -> Option<String>;
 #[async_trait]
 pub trait ExecutionProfile: Send + Sync {
     fn id(&self) -> &'static str;
-    /// Executables `lyra doctor` checks for this profile.
+    /// This profile's evidence in an existing worktree, read from files only; `None` when absent.
+    fn detect(&self, worktree: &Path) -> Option<ResolvedProfile>;
+    /// What [`Self::detect`] looks for, quoted in diagnostics.
+    fn detection(&self) -> &'static str;
+    /// Executables Intake requires for a run with this profile; `lyra doctor` reports them.
     fn required_tools(&self) -> &'static [&'static str];
+    /// The target language as prompts name it ("Rust", "Python").
+    fn language(&self) -> &'static str;
+    /// The profile's prompt passages: a minijinja file of macros from `src/prompts/profiles/`
+    /// that every stage prompt imports as `profile` (see PLAN §13.4).
+    fn prompt_macros(&self) -> &'static str;
 
     // --- project / toolchain -------------------------------------------------------
 
@@ -108,6 +118,12 @@ pub trait ExecutionProfile: Send + Sync {
     fn manifest_names(&self) -> &'static [&'static str];
     /// Directory names of build outputs, skipped in source overviews.
     fn generated_dirs(&self) -> &'static [&'static str];
+    /// Whether the directory at `path` (`relative` to the repository root) holds generated
+    /// output rather than source. The default matches [`Self::generated_dirs`] by name;
+    /// profiles whose tooling uses common words as output names decide by markers instead.
+    fn is_generated_dir(&self, relative: &Path, _path: &Path) -> bool {
+        relative.file_name().and_then(|n| n.to_str()).is_some_and(|name| self.generated_dirs().contains(&name))
+    }
     /// A path the toolchain or convention treats as test code.
     fn is_test_path(&self, path: &str) -> bool;
     /// Workspace/project layout for `10-context/repo.json` (best effort: errors are values).
@@ -139,6 +155,21 @@ pub trait ExecutionProfile: Send + Sync {
     fn assert_passed(&self, output: &str, rec: &ReproRecord) -> Result<(), String>;
     /// Source binding: the selected test is absent from a discovery run with its source emptied.
     fn assert_absent_from_discovery(&self, output: &str, rec: &ReproRecord) -> Result<(), String>;
+    /// S2: files the failing regression run actually loaded that are not production code
+    /// (repository-relative), which Repro freezes with the test; `worktree` is the checkout the
+    /// run used, for the profile to read what the repository declares. An error means the
+    /// profile cannot establish them and the reproduction is rejected. The default records
+    /// nothing (`rust-cargo` locks its test inputs through registration and the frozen-input
+    /// rule).
+    fn loaded_test_inputs(&self, _output: &str, _rec: &ReproRecord, _worktree: &Path) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+    /// A file the toolchain itself writes while running the repro (Cargo's `Cargo.lock` in a
+    /// library that does not commit one), which the repro stage must not freeze as a test
+    /// input: a fix that changes dependencies legitimately rewrites it. Default: none.
+    fn is_toolchain_output(&self, _path: &str) -> bool {
+        false
+    }
 
     // --- guards -----------------------------------------------------------------------
 
@@ -174,10 +205,11 @@ pub trait ExecutionProfile: Send + Sync {
     /// An optional baseline preparation when the checkout lacks a generated input;
     /// `present(path)` tells whether a worktree-relative file exists.
     fn preparation(&self, worktree: &Path, present: &dyn Fn(&Path) -> bool) -> Option<Preparation>;
-    /// The verification commands, in order, built in `worktree`.
+    /// The verification commands, in order, built in `worktree`. `verify` holds the configured
+    /// commands for this profile (`None` = the profile's default; see `Config::verify_commands`).
     fn verification_steps(
         &self,
-        verify: &VerifyConfig,
+        verify: &VerifyCommands,
         rec: &ReproRecord,
         worktree: &Path,
     ) -> Result<Vec<VerifyStep>, String>;
@@ -187,7 +219,7 @@ pub trait ExecutionProfile: Send + Sync {
 
 /// All built-in profiles, in detection order.
 pub fn builtin() -> Vec<Box<dyn ExecutionProfile>> {
-    vec![Box::new(rust_cargo::RustCargo)]
+    vec![Box::new(rust_cargo::RustCargo), Box::new(python_pytest::PythonPytest)]
 }
 
 /// The built-in profile with this id.
@@ -195,19 +227,136 @@ pub fn by_id(id: &str) -> Option<Box<dyn ExecutionProfile>> {
     builtin().into_iter().find(|p| p.id() == id)
 }
 
-/// Detects the profile of an existing worktree from the files present. Explicit
-/// repository/operator configuration takes precedence in later phases; today the
-/// built-in detectors are the only source, and nothing is executed.
-pub fn resolve(worktree: &Path) -> Result<(ResolvedProfile, Box<dyn ExecutionProfile>), String> {
-    if let Some(resolved) = rust_cargo::detect(worktree) {
-        return Ok((resolved, Box::new(rust_cargo::RustCargo)));
+/// The outcome of profile resolution: the chosen profile plus every other built-in profile
+/// whose evidence was also found, so an ambiguous repository is visible rather than silent.
+pub struct Resolution {
+    pub resolved: ResolvedProfile,
+    pub profile: Box<dyn ExecutionProfile>,
+    /// `"detection"` (first matching built-in profile) or `"request"` (chosen by the operator).
+    pub selected_by: &'static str,
+    /// Other built-in profiles whose evidence was found, in detection order.
+    pub alternatives: Vec<ResolvedProfile>,
+}
+
+impl Resolution {
+    /// `artifacts/profile.json`: the saved [`ResolvedProfile`] plus how it was selected and
+    /// which alternatives were detected. `run.json` keeps only the [`ResolvedProfile`].
+    pub fn artifact(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(&self.resolved).unwrap_or_default();
+        value["selected_by"] = serde_json::Value::from(self.selected_by);
+        value["alternatives"] = serde_json::to_value(&self.alternatives).unwrap_or_default();
+        value
     }
-    Err(format!(
-        "no built-in execution profile matches this repository (looked for {}); supported profiles: {}. \
-         Other languages onboard through a profile, see docs/PLAN.md §13",
-        rust_cargo::DETECTION,
-        builtin().iter().map(|p| p.id()).collect::<Vec<_>>().join(", ")
-    ))
+}
+
+/// Resolves the profile of an existing worktree from the files present. Nothing is executed.
+///
+/// - `requested = Some(id)`: the operator's explicit choice (`lyra run --profile`, the
+///   dashboard, `POST /api/runs`). The id must be a built-in profile and its evidence must be
+///   present; a choice is never a way to run a runner the repository does not use.
+/// - `requested = None`: the first built-in profile in [`builtin`] order whose evidence is
+///   present. A root `Cargo.toml` therefore wins over pytest evidence, which keeps existing Rust
+///   runs unchanged; the other matches are reported as `alternatives`.
+pub fn resolve(worktree: &Path, requested: Option<&str>) -> Result<Resolution, String> {
+    let mut matches: Vec<(ResolvedProfile, Box<dyn ExecutionProfile>)> =
+        builtin().into_iter().filter_map(|p| p.detect(worktree).map(|r| (r, p))).collect();
+    let supported = builtin().iter().map(|p| p.id()).collect::<Vec<_>>().join(", ");
+    let index = match requested.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => {
+            let Some(wanted) = by_id(id) else {
+                return Err(format!("unknown execution profile '{id}'; supported profiles: {supported}"));
+            };
+            matches.iter().position(|(r, _)| r.id == id).ok_or_else(|| {
+                format!(
+                    "execution profile '{id}' was requested but this repository has none of its evidence (looked for {})",
+                    wanted.detection()
+                )
+            })?
+        }
+        None if matches.is_empty() => {
+            let looked_for = builtin().iter().map(|p| p.detection()).collect::<Vec<_>>().join("; or ");
+            return Err(format!(
+                "no built-in execution profile matches this repository (looked for {looked_for}); supported profiles: {supported}. \
+                 Other languages onboard through a profile, see docs/PLAN.md §13"
+            ));
+        }
+        None => 0,
+    };
+    let (resolved, profile) = matches.remove(index);
+    Ok(Resolution {
+        resolved,
+        profile,
+        selected_by: if requested.is_some_and(|id| !id.trim().is_empty()) { "request" } else { "detection" },
+        alternatives: matches.into_iter().map(|(r, _)| r).collect(),
+    })
+}
+
+/// The run was cancelled while the tools were being checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cancelled;
+
+/// Executables from `profile.required_tools()` that cannot be used, each with the reason:
+/// not found on `PATH`, or found but not starting. Being on `PATH` is not enough: the
+/// Windows Store `python` alias is on `PATH` and only prints "Python was not found", so each
+/// tool must also answer `--version` successfully. The check runs through the cancellable,
+/// output-bounded subprocess runner, which kills the whole process tree on Cancel or when the
+/// run's hang guard (`run.timeout_minutes`, passed as `timeout`) expires.
+pub async fn missing_tools(
+    profile: &dyn ExecutionProfile,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<Vec<String>, Cancelled> {
+    let mut missing = Vec::new();
+    for tool in profile.required_tools() {
+        match crate::proc::resolve_program(tool) {
+            Err(_) => missing.push(format!("{tool} (not found on PATH)")),
+            Ok(path) => match tool_starts(&path, timeout, cancel).await {
+                ToolStart::Usable => {}
+                ToolStart::Fails(reason) => missing.push(format!("{tool} ({reason})")),
+                ToolStart::Cancelled => return Err(Cancelled),
+            },
+        }
+    }
+    Ok(missing)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolStart {
+    Usable,
+    Fails(String),
+    Cancelled,
+}
+
+/// Whether `program --version` starts and succeeds, run like every other command: bounded
+/// output, the run's hang guard as its timeout, the run's cancellation token and
+/// process-tree cleanup.
+pub(crate) async fn tool_starts(program: &Path, timeout: Duration, cancel: &CancellationToken) -> ToolStart {
+    let found = program.display();
+    let spec = CommandSpec::new(program.to_string_lossy(), std::env::temp_dir()).arg("--version");
+    let out = match crate::proc::run(&spec, timeout, cancel).await {
+        Ok(out) => out,
+        Err(e) => return ToolStart::Fails(format!("found at {found} but it cannot be started: {e:#}")),
+    };
+    if out.cancelled {
+        return ToolStart::Cancelled;
+    }
+    if out.success() {
+        return ToolStart::Usable;
+    }
+    if out.timed_out {
+        return ToolStart::Fails(format!(
+            "found at {found} but `--version` did not answer within the run's hang guard ({} s, \
+             `run.timeout_minutes`)",
+            timeout.as_secs()
+        ));
+    }
+    if out.output_truncated || out.drain_timed_out {
+        return ToolStart::Fails(format!("found at {found} but `--version` did not behave like a version query"));
+    }
+    let said =
+        out.stderr.lines().chain(out.stdout.lines()).map(str::trim).find(|l| !l.is_empty()).unwrap_or("no output");
+    let code = out.exit_code.map_or("a signal".to_string(), |c| format!("exit {c}"));
+    ToolStart::Fails(format!("found at {found} but `--version` failed with {code}: {said}"))
 }
 
 /// The profile a saved run was resolved with. Runs written before this contract have
@@ -247,35 +396,195 @@ mod tests {
                 issue_text: None,
                 provider: None,
                 policy_acknowledged: false,
+                profile: None,
             },
             "claude".into(),
         )
+    }
+
+    /// A tool that is on `PATH` but does not start (the Windows Store `python` alias exits
+    /// 9009 with "Python was not found") is reported; a working one is not; a tool that hangs
+    /// is stopped by Cancel together with its descendants; a noisy one is bounded.
+    #[tokio::test]
+    async fn a_tool_on_path_must_also_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        #[cfg(unix)]
+        let shim = |name: &str, body: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        #[cfg(windows)]
+        let shim = |name: &str, body: &str| {
+            let path = dir.path().join(format!("{name}.cmd"));
+            std::fs::write(&path, body).unwrap();
+            path
+        };
+        #[cfg(unix)]
+        let (broken, working) = (
+            shim("python-alias", "echo 'Python was not found; run without arguments to install from the Microsoft Store' >&2\nexit 9009\n"),
+            shim("python-real", "echo 'Python 3.14.7'\n"),
+        );
+        #[cfg(windows)]
+        let (broken, working) = (
+            shim("python-alias", "@echo Python was not found; run without arguments to install from the Microsoft Store 1>&2\r\n@exit /b 9009\r\n"),
+            shim("python-real", "@echo Python 3.14.7\r\n"),
+        );
+        match tool_starts(&broken, GUARD, &cancel).await {
+            ToolStart::Fails(err) => {
+                assert!(err.contains("Python was not found") && err.contains("--version` failed with exit"), "{err}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(tool_starts(&working, GUARD, &cancel).await, ToolStart::Usable);
+        assert!(matches!(
+            tool_starts(&dir.path().join("does-not-exist"), GUARD, &cancel).await,
+            ToolStart::Fails(e) if e.contains("cannot be started")
+        ));
+
+        // Built-in profiles on this machine: whatever is missing is reported with a reason.
+        for profile in builtin() {
+            for missing in missing_tools(&*profile, GUARD, &cancel).await.unwrap() {
+                assert!(missing.contains('(') && missing.ends_with(')'), "{missing}");
+            }
+        }
+    }
+
+    /// The run's default hang guard (`run.timeout_minutes = 30`).
+    const GUARD: Duration = Duration::from_secs(30 * 60);
+
+    /// The tool check honours the configured hang guard: a working but slow interpreter
+    /// passes under a guard longer than its start-up and is reported (and stopped) under a
+    /// shorter one; nothing in between is a fixed limit of its own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_tool_check_uses_the_configured_hang_guard() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let slow = dir.path().join("python-slow");
+        std::fs::write(&slow, "#!/bin/sh\nsleep 2\necho 'Python 3.14.7'\n").unwrap();
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cancel = CancellationToken::new();
+        assert_eq!(tool_starts(&slow, Duration::from_secs(20), &cancel).await, ToolStart::Usable);
+        let started = std::time::Instant::now();
+        match tool_starts(&slow, Duration::from_millis(500), &cancel).await {
+            ToolStart::Fails(e) => assert!(e.contains("hang guard") && e.contains("run.timeout_minutes"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(2), "stopped at the guard: {:?}", started.elapsed());
+        // The configured value reaches the check: `Config::timeout` is what Intake passes.
+        let mut config = crate::config::Config::default();
+        config.run.timeout_minutes = 45;
+        assert_eq!(config.timeout(), Duration::from_secs(45 * 60));
+    }
+
+    /// Cancel during the tool check returns promptly and kills the tool's descendants too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_stops_a_hanging_tool_check_and_its_descendants() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("child.pid");
+        let hang = dir.path().join("python-hangs");
+        std::fs::write(&hang, format!("#!/bin/sh\nsleep 60 &\necho $! > '{}'\nwait\n", pidfile.display())).unwrap();
+        std::fs::set_permissions(&hang, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let pid_path = pidfile.clone();
+        tokio::spawn(async move {
+            for _ in 0..500 {
+                if pid_path.is_file() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            trigger.cancel();
+        });
+        let started = std::time::Instant::now();
+        assert_eq!(tool_starts(&hang, GUARD, &cancel).await, ToolStart::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+        let pid = std::fs::read_to_string(&pidfile).unwrap().trim().to_string();
+        let mut alive = true;
+        for _ in 0..50 {
+            alive = std::process::Command::new("kill").args(["-0", &pid]).status().unwrap().success();
+            if !alive {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!alive, "descendant {pid} survived Cancel");
+
+        // A noisy tool is bounded by the runner instead of filling memory.
+        let noisy = dir.path().join("python-noisy");
+        // One 2 MB line, above the runner's per-line bound.
+        std::fs::write(&noisy, "#!/bin/sh\nhead -c 2000000 /dev/zero | tr '\\0' x\n").unwrap();
+        std::fs::set_permissions(&noisy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            tool_starts(&noisy, GUARD, &CancellationToken::new()).await,
+            ToolStart::Fails(e) if e.contains("did not behave like a version query")
+        ));
     }
 
     #[test]
     fn cargo_manifest_at_the_root_resolves_to_rust_cargo() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
-        let (resolved, profile) = resolve(dir.path()).unwrap();
+        let resolution = resolve(dir.path(), None).unwrap();
+        let resolved = &resolution.resolved;
         assert_eq!(resolved.id, "rust-cargo");
         assert_eq!(resolved.version, CONTRACT_VERSION);
         assert_eq!(resolved.project_dir, "");
         assert_eq!(resolved.evidence, vec!["Cargo.toml".to_string()]);
-        assert_eq!(profile.id(), "rust-cargo");
+        assert_eq!(resolution.profile.id(), "rust-cargo");
+        assert_eq!(resolution.selected_by, "detection");
+        assert!(resolution.alternatives.is_empty());
+    }
+
+    #[test]
+    fn mixed_repositories_default_to_cargo_report_alternatives_and_accept_an_explicit_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        std::fs::write(dir.path().join("pytest.ini"), "[pytest]\n").unwrap();
+
+        // Unchanged default for legacy and unambiguous behaviour, with the other match visible.
+        let default = resolve(dir.path(), None).unwrap();
+        assert_eq!((default.resolved.id.as_str(), default.selected_by), ("rust-cargo", "detection"));
+        assert_eq!(default.alternatives.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["python-pytest"]);
+        let artifact = default.artifact();
+        assert_eq!(artifact["alternatives"][0]["evidence"], serde_json::json!(["pytest.ini"]));
+        assert_eq!(artifact["selected_by"], "detection");
+        // The saved run.json shape is unchanged: only ResolvedProfile is stored there.
+        assert!(serde_json::to_value(&default.resolved).unwrap().get("alternatives").is_none());
+
+        // Either supported runner can be targeted explicitly.
+        let python = resolve(dir.path(), Some("python-pytest")).unwrap();
+        assert_eq!((python.resolved.id.as_str(), python.selected_by), ("python-pytest", "request"));
+        assert_eq!(python.alternatives.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["rust-cargo"]);
+        assert_eq!(resolve(dir.path(), Some("rust-cargo")).unwrap().resolved.id, "rust-cargo");
+        assert_eq!(resolve(dir.path(), Some(" ")).unwrap().selected_by, "detection", "blank means auto-detect");
+
+        // A choice needs that profile's evidence and a known id.
+        std::fs::remove_file(dir.path().join("pytest.ini")).unwrap();
+        let error = resolve(dir.path(), Some("python-pytest")).err().unwrap();
+        assert!(error.contains("none of its evidence") && error.contains("pytest.ini"), "{error}");
+        assert!(resolve(dir.path(), Some("go-test")).err().unwrap().contains("unknown execution profile"));
     }
 
     #[test]
     fn unsupported_repository_fails_with_an_actionable_message() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.json"), "{}").unwrap();
-        let error = resolve(dir.path()).err().unwrap();
+        let error = resolve(dir.path(), None).err().unwrap();
         assert!(error.contains("Cargo.toml"), "{error}");
         assert!(error.contains("rust-cargo"), "{error}");
         assert!(error.contains("PLAN.md"), "{error}");
         // A manifest below the root is not a root project.
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub/Cargo.toml"), "").unwrap();
-        assert!(resolve(dir.path()).is_err());
+        assert!(resolve(dir.path(), None).is_err());
     }
 
     #[test]
@@ -284,13 +593,20 @@ mod tests {
         assert!(st.profile.is_none());
         assert_eq!(for_state(&st).unwrap().id(), "rust-cargo");
         st.profile = Some(ResolvedProfile {
-            id: "python-pytest".into(),
+            id: "go-test".into(),
             version: CONTRACT_VERSION,
             project_dir: String::new(),
             evidence: vec![],
         });
         let error = for_state(&st).err().unwrap();
-        assert!(error.contains("python-pytest"), "{error}");
+        assert!(error.contains("go-test"), "{error}");
+        st.profile = Some(ResolvedProfile {
+            id: "python-pytest".into(),
+            version: CONTRACT_VERSION,
+            project_dir: String::new(),
+            evidence: vec!["pytest.ini".into()],
+        });
+        assert_eq!(for_state(&st).unwrap().id(), "python-pytest");
         st.profile = Some(ResolvedProfile {
             id: "rust-cargo".into(),
             version: CONTRACT_VERSION,
