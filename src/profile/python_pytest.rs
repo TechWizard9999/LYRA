@@ -47,31 +47,70 @@ const DISCOVERY_WRAPPER: &str =
     "import sys, pytest; code = int(pytest.main(sys.argv[1:])); sys.exit(0 if code == 5 else code)";
 
 /// The regression runs pytest in-process through this fixed recorder, which afterwards lists
-/// every module file it loaded from inside the working directory (`LYRA-LOADED`) and every
-/// file inside it that the run opened for reading (`LYRA-READ`, through an audit hook on the
-/// interpreter's `open` event, which `open`, `io.open`, `os.open` and `pathlib` all raise).
+/// every module file it loaded from inside the working directory (`LYRA-LOADED`), every file
+/// inside it whose existing content the run may have consumed (`LYRA-READ`), and every child
+/// process it started (`LYRA-SPAWN`), all observed through an audit hook installed before
+/// pytest starts:
+///
+/// - `open` (raised by `open`, `io.open`, `os.open` and `pathlib`) counts as a read when the
+///   file already existed and the open can read it without truncating it first: `r`, `r+`,
+///   `a+`, `rb`… and `os.open` with `O_RDONLY` or `O_RDWR` without `O_TRUNC`. Only `w`/`w+`
+///   (and `O_TRUNC`), which discard the content, and write-only opens are not reads.
+/// - `sqlite3.connect` of an existing database file counts as a read.
+/// - `subprocess.Popen`, `os.system`, `os.exec`, `os.posix_spawn`, `os.spawn`, `os.fork`,
+///   `os.forkpty` and `os.startfile` start a process whose reads this interpreter cannot see,
+///   so the inputs of such a regression cannot be established and Repro rejects it.
+///
 /// Python itself reports what the regression imported and read, however the import or the read
 /// was written, and Repro freezes the non-production ones with the test. The exit status is
 /// pytest's.
 const PYTEST_RECORDER: &str = "import os, sys, pytest
 cwd = os.getcwd()
 reads = set()
-def lyra_audit(event, args):
-    if event != 'open':
-        return
-    path, mode, flags = args
+spawns = []
+active = True
+SPAWNS = ('subprocess.Popen', 'os.system', 'os.exec', 'os.posix_spawn', 'os.spawn', 'os.fork', 'os.forkpty', 'os.startfile')
+def lyra_path(path):
     if isinstance(path, bytes):
         path = os.fsdecode(path)
+    if isinstance(path, os.PathLike):
+        path = os.fspath(path)
     if not isinstance(path, str):
+        return None
+    return path if os.path.isabs(path) else os.path.join(cwd, path)
+def lyra_existing(path):
+    try:
+        return path is not None and os.path.isfile(path)
+    except (OSError, ValueError):
+        return False
+def lyra_audit(event, args):
+    if not active:
         return
-    if mode is None:
-        if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT):
-            return
-    elif any(c in mode for c in 'wax+'):
-        return
-    reads.add(path if os.path.isabs(path) else os.path.join(cwd, path))
+    if event == 'open':
+        path, mode, flags = args
+        if mode is None:
+            readable = (flags & (os.O_WRONLY | os.O_RDWR)) != os.O_WRONLY
+            truncating = bool(flags & getattr(os, 'O_TRUNC', 0))
+        else:
+            readable = 'r' in mode or '+' in mode
+            truncating = 'w' in mode
+        path = lyra_path(path)
+        if readable and not truncating and lyra_existing(path):
+            reads.add(path)
+    elif event == 'sqlite3.connect':
+        path = lyra_path(args[0]) if args else None
+        if lyra_existing(path):
+            reads.add(path)
+    elif event in SPAWNS:
+        what = args[0] if args else ''
+        if isinstance(what, (list, tuple)):
+            what = what[0] if what else ''
+        if isinstance(what, bytes):
+            what = os.fsdecode(what)
+        spawns.append(event + ' ' + str(what).replace(chr(10), ' ')[:200])
 sys.addaudithook(lyra_audit)
 code = int(pytest.main(sys.argv[1:]))
+active = False
 root = os.path.realpath(cwd)
 def inside(path):
     path = os.path.realpath(path)
@@ -83,10 +122,13 @@ for module in list(sys.modules.values()):
 for path in sorted(reads):
     if os.path.isfile(path) and inside(path):
         print('LYRA-READ ' + inside(path))
+for spawn in spawns:
+    print('LYRA-SPAWN ' + spawn)
 print('LYRA-LOADED-END')
 sys.exit(code)";
 const LOADED_PREFIX: &str = "LYRA-LOADED ";
 const READ_PREFIX: &str = "LYRA-READ ";
+const SPAWN_PREFIX: &str = "LYRA-SPAWN ";
 const LOADED_END: &str = "LYRA-LOADED-END";
 
 const PYTEST_CONFIG_FILES: [&str; 4] = ["pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml"];
@@ -776,13 +818,22 @@ fn is_test_side(path: &str, tree: &str) -> bool {
 /// and data the run read (a tracked `fixtures/input.json`, wherever it lives). Pytest's own
 /// configuration files are covered by the configuration guard, so they are not frozen as
 /// data; byte-code and interpreter caches are nobody's input. A run without the end
-/// marker (crashed, truncated, or not run through the recorder) is an error, and so is a file
-/// the repository's metadata cannot classify: in both cases the inputs cannot be established.
+/// marker (crashed, truncated, or not run through the recorder), a run that started a child
+/// process (whose reads the recorder cannot see) and a file the repository's metadata cannot
+/// classify are errors: in each case the inputs cannot be established.
 pub fn parse_loaded_modules(output: &str, test_file: &str, production: &ProductionCode) -> Result<Vec<String>, String> {
     if !output.lines().any(|l| l.trim() == LOADED_END) {
         return Err("the regression run did not report the modules it loaded, so LYRA cannot establish which test \
                     inputs to lock"
             .into());
+    }
+    let spawns: Vec<&str> = output.lines().filter_map(|l| l.trim().strip_prefix(SPAWN_PREFIX)).collect();
+    if !spawns.is_empty() {
+        return Err(format!(
+            "the regression started a child process ({}), whose file reads LYRA cannot observe, so it cannot \
+             establish which test inputs to lock; reproduce the bug by calling the project's code in-process",
+            spawns.iter().map(|s| format!("`{}`", s.trim())).collect::<Vec<_>>().join(", ")
+        ));
     }
     let tree = test_tree(test_file);
     let mut loaded = Vec::new();
@@ -2602,6 +2653,19 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         let err = parse_loaded_modules("1 failed in 0.02s\nLYRA-LOADED tests/test_helpers.py\n", FILE, &declared())
             .unwrap_err();
         assert!(err.contains("cannot establish"), "a run without the end marker fails closed: {err}");
+        let spawned = report.replace(
+            "LYRA-LOADED-END",
+            "LYRA-SPAWN subprocess.Popen /usr/bin/python3\nLYRA-SPAWN os.system cat fixtures/input.json\nLYRA-LOADED-END",
+        );
+        let err = parse_loaded_modules(&spawned, FILE, &declared()).unwrap_err();
+        for expected in [
+            "child process",
+            "`subprocess.Popen /usr/bin/python3`",
+            "`os.system cat fixtures/input.json`",
+            "in-process",
+        ] {
+            assert!(err.contains(expected), "{expected}: {err}");
+        }
         // With nothing declared, production and support cannot be told apart: a visible error
         // naming the files and the remedy, never a silent choice.
         let err = parse_loaded_modules(report, FILE, &ProductionCode::default()).unwrap_err();
@@ -2977,6 +3041,85 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         check_fix_changes_with(&fix, &record, &read_checkpoint, &read_now).unwrap();
         let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
         assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "{out}");
+    }
+
+    /// End to end with real pytest, the reviewer's two follow-up forms: a fixture read through a
+    /// read/write open (`r+`, `a+`, `os.open(O_RDWR)`) is recorded and frozen like a plain read,
+    /// while truncating and write-only opens are not reads; a regression that reads the fixture
+    /// through a child process cannot have its inputs established and is rejected at S2.
+    #[tokio::test]
+    #[ignore = "needs a provisioned python3 with pytest on PATH"]
+    async fn read_write_opens_are_reads_and_child_processes_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("pytest.ini", "[pytest]\n");
+        write("pyproject.toml", PYPROJECT);
+        write("calc.py", "def add(a, b):\n    return a - b\n");
+        write("fixtures/input.json", "1 2\n");
+        write("fixtures/append.txt", "3\n");
+        write("fixtures/raw.txt", "0\n");
+        write("fixtures/scratch.txt", "old\n");
+        write("fixtures/log.txt", "old\n");
+        write(
+            FILE,
+            "import os\nfrom calc import add\n\ndef test_issue_7_fails():\n    with open(\"fixtures/input.json\", \"r+\") as f:\n        a, b = map(int, f.read().split())\n    with open(\"fixtures/append.txt\", \"a+\") as f:\n        f.seek(0)\n        expected = int(f.read())\n    fd = os.open(\"fixtures/raw.txt\", os.O_RDWR)\n    limit = int(os.read(fd, 16))\n    os.close(fd)\n    with open(\"fixtures/scratch.txt\", \"w+\") as f:\n        f.write(\"new\")\n    with open(\"fixtures/log.txt\", \"a\") as f:\n        f.write(\"x\")\n    assert add(a, b) == expected + limit, \"sum must be three\"\n",
+        );
+        let timeout = Duration::from_secs(120);
+        let cancel = CancellationToken::new();
+        let spec = PythonPytest.reproduction_environment(PythonPytest.regression_command(&rec(), root).unwrap(), root);
+        let run = proc::run(&spec, timeout, &cancel).await.unwrap();
+        let out = run.combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Failed, "{out}");
+        let loaded = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap();
+        assert_eq!(
+            loaded,
+            ["fixtures/append.txt", "fixtures/input.json", "fixtures/raw.txt"],
+            "r+, a+ and O_RDWR consume existing data; w+ and a do not: {out}"
+        );
+        // Restore what the run wrote, as the S2 checkpoint holds it, then attack the r+ fixture.
+        write("fixtures/scratch.txt", "old\n");
+        write("fixtures/log.txt", "old\n");
+        let frozen: HashMap<String, String> =
+            [FILE, "pyproject.toml", "calc.py", "fixtures/input.json", "fixtures/append.txt", "fixtures/raw.txt"]
+                .into_iter()
+                .map(|p| (p.to_string(), std::fs::read_to_string(root.join(p)).unwrap()))
+                .collect();
+        let read_checkpoint = |p: &str| frozen.get(p).cloned();
+        let read_now = |p: &str| std::fs::read_to_string(root.join(p)).ok();
+        let mut record = rec();
+        record.frozen_inputs = loaded;
+        write("fixtures/input.json", "4 1\n");
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "the attack works without the lock: {out}");
+        let change = vec![("M".to_string(), "fixtures/input.json".to_string())];
+        let err = check_fix_changes_with(&change, &record, &read_checkpoint, &read_now).unwrap_err();
+        assert!(err.contains("fixtures/input.json") && err.contains("locked"), "{err}");
+        write("fixtures/input.json", &frozen["fixtures/input.json"]);
+
+        // A child process reads the fixture: the parent cannot see that read, so S2 stops.
+        write(
+            FILE,
+            "import subprocess, sys\nfrom calc import add\n\ndef test_issue_7_fails():\n    out = subprocess.run([sys.executable, \"-c\", \"print(open('fixtures/input.json').read())\"], capture_output=True, text=True, check=True).stdout\n    a, b = map(int, out.split())\n    assert add(a, b) == 3, \"sum must be three\"\n",
+        );
+        let run = proc::run(&spec, timeout, &cancel).await.unwrap();
+        let out = run.combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Failed, "{out}");
+        assert!(!out.contains("LYRA-READ fixtures/input.json"), "precondition: the parent never sees the read: {out}");
+        let err = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap_err();
+        assert!(err.contains("child process") && err.contains("subprocess.Popen"), "{err}");
+        // os.system is caught the same way.
+        write(
+            FILE,
+            "import os\nfrom calc import add\n\ndef test_issue_7_fails():\n    os.system(\"cat fixtures/input.json > /dev/null\")\n    assert add(1, 2) == 3, \"sum must be three\"\n",
+        );
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        let err = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap_err();
+        assert!(err.contains("`os.system cat fixtures/input.json > /dev/null`"), "{err}");
     }
 
     #[test]

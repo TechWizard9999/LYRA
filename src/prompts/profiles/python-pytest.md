@@ -28,6 +28,7 @@ Also allowed: new non-Python fixture files under a `tests/` or `fixtures/` direc
 ## What the test must do
 
 - One module-level test function named `test_issue_{{ issue_number }}_<what_it_checks>`, for example `test_issue_{{ issue_number }}_rejects_short_frame`. Import the code under test the way the existing tests do. No `skip`, `skipif` or `xfail` markers, no `parametrize`, no `pytest.raises` that would hide the bug, and no fixtures that the repository does not already define. The test must fail **because the bug exists** and pass once the bug is fixed.
+- Call the project's code in-process. Do not start child processes (`subprocess`, `os.system`, `multiprocessing`): the harness cannot see what they read, so it rejects such a test.
 - It must fail on an `assert` whose message describes the bug, for example `assert parse(frame) is None, "short frame must be rejected"`. An import or collection error, a missing dependency, a test that does not run, or an unrelated exception is NOT a reproduction.
 - Keep it small and deterministic: no network, no timing dependence, no reliance on the current directory beyond the repository's own fixtures.
 - Do not execute commands. Supply the pytest node id; the harness runs `python3 -m pytest <test_name>` with the repository's `addopts` neutralised, checks that exactly this one test executed and failed with your `expected` assertion text, and commits the validated reproduction. Only the harness can establish that reproduction succeeded.
