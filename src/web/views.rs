@@ -73,8 +73,8 @@ pub fn home(v: &HomeView) -> Markup {
                 form.newrun method="post" action="/runs" {
                     label {
                         span { "Repository path" }
-                        input type="text" name="repo" required placeholder="C:\\src\\my-crate or /home/me/src/my-crate" value=(v.form.repo);
-                        small { "An already-cloned Rust repository on this machine. LYRA works in its own worktree." }
+                        input type="text" name="repo" required placeholder="C:\\src\\my-repo or /home/me/src/my-repo" value=(v.form.repo);
+                        small { "An already-cloned repository on this machine. LYRA works in its own worktree." }
                     }
                     label {
                         span { "Issue" }
@@ -82,7 +82,8 @@ pub fn home(v: &HomeView) -> Markup {
                     }
                     label {
                         span { "Issue text (optional)" }
-                        textarea name="issue_text" rows="4" placeholder="Paste the issue to run offline; the Issue field is then only a label." { (v.form.issue_text) }
+                        textarea name="issue_text" rows="4" placeholder="Paste the issue text instead of fetching it from GitHub." { (v.form.issue_text) }
+                        small { "A valid issue reference is still required." }
                     }
                     div.row {
                         label {
@@ -101,6 +102,7 @@ pub fn home(v: &HomeView) -> Markup {
                                     option value=(p.id()) selected[v.form.profile == p.id()] { (p.id()) }
                                 }
                             }
+                            small { "Auto-detect chooses a profile from repository files." }
                         }
                         label.check {
                             input type="checkbox" name="policy_acknowledged" checked[v.form.policy_acknowledged.is_some()];
@@ -123,18 +125,20 @@ fn runs_table(runs: &[RunState]) -> Markup {
         @if runs.is_empty() {
             p.muted { "No runs yet." }
         } @else {
-            table.runs {
-                thead { tr { th { "Run" } th { "Status" } th { "Stage" } th { "Issue" } th { "Runtime" } th { "Created" } th { "PR" } } }
-                tbody {
-                    @for r in runs {
-                        tr {
-                            td { a href=(format!("/runs/{}", r.id)) { code { (r.id) } } }
-                            td { (badge(r.status.as_str())) }
-                            td { (r.stage.label()) }
-                            td { (r.request.issue) }
-                            td { (r.provider) }
-                            td.muted { (short_ts(&r.created)) }
-                            td { @if let Some(u) = r.pr_url.as_deref().and_then(https_pr_url) { a href=(u) target="_blank" rel="noopener" { "PR" } } }
+            div.runs-scroll role="region" aria-label="Runs table" tabindex="0" {
+                table.runs {
+                    thead { tr { th { "Run" } th { "Status" } th { "Stage" } th { "Issue" } th { "Runtime" } th { "Created" } th { "PR" } } }
+                    tbody {
+                        @for r in runs {
+                            tr {
+                                td { a href=(format!("/runs/{}", r.id)) { code { (r.id) } } }
+                                td { (badge(r.status.as_str())) }
+                                td { (r.stage.label()) }
+                                td { (r.request.issue) }
+                                td { (r.provider) }
+                                td.muted { (short_ts(&r.created)) }
+                                td { @if let Some(u) = r.pr_url.as_deref().and_then(https_pr_url) { a href=(u) target="_blank" rel="noopener" { "PR" } } }
+                            }
                         }
                     }
                 }
@@ -487,9 +491,10 @@ mod tests {
             busy: false,
         })
         .into_string();
-        assert!(html.contains("demo-7-20261104-101500"));
         assert!(html.contains(r#"<option value="codex" selected>"#));
         assert!(html.contains("repo path is required"));
+        assert!(html.contains(r#"class="runs-scroll" role="region" aria-label="Runs table" tabindex="0""#));
+        assert!(html.contains(r#"<a href="/runs/demo-7-20261104-101500""#));
     }
 
     #[test]
