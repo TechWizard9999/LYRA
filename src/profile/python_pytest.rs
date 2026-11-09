@@ -47,21 +47,46 @@ const DISCOVERY_WRAPPER: &str =
     "import sys, pytest; code = int(pytest.main(sys.argv[1:])); sys.exit(0 if code == 5 else code)";
 
 /// The regression runs pytest in-process through this fixed recorder, which afterwards lists
-/// every module file it loaded from inside the working directory. Python itself reports what
-/// the regression imported, however the import was written (inline, conditional, dynamic),
-/// and Repro freezes the test-side ones with the test. The exit status is pytest's.
+/// every module file it loaded from inside the working directory (`LYRA-LOADED`) and every
+/// file inside it that the run opened for reading (`LYRA-READ`, through an audit hook on the
+/// interpreter's `open` event, which `open`, `io.open`, `os.open` and `pathlib` all raise).
+/// Python itself reports what the regression imported and read, however the import or the read
+/// was written, and Repro freezes the non-production ones with the test. The exit status is
+/// pytest's.
 const PYTEST_RECORDER: &str = "import os, sys, pytest
+cwd = os.getcwd()
+reads = set()
+def lyra_audit(event, args):
+    if event != 'open':
+        return
+    path, mode, flags = args
+    if isinstance(path, bytes):
+        path = os.fsdecode(path)
+    if not isinstance(path, str):
+        return
+    if mode is None:
+        if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT):
+            return
+    elif any(c in mode for c in 'wax+'):
+        return
+    reads.add(path if os.path.isabs(path) else os.path.join(cwd, path))
+sys.addaudithook(lyra_audit)
 code = int(pytest.main(sys.argv[1:]))
-root = os.path.realpath(os.getcwd())
+root = os.path.realpath(cwd)
+def inside(path):
+    path = os.path.realpath(path)
+    return os.path.relpath(path, root).replace(os.sep, '/') if path.startswith(root + os.sep) else None
 for module in list(sys.modules.values()):
     path = getattr(module, '__file__', None)
-    if isinstance(path, str):
-        path = os.path.realpath(path)
-        if path.startswith(root + os.sep):
-            print('LYRA-LOADED ' + os.path.relpath(path, root).replace(os.sep, '/'))
+    if isinstance(path, str) and inside(path):
+        print('LYRA-LOADED ' + inside(path))
+for path in sorted(reads):
+    if os.path.isfile(path) and inside(path):
+        print('LYRA-READ ' + inside(path))
 print('LYRA-LOADED-END')
 sys.exit(code)";
 const LOADED_PREFIX: &str = "LYRA-LOADED ";
+const READ_PREFIX: &str = "LYRA-READ ";
 const LOADED_END: &str = "LYRA-LOADED-END";
 
 const PYTEST_CONFIG_FILES: [&str; 4] = ["pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml"];
@@ -489,13 +514,7 @@ fn project_code_named(root: &Path, name: &str, test_tree: &str) -> bool {
             {
                 continue;
             }
-            if file_name == name
-                && std::fs::read_dir(&path)
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                    .any(|e| e.file_name().to_string_lossy().ends_with(".py"))
-            {
+            if file_name == name && contains_python(&path, 0) {
                 return true;
             }
             if depth < 4 && visit(root, &path, depth + 1, name, test_tree) {
@@ -507,11 +526,35 @@ fn project_code_named(root: &Path, name: &str, test_tree: &str) -> bool {
     visit(root, root, 1, name, test_tree)
 }
 
+/// Whether a directory holds Python source at any depth (up to eight levels, skipping hidden
+/// and generated directories), which is what makes a directory without `__init__.py` a PEP 420
+/// namespace package: `src/acme/widget/mod.py` makes `acme` importable even though `src/acme/`
+/// itself holds no `.py` file.
+fn contains_python(dir: &Path, depth: usize) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        match entry.file_type() {
+            Ok(kind) if kind.is_file() && name.ends_with(".py") => return true,
+            Ok(kind) if kind.is_dir() && !name.starts_with('.') && name != "__pycache__" => {
+                let path = entry.path();
+                if !path.join("pyvenv.cfg").exists() {
+                    subdirs.push(path);
+                }
+            }
+            _ => {}
+        }
+    }
+    depth < 8 && subdirs.iter().any(|d| contains_python(d, depth + 1))
+}
+
 /// The project's own top-level packages and modules in the repository root and `src/`, which
 /// the verification provenance step requires to resolve inside the checkout: regular packages
-/// and modules in both, and PEP 420 namespace packages (a directory of Python files without
-/// `__init__.py`) under `src/`. Tests, docs, tooling scripts, virtual environments and build
-/// output are not project code. There is no limit on the number of names.
+/// and modules in both, and PEP 420 namespace packages (a directory without `__init__.py` that
+/// holds Python files at any depth, so a namespace root of subpackages counts) under `src/`.
+/// Tests, docs, tooling scripts, virtual environments and build output are not project code.
+/// There is no limit on the number of names.
 pub fn importable_names(root: &Path) -> Vec<String> {
     const NOT_PROJECT_DIRS: [&str; 12] = [
         "tests",
@@ -537,14 +580,7 @@ pub fn importable_names(root: &Path) -> Vec<String> {
             let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else { continue };
             let Ok(kind) = entry.file_type() else { continue };
             let candidate = if kind.is_dir() {
-                let has_python = || {
-                    std::fs::read_dir(&path)
-                        .into_iter()
-                        .flatten()
-                        .flatten()
-                        .any(|e| e.file_name().to_string_lossy().ends_with(".py"))
-                };
-                let package = path.join("__init__.py").is_file() || (base != root && has_python());
+                let package = path.join("__init__.py").is_file() || (base != root && contains_python(&path, 0));
                 (!NOT_PROJECT_DIRS.contains(&file_name.as_str()) && !path.join("pyvenv.cfg").exists() && package)
                     .then_some(file_name)
             } else if kind.is_file() {
@@ -734,12 +770,14 @@ fn is_test_side(path: &str, tree: &str) -> bool {
         || (name.ends_with(".py") && (name.starts_with("test_") || name.ends_with("_test.py")))
 }
 
-/// Parses the import recorder's report (see [`PYTEST_RECORDER`]) into the files the regression
-/// actually loaded that are not production code, repository-relative: test-side modules and
-/// test support anywhere else (a shared `support/helpers.py`, a root helper module). A run
-/// without the end marker (crashed, truncated, or not run through the recorder) is an error,
-/// and so is a loaded module the repository's metadata cannot classify: in both cases the
-/// inputs cannot be established.
+/// Parses the recorder's report (see [`PYTEST_RECORDER`]) into the files the regression
+/// actually loaded or read that are not production code, repository-relative: test-side
+/// modules, test support anywhere else (a shared `support/helpers.py`, a root helper module)
+/// and data the run read (a tracked `fixtures/input.json`, wherever it lives). Pytest's own
+/// configuration files are covered by the configuration guard, so they are not frozen as
+/// data; byte-code and interpreter caches are nobody's input. A run without the end
+/// marker (crashed, truncated, or not run through the recorder) is an error, and so is a file
+/// the repository's metadata cannot classify: in both cases the inputs cannot be established.
 pub fn parse_loaded_modules(output: &str, test_file: &str, production: &ProductionCode) -> Result<Vec<String>, String> {
     if !output.lines().any(|l| l.trim() == LOADED_END) {
         return Err("the regression run did not report the modules it loaded, so LYRA cannot establish which test \
@@ -749,10 +787,16 @@ pub fn parse_loaded_modules(output: &str, test_file: &str, production: &Producti
     let tree = test_tree(test_file);
     let mut loaded = Vec::new();
     let mut unknown = BTreeSet::new();
-    for path in output.lines().filter_map(|l| l.trim().strip_prefix(LOADED_PREFIX)).map(guards::norm_path) {
+    let reported = output.lines().map(str::trim).filter_map(|l| {
+        l.strip_prefix(LOADED_PREFIX).map(|p| (p, false)).or_else(|| l.strip_prefix(READ_PREFIX).map(|p| (p, true)))
+    });
+    for (path, is_read) in reported.map(|(p, r)| (guards::norm_path(p), r)) {
         if path.is_empty()
-            || path.split('/').any(|c| c.is_empty() || c == ".." || c.starts_with('.') || c == "site-packages")
+            || path
+                .split('/')
+                .any(|c| c.is_empty() || c == ".." || c.starts_with('.') || c == "site-packages" || c == "__pycache__")
             || path == test_file
+            || (is_read && !is_data_input(&path))
         {
             continue;
         }
@@ -772,10 +816,21 @@ pub fn parse_loaded_modules(output: &str, test_file: &str, production: &Producti
     Ok(loaded)
 }
 
+/// A file the run read that counts as an input of the regression: anything but byte-code,
+/// path files and the pytest or packaging configuration pytest itself reads at start-up (the
+/// configuration guard owns those). Python sources read as text are inputs like any other.
+fn is_data_input(path: &str) -> bool {
+    const CONFIGURATION: [&str; 4] = ["pyproject.toml", "setup.cfg", "tox.ini", "setup.py"];
+    let name = guards::base_name(path);
+    !(name.ends_with(".pyc") || name.ends_with(".pth"))
+        && !PYTEST_CONFIG_FILES.contains(&name)
+        && !CONFIGURATION.contains(&name)
+}
+
 /// Top-level directories outside the test tree that hold a frozen input (a shared
-/// `support/helpers.py` the regression loaded, a `fixtures/` file the repro created): the whole
-/// tree is test support and is locked with the test, so no module can be added next to the
-/// frozen one to shadow it.
+/// `support/helpers.py` the regression loaded, a `fixtures/input.json` it read, a file the
+/// repro created): the whole tree is test support and is locked with the test, so no module or
+/// file can be added next to the frozen one to shadow or redirect it.
 fn support_trees(frozen_inputs: &[String], tree: &str) -> BTreeSet<String> {
     frozen_inputs
         .iter()
@@ -801,10 +856,13 @@ enum Classification {
 
 /// Where the repository says its production code lives, so that everything else the frozen
 /// regression loads can be frozen as test support: the top-level import names its packaging
-/// metadata declares (`pyproject.toml` `[project] name`, setuptools, poetry, hatch and flit
-/// package lists; `setup.cfg` `[metadata] name` and `[options] packages` / `py_modules`), the
-/// `packages` list under `[profiles.python-pytest]` in the repository's `lyra.toml`, and
-/// everything under `src/`. Read from the frozen checkout, never from the fix.
+/// metadata declares (`pyproject.toml` setuptools, poetry, hatch and flit package lists;
+/// `setup.cfg` `[options] packages` / `py_modules`), the `packages` list under
+/// `[profiles.python-pytest]` in the repository's `lyra.toml`, and everything under `src/`. A
+/// distribution name (`[project] name`, `[tool.poetry] name`, `[metadata] name`) is not an
+/// import name: `published-project` may well ship the package `libcode`. It counts only when a
+/// package or module spelled like it exists in the checkout; otherwise the repository has to
+/// declare its packages. Read from the frozen checkout, never from the fix.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProductionCode {
     names: BTreeSet<String>,
@@ -813,6 +871,7 @@ pub struct ProductionCode {
 impl ProductionCode {
     pub fn declared(read: FileReader<'_>) -> Self {
         let mut names = BTreeSet::new();
+        let mut distributions = Vec::new();
         if let Some(text) = read("pyproject.toml") {
             if let Ok(doc) = text.parse::<toml::Value>() {
                 let at = |path: &[&str]| path.iter().try_fold(&doc, |v, k| v.get(k));
@@ -823,14 +882,14 @@ impl ProductionCode {
                         }
                     }
                 };
-                take(at(&["project", "name"]));
                 take(at(&["tool", "setuptools", "packages"]));
                 take(at(&["tool", "setuptools", "py-modules"]));
                 take(at(&["tool", "setuptools", "packages", "find", "include"]));
-                take(at(&["tool", "poetry", "name"]));
                 take(at(&["tool", "poetry", "packages"]));
                 take(at(&["tool", "hatch", "build", "targets", "wheel", "packages"]));
                 take(at(&["tool", "flit", "module", "name"]));
+                distributions.extend(strings_of(at(&["project", "name"])));
+                distributions.extend(strings_of(at(&["tool", "poetry", "name"])));
             }
         }
         if let Some(text) = read("setup.cfg") {
@@ -844,7 +903,9 @@ impl ProductionCode {
                 for line in lines {
                     if let Some((key, value)) = line.split_once('=') {
                         continued = keys.contains(&key.trim());
-                        if continued {
+                        if continued && header == "metadata" {
+                            distributions.push(value.trim().to_string());
+                        } else if continued {
                             names.extend(value.split(',').filter_map(import_name));
                         }
                     } else if continued {
@@ -857,6 +918,23 @@ impl ProductionCode {
             if let Ok(doc) = text.parse::<toml::Value>() {
                 let value = doc.get("profiles").and_then(|p| p.get(ID)).and_then(|p| p.get("packages"));
                 names.extend(strings_of(value).iter().filter_map(|raw| import_name(raw)));
+            }
+        }
+        // A distribution name is only a hint: it names production code when the checkout has a
+        // package or module spelled like it (PEP 503 normalisation aside, `My-Project` is
+        // imported as `my_project`).
+        for raw in distributions {
+            let Some(name) = import_name(&raw) else { continue };
+            for n in [name.clone(), name.to_ascii_lowercase()] {
+                let spelled = [
+                    format!("{n}/__init__.py"),
+                    format!("{n}.py"),
+                    format!("src/{n}/__init__.py"),
+                    format!("src/{n}.py"),
+                ];
+                if spelled.iter().any(|p| read(p).is_some()) {
+                    names.insert(n);
+                }
             }
         }
         Self { names }
@@ -883,10 +961,11 @@ impl ProductionCode {
 
     fn unknown_message(&self, paths: &BTreeSet<String>) -> String {
         format!(
-            "the frozen regression loads {}, which LYRA cannot tell apart from production code because the repository \
-             declares no packages; declare them (`[project] name` or `[tool.setuptools] packages` in pyproject.toml, \
-             `[options] packages` in setup.cfg, or `packages = [...]` under `[profiles.{ID}]` in the repository's \
-             lyra.toml): everything the regression loads outside them and `src/` is then frozen as test support",
+            "the frozen regression loads or reads {}, which LYRA cannot tell apart from production code because the \
+             repository declares no packages; declare them (`[tool.setuptools] packages` or `py-modules` in \
+             pyproject.toml, `[options] packages` in setup.cfg, or `packages = [...]` under `[profiles.{ID}]` in the \
+             repository's lyra.toml; a `[project] name` counts only when a package or module spelled like it exists): \
+             everything the regression loads outside them and `src/` is then frozen as test support",
             paths.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
         )
     }
@@ -1553,10 +1632,15 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         move |p: &str| map.get(p).map(|s| s.to_string())
     }
 
-    /// Packaging metadata declaring `calc` as the production code of the fixture repositories.
+    /// Packaging metadata declaring `calc` as the production code of the fixture repositories:
+    /// a distribution name, which counts because the fixtures really have a `calc.py`.
     const PYPROJECT: &str = "[project]\nname = \"calc\"\n";
     fn declared() -> ProductionCode {
-        ProductionCode::declared(&|p: &str| (p == "pyproject.toml").then(|| PYPROJECT.to_string()))
+        ProductionCode::declared(&|p: &str| match p {
+            "pyproject.toml" => Some(PYPROJECT.to_string()),
+            "calc.py" => Some(String::new()),
+            _ => None,
+        })
     }
 
     fn output(exit: i32, text: &str) -> CommandOutput {
@@ -2190,16 +2274,23 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             ("venv/__init__.py", ""),
             ("not-a-name/__init__.py", ""),
             ("namespace_only/mod.py", ""),
+            // A namespace root that holds only subpackages: no `.py` directly in `src/acme/`.
+            ("src/acme/widget/mod.py", ""),
+            ("src/empty_dirs/nothing/.keep", ""),
+            // Imported by the regression and found through its nested layout under `lib/`.
+            ("lib/vendor/deep/mod.py", ""),
+            (FILE, "from acme.widget import mod\nimport vendor.deep.mod\nimport os\n"),
         ] {
             let path = root.join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         }
-        assert_eq!(importable_names(root), ["calc", "pkg", "toplevel"]);
+        assert_eq!(importable_names(root), ["acme", "calc", "pkg", "toplevel"]);
+        assert_eq!(provenance_names(root, FILE), ["acme", "calc", "pkg", "toplevel", "vendor"]);
         let steps = PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), root).unwrap();
         assert_eq!(steps.iter().map(|s| s.name).collect::<Vec<_>>(), ["imports", "repro", "tests"]);
         assert_eq!(steps[0].spec.args.len(), 2, "names travel on stdin, not argv");
-        assert_eq!(steps[0].spec.stdin.as_deref(), Some("calc\npkg\ntoplevel\n"));
+        assert_eq!(steps[0].spec.stdin.as_deref(), Some("acme\ncalc\npkg\ntoplevel\nvendor\n"));
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(
             PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), empty.path()).unwrap()[0].name,
@@ -2332,10 +2423,21 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
     }
 
     /// A regular package of the same name outside the checkout takes precedence over the
-    /// candidate's PEP 420 namespace package; the provenance step must catch it by name.
+    /// candidate's PEP 420 namespace package; the provenance step must catch it by name. Both
+    /// a namespace package of modules (`src/pkg/module.py`) and a namespace root that holds
+    /// only subpackages (`src/pkg/widget/module.py`, nothing directly in `src/pkg/`).
     #[tokio::test]
     #[ignore = "needs a provisioned python3 with pytest on PATH"]
     async fn a_regular_package_elsewhere_cannot_hide_behind_a_namespace_package() {
+        for (module, import) in [
+            ("pkg/module.py", "from pkg.module import answer"),
+            ("pkg/widget/module.py", "from pkg.widget.module import answer"),
+        ] {
+            namespace_package_shadowed_externally(module, import).await;
+        }
+    }
+
+    async fn namespace_package_shadowed_externally(module: &str, import: &str) {
         let dir = tempfile::tempdir().unwrap();
         let timeout = Duration::from_secs(120);
         let cancel = CancellationToken::new();
@@ -2344,15 +2446,18 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             std::fs::write(path, text).unwrap();
         };
         let checkout = dir.path().join("checkout");
-        write(checkout.join("src/pkg/module.py"), "def answer():\n    return 41\n");
+        write(checkout.join("src").join(module), "def answer():\n    return 41\n");
         write(checkout.join("pytest.ini"), "[pytest]\n");
         write(
             checkout.join(FILE),
-            "from pkg.module import answer\n\ndef test_issue_7_fails():\n    assert answer() == 42, \"sum must be three\"\n",
+            &format!("{import}\n\ndef test_issue_7_fails():\n    assert answer() == 42, \"sum must be three\"\n"),
         );
         let external = dir.path().join("site");
         write(external.join("pkg/__init__.py"), "");
-        write(external.join("pkg/module.py"), "def answer():\n    return 42\n");
+        for dir in std::path::Path::new(module).ancestors().skip(1).filter(|d| !d.as_os_str().is_empty()) {
+            write(external.join(dir).join("__init__.py"), "");
+        }
+        write(external.join(module), "def answer():\n    return 42\n");
 
         let venv = dir.path().join("venv");
         let made = proc::run(
@@ -2400,9 +2505,11 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             RegressionOutcome::Passed,
             "precondition: the external package wins: {out}"
         );
-        // ...so verification fails visibly, naming the package.
+        // ...so verification fails visibly, naming the package (which must be listed even
+        // when `src/pkg/` itself holds no Python file).
         let steps = PythonPytest.verification_steps(&VerifyCommands::default(), &rec(), &checkout).unwrap();
-        assert_eq!(steps[0].name, "imports");
+        assert_eq!(steps[0].name, "imports", "{module}");
+        assert_eq!(steps[0].spec.stdin.as_deref(), Some("pkg\n"), "{module}");
         let env_root = dir.path().join("env");
         let check =
             proc::run(&with_venv(PythonPytest.command_environment(steps[0].spec.clone(), &env_root)), timeout, &cancel)
@@ -2473,18 +2580,24 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
 
     #[test]
     fn the_import_recorder_report_is_required_and_freezes_everything_but_production_code() {
-        let report = "1 failed in 0.02s\nLYRA-LOADED calc.py\nLYRA-LOADED calc/util.py\nLYRA-LOADED src/other/x.py\nLYRA-LOADED tests/__init__.py\nLYRA-LOADED tests/test_helpers.py\nLYRA-LOADED tests/test_issue_7.py\nLYRA-LOADED conftest.py\nLYRA-LOADED support/__init__.py\nLYRA-LOADED support/helpers.py\nLYRA-LOADED helpers.py\nLYRA-LOADED .venv/lib/test_x.py\nLYRA-LOADED lib/site-packages/test_y.py\nLYRA-LOADED ../outside/test_z.py\nLYRA-LOADED-END\n";
+        let report = "1 failed in 0.02s\nLYRA-LOADED calc.py\nLYRA-LOADED calc/util.py\nLYRA-LOADED src/other/x.py\nLYRA-LOADED tests/__init__.py\nLYRA-LOADED tests/test_helpers.py\nLYRA-LOADED tests/test_issue_7.py\nLYRA-LOADED conftest.py\nLYRA-LOADED support/__init__.py\nLYRA-LOADED support/helpers.py\nLYRA-LOADED helpers.py\nLYRA-LOADED .venv/lib/test_x.py\nLYRA-LOADED lib/site-packages/test_y.py\nLYRA-LOADED ../outside/test_z.py\nLYRA-READ fixtures/input.json\nLYRA-READ tests/data/case.txt\nLYRA-READ data/golden.bin\nLYRA-READ calc/table.csv\nLYRA-READ src/other/schema.json\nLYRA-READ pyproject.toml\nLYRA-READ pytest.ini\nLYRA-READ setup.cfg\nLYRA-READ tests/test_issue_7.py\nLYRA-READ tests/helpers.py\nLYRA-READ support/__pycache__/helpers.cpython-314.pyc\nLYRA-READ .pytest_cache/v/cache/nodeids\nLYRA-LOADED-END\n";
         assert_eq!(
             parse_loaded_modules(report, FILE, &declared()).unwrap(),
             [
                 "conftest.py",
+                "data/golden.bin",
+                "fixtures/input.json",
                 "helpers.py",
                 "support/__init__.py",
                 "support/helpers.py",
                 "tests/__init__.py",
+                "tests/data/case.txt",
+                "tests/helpers.py",
                 "tests/test_helpers.py"
             ],
-            "declared `calc` and `src/` stay editable; shared support anywhere else is frozen"
+            "declared `calc` and `src/` stay editable (modules and data alike); shared support and data read anywhere \
+             else are frozen; Python sources among the reads belong to the module layer, configuration to its guard, \
+             caches to nobody"
         );
         let err = parse_loaded_modules("1 failed in 0.02s\nLYRA-LOADED tests/test_helpers.py\n", FILE, &declared())
             .unwrap_err();
@@ -2492,7 +2605,15 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         // With nothing declared, production and support cannot be told apart: a visible error
         // naming the files and the remedy, never a silent choice.
         let err = parse_loaded_modules(report, FILE, &ProductionCode::default()).unwrap_err();
-        for expected in ["`calc.py`", "`support/helpers.py`", "`helpers.py`", "declares no packages", "lyra.toml"] {
+        for expected in [
+            "`calc.py`",
+            "`support/helpers.py`",
+            "`helpers.py`",
+            "`fixtures/input.json`",
+            "`data/golden.bin`",
+            "declares no packages",
+            "lyra.toml",
+        ] {
             assert!(err.contains(expected), "{expected}: {err}");
         }
         assert!(
@@ -2580,26 +2701,39 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             ("pyproject.toml", "[project]\nname = \"my-project\"\n[tool.setuptools]\npy-modules = [\"cli\"]\n[tool.setuptools.packages.find]\ninclude = [\"plugins*\", \"my_project.sub\"]\n[tool.poetry]\nname = \"poem\"\npackages = [{ include = \"verse\", from = \"src\" }]\n[tool.hatch.build.targets.wheel]\npackages = [\"src/hatched\"]\n[tool.flit.module]\nname = \"flat\"\n"),
             ("setup.cfg", "[metadata]\nname = cfg-dist\n[options]\npackages =\n    cfgpkg\n    cfgpkg.sub\npy_modules = single, other\n[options.extras_require]\ntest = pytest\n"),
             ("lyra.toml", "[verify]\ntest = \"python3 -m pytest\"\n[profiles.python-pytest]\npackages = [\"declared\", \"bad-name!\"]\n"),
+            ("my_project/__init__.py", ""),
         ]);
         let production = ProductionCode::declared(&reader(&files));
-        let expected: BTreeSet<String> = [
-            "my_project",
-            "cli",
-            "plugins",
-            "poem",
-            "verse",
-            "hatched",
-            "flat",
-            "cfg_dist",
-            "cfgpkg",
-            "single",
-            "other",
-            "declared",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
+        // `my_project` counts because `my_project/__init__.py` exists; the distribution names
+        // `poem` and `cfg-dist` name nothing in the checkout and are not import names.
+        let expected: BTreeSet<String> =
+            ["my_project", "cli", "plugins", "verse", "hatched", "flat", "cfgpkg", "single", "other", "declared"]
+                .into_iter()
+                .map(String::from)
+                .collect();
         assert_eq!(production.names, expected);
+        // The reviewer's case: a flat layout whose distribution name differs from its import
+        // package. The distribution name must not be taken for production code, or every real
+        // fix to `libcode/` would be rejected as a change to frozen test support; without an
+        // explicit declaration the repository is asked for one.
+        let published = HashMap::from([
+            ("pyproject.toml", "[project]\nname = \"published-project\"\n"),
+            ("libcode/__init__.py", ""),
+            ("libcode/main.py", "def main(): pass\n"),
+        ]);
+        let undeclared = ProductionCode::declared(&reader(&published));
+        assert!(undeclared.names.is_empty(), "{:?}", undeclared.names);
+        assert_eq!(undeclared.classify("libcode/main.py", "tests"), Classification::Unknown);
+        let message = undeclared.unknown_message(&BTreeSet::from(["libcode/main.py".to_string()]));
+        assert!(message.contains("`libcode/main.py`") && message.contains("[project] name` counts only"), "{message}");
+        let mut declared = published.clone();
+        declared.insert("setup.cfg", "[metadata]\nname = published-project\n[options]\npackages = libcode\n");
+        let libcode = ProductionCode::declared(&reader(&declared));
+        assert_eq!(libcode.names, BTreeSet::from(["libcode".to_string()]));
+        assert_eq!(libcode.classify("libcode/main.py", "tests"), Classification::Production);
+        // A distribution name spelled like its module, in either case, is enough on its own.
+        let spelled = HashMap::from([("pyproject.toml", "[project]\nname = \"Calc-Tools\"\n"), ("calc_tools.py", "")]);
+        assert_eq!(ProductionCode::declared(&reader(&spelled)).names, BTreeSet::from(["calc_tools".to_string()]));
         for (path, want) in [
             ("my_project/core.py", Classification::Production),
             ("cli.py", Classification::Production),
@@ -2759,6 +2893,90 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         let added = vec![("M".to_string(), "calc.py".to_string()), ("A".to_string(), "support/shadow.py".to_string())];
         let err = check_fix_changes_with(&added, &with_recorder, &read_checkpoint, &read_now).unwrap_err();
         assert!(err.contains("support/shadow.py") && err.contains("test support in support/"), "{err}");
+    }
+
+    /// End to end with real pytest, the reviewer's fixture-only bypass: the regression reads a
+    /// tracked `fixtures/input.json` that existed before Repro, through `open` and through
+    /// `pathlib`, plus a data file inside the test tree. The recorder reports the reads, so a
+    /// fix that only swaps the triggering input for a benign one is rejected; a repository that
+    /// cannot say what its production code is fails closed at S2 instead of guessing.
+    #[tokio::test]
+    #[ignore = "needs a provisioned python3 with pytest on PATH"]
+    async fn pre_existing_fixture_data_read_by_the_regression_is_frozen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("pytest.ini", "[pytest]\n");
+        write("pyproject.toml", PYPROJECT);
+        write("calc.py", "import json\n\ndef add(a, b):\n    return a - b\n\ndef load(path):\n    with open(path) as f:\n        return json.load(f)\n");
+        write("fixtures/input.json", "{\"a\": 1, \"b\": 2}\n");
+        write("data/expected.txt", "3\n");
+        write("tests/cases/limit.txt", "0\n");
+        write(
+            FILE,
+            "import os, pathlib\nfrom calc import add, load\n\nHERE = os.path.dirname(__file__)\n\ndef test_issue_7_fails():\n    case = load(\"fixtures/input.json\")\n    expected = int(pathlib.Path(\"data/expected.txt\").read_text())\n    limit = int(open(os.path.join(HERE, \"cases/limit.txt\")).read())\n    assert add(case[\"a\"], case[\"b\"]) == expected + limit, \"sum must be three\"\n",
+        );
+        let timeout = Duration::from_secs(120);
+        let cancel = CancellationToken::new();
+        let spec = PythonPytest.reproduction_environment(PythonPytest.regression_command(&rec(), root).unwrap(), root);
+        let run = proc::run(&spec, timeout, &cancel).await.unwrap();
+        let out = run.combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Failed, "{out}");
+        PythonPytest.confirm_failure(&run, &rec()).unwrap();
+        let loaded = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap();
+        assert_eq!(
+            loaded,
+            ["data/expected.txt", "fixtures/input.json", "tests/cases/limit.txt"],
+            "every read input is frozen, production `calc` is not: {out}"
+        );
+
+        // Without a declaration of the production code, the reads cannot be classified: S2 stops.
+        std::fs::remove_file(root.join("pyproject.toml")).unwrap();
+        let err = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap_err();
+        assert!(err.contains("`fixtures/input.json`") && err.contains("declares no packages"), "{err}");
+        write("pyproject.toml", PYPROJECT);
+
+        let frozen: HashMap<String, String> =
+            [FILE, "pyproject.toml", "calc.py", "fixtures/input.json", "data/expected.txt", "tests/cases/limit.txt"]
+                .into_iter()
+                .map(|p| (p.to_string(), std::fs::read_to_string(root.join(p)).unwrap()))
+                .collect();
+        let read_checkpoint = |p: &str| frozen.get(p).cloned();
+        let read_now = |p: &str| std::fs::read_to_string(root.join(p)).ok();
+        let mut record = rec();
+        record.frozen_inputs = loaded;
+        for (path, benign) in [
+            ("fixtures/input.json", "{\"a\": 4, \"b\": 1}\n"),
+            ("data/expected.txt", "-1\n"),
+            ("tests/cases/limit.txt", "-4\n"),
+        ] {
+            write(path, benign);
+            let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+            assert_eq!(
+                classify_pytest(&out, ID_),
+                RegressionOutcome::Passed,
+                "{path}: the attack works without the lock: {out}"
+            );
+            let change = vec![("M".to_string(), path.to_string())];
+            let err = check_fix_changes_with(&change, &record, &read_checkpoint, &read_now).unwrap_err();
+            assert!(err.contains(path) && err.contains("locked"), "{path}: {err}");
+            write(path, &frozen[path]);
+        }
+        // Nothing can be added next to a frozen input either, and the real fix is accepted.
+        write("fixtures/other.json", "{}\n");
+        let added = vec![("A".to_string(), "fixtures/other.json".to_string())];
+        let err = check_fix_changes_with(&added, &record, &read_checkpoint, &read_now).unwrap_err();
+        assert!(err.contains("test support in fixtures/"), "{err}");
+        std::fs::remove_file(root.join("fixtures/other.json")).unwrap();
+        write("calc.py", &frozen["calc.py"].replace("a - b", "a + b"));
+        let fix = vec![("M".to_string(), "calc.py".to_string())];
+        check_fix_changes_with(&fix, &record, &read_checkpoint, &read_now).unwrap();
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "{out}");
     }
 
     #[test]

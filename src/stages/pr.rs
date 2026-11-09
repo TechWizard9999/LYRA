@@ -306,8 +306,11 @@ mod tests {
             "command": command, "expected": rec.expected, "observed": "", "registration_file": null, "notes": "", "frozen_commit": "aaa"});
         v["verify"]["steps"] = json!([{"name": "repro", "command": executed.display(), "ok": true, "exit_code": 0, "duration_ms": 400, "log": "50-verify/repro-after.txt"}]);
         let body = pr_body(&v).unwrap();
-        assert!(body.contains(&format!("- Run it: `{command}`\n")), "{body}");
-        assert!(body.contains(&format!("| repro | `{command}` | pass | 0.4 s |\n")), "{body}");
+        // Whole lines, so the command and nothing else is on each (`lines()` also accepts the
+        // CRLF a Windows checkout with `core.autocrlf` gives the template).
+        let has_line = |line: String| body.lines().any(|l| l == line);
+        assert!(has_line(format!("- Run it: `{command}`")), "{body}");
+        assert!(has_line(format!("| repro | `{command}` | pass | 0.4 s |")), "{body}");
         assert!(!body.contains("pytest.main"), "no recorder source in the PR: {body}");
     }
 
