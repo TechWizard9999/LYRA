@@ -1049,9 +1049,8 @@ impl ProductionCode {
             if wheres.is_empty() { vec![join_dir(base, "")] } else { wheres.iter().map(|w| join_dir(w, "")).collect() };
         for dir in &wheres {
             if includes.is_empty() {
-                if !dir.is_empty() {
-                    self.add_root(dir, "*");
-                }
+                // Every package in the search path: as broad as `include = ["*"]`.
+                self.add_root(dir, "*");
             } else {
                 for include in includes {
                     self.add_name(include, dir);
@@ -1069,8 +1068,11 @@ impl ProductionCode {
 
     fn add_root(&mut self, dir: &str, pattern: &str) {
         let dir = join_dir(dir, "");
-        if dir.is_empty() && pattern.chars().all(|c| c == '*' || c == '?') {
-            self.too_broad.insert(pattern.to_string());
+        // A pattern made only of wildcards declares every directory in its search path (the
+        // root, `src/`, a `pythonpath` such as `lib/`), test support next to the packages
+        // included, so it cannot tell production from test support: it declares nothing.
+        if pattern.chars().all(|c| c == '*' || c == '?') {
+            self.too_broad.insert(if dir.is_empty() { pattern.to_string() } else { format!("{dir}/{pattern}") });
             return;
         }
         if (dir.is_empty() || dir == "src") && identifier_re().is_match(pattern) {
@@ -1096,7 +1098,8 @@ impl ProductionCode {
         if self.excluded.iter().any(matches) {
             return false;
         }
-        Self::top_below(path, "").is_some_and(|top| self.names.contains(top)) || self.roots.iter().any(matches)
+        let named = |dir: &str| Self::top_below(path, dir).is_some_and(|top| self.names.contains(top));
+        named("") || named("src") || self.roots.iter().any(matches)
     }
 
     /// The declarations, for messages: `calc`, `lib/pkg`, `foo*`.
@@ -1111,12 +1114,9 @@ impl ProductionCode {
         if is_test_infrastructure(path, tree) {
             return Classification::TestSupport;
         }
-        if path.starts_with("src/") {
-            return Classification::Production;
-        }
         if self.is_empty() {
-            // Only a Python module outside `src/` might be undeclared production code; data and
-            // other files there are not production code either way.
+            // Only a Python module might be undeclared production code; data and other files
+            // are not production code either way.
             let module = [".py", ".pyc", ".pyd", ".so", ".pyw"].iter().any(|ext| path.ends_with(ext));
             return if module { Classification::Unknown } else { Classification::TestSupport };
         }
@@ -1132,15 +1132,15 @@ impl ProductionCode {
             "the frozen regression loads or reads {}, which LYRA cannot tell apart from production code because the \
              repository declares no packages; declare them (`[tool.setuptools] packages` or `py-modules` in \
              pyproject.toml, `[options] packages` in setup.cfg, or `packages = [...]` under `[profiles.{ID}]` in the \
-             repository's lyra.toml; a `[project] name` counts only when a package or module spelled like it exists): \
-             everything the regression loads outside them and `src/` is then frozen as test support",
+             repository's lyra.toml; a `[project] name` counts only when a package or module spelled like it exists, \
+             at the root or under `src/`): everything the regression loads outside them is then frozen as test support",
             paths.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
         ) + &if self.too_broad.is_empty() {
             String::new()
         } else {
             format!(
-                " (the declared pattern {} matches every top-level directory, test support included, so it was \
-                 ignored; name the packages)",
+                " (the declared pattern {} matches every package in its search path, test support next to them \
+                 included, so it was ignored; name the packages)",
                 self.too_broad.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
             )
         }
@@ -1738,8 +1738,8 @@ fn fix_may_not_change(
         Classification::Production => None,
         Classification::Unknown => Some(production.unknown_message(&BTreeSet::from([path.to_string()]))),
         Classification::TestSupport => Some(format!(
-            "not declared production code; a fix may change only `src/`, the declared packages{} and the \
-             dependency fields of the root manifests",
+            "not declared production code; a fix may change only the declared packages{} and the dependency \
+             fields of the root manifests",
             if production.is_empty() { String::new() } else { format!(" ({})", production.describe()) }
         )),
     }
@@ -2248,7 +2248,8 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
 
     #[test]
     fn fix_lock_rejects_test_conftest_config_and_hook_changes() {
-        let pyproject = "[project]\nname = \"x\"\n[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n";
+        let pyproject =
+            "[project]\nname = \"x\"\n[tool.setuptools]\npy-modules = [\"app\"]\n[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n";
         let frozen = HashMap::from([
             (FILE, "def test_issue_7_fails():\n    assert 0\n"),
             ("pyproject.toml", pyproject),
@@ -2342,7 +2343,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
     /// fixture. Additions, deletions and renames (a deletion plus an addition) are all checked.
     #[test]
     fn fix_may_change_only_declared_production_code() {
-        let pyproject = "[project]\nname = \"calc\"\ndependencies = [\"attrs\"]\n[tool.setuptools]\npackages = [\"calc\", \"textkit\"]\n[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n[project.entry-points.pytest11]\n";
+        let pyproject = "[project]\nname = \"calc\"\ndependencies = [\"attrs\"]\n[tool.setuptools]\npackages = [\"calc\", \"textkit\", \"app\"]\n[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n[project.entry-points.pytest11]\n";
         let setup_cfg = "[metadata]\nname = calc\n[options]\npackages = calc\ninstall_requires =\n    attrs>=21\n    six==1.16\n[options.extras_require]\ntest = pytest\n[tool:pytest]\ntestpaths = tests\n";
         let checkpoint = HashMap::from([
             (FILE, "from calc import add\n"),
@@ -2438,7 +2439,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         for broken in [
             pyproject.replace("name = \"calc\"", "name = \"other\""),
             pyproject.replace("testpaths = [\"tests\"]", "testpaths = [\"src\"]"),
-            pyproject.replace("[\"calc\", \"textkit\"]", "[\"calc\"]"),
+            pyproject.replace("[\"calc\", \"textkit\", \"app\"]", "[\"calc\"]"),
             format!("{pyproject}hide = \"calc.plugin\"\n"),
             "[project\n".to_string(),
         ] {
@@ -3137,7 +3138,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
 
     #[test]
     fn the_import_recorder_report_is_required_and_freezes_everything_but_production_code() {
-        let report = "1 failed in 0.02s\nLYRA-LOADED calc.py\nLYRA-LOADED calc/util.py\nLYRA-LOADED src/other/x.py\nLYRA-LOADED tests/__init__.py\nLYRA-LOADED tests/test_helpers.py\nLYRA-LOADED tests/test_issue_7.py\nLYRA-LOADED conftest.py\nLYRA-LOADED support/__init__.py\nLYRA-LOADED support/helpers.py\nLYRA-LOADED helpers.py\nLYRA-LOADED .venv/lib/test_x.py\nLYRA-LOADED lib/site-packages/test_y.py\nLYRA-LOADED ../outside/test_z.py\nLYRA-READ fixtures/input.json\nLYRA-READ tests/data/case.txt\nLYRA-READ data/golden.bin\nLYRA-READ calc/table.csv\nLYRA-READ src/other/schema.json\nLYRA-READ pyproject.toml\nLYRA-READ pytest.ini\nLYRA-READ setup.cfg\nLYRA-READ tests/test_issue_7.py\nLYRA-READ tests/helpers.py\nLYRA-READ support/__pycache__/helpers.cpython-314.pyc\nLYRA-READ .pytest_cache/v/cache/nodeids\nLYRA-LOADED-END\n";
+        let report = "1 failed in 0.02s\nLYRA-LOADED calc.py\nLYRA-LOADED calc/util.py\nLYRA-LOADED src/calc/core.py\nLYRA-LOADED src/support/helper.py\nLYRA-LOADED tests/__init__.py\nLYRA-LOADED tests/test_helpers.py\nLYRA-LOADED tests/test_issue_7.py\nLYRA-LOADED conftest.py\nLYRA-LOADED support/__init__.py\nLYRA-LOADED support/helpers.py\nLYRA-LOADED helpers.py\nLYRA-LOADED .venv/lib/test_x.py\nLYRA-LOADED lib/site-packages/test_y.py\nLYRA-LOADED ../outside/test_z.py\nLYRA-READ fixtures/input.json\nLYRA-READ tests/data/case.txt\nLYRA-READ data/golden.bin\nLYRA-READ calc/table.csv\nLYRA-READ src/other/schema.json\nLYRA-READ pyproject.toml\nLYRA-READ pytest.ini\nLYRA-READ setup.cfg\nLYRA-READ tests/test_issue_7.py\nLYRA-READ tests/helpers.py\nLYRA-READ support/__pycache__/helpers.cpython-314.pyc\nLYRA-READ .pytest_cache/v/cache/nodeids\nLYRA-LOADED-END\n";
         assert_eq!(
             parse_loaded_modules(report, FILE, &declared()).unwrap(),
             [
@@ -3147,6 +3148,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
                 "fixtures/input.json",
                 "helpers.py",
                 "src/other/schema.json",
+                "src/support/helper.py",
                 "support/__init__.py",
                 "support/helpers.py",
                 "tests/__init__.py",
@@ -3154,8 +3156,8 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
                 "tests/helpers.py",
                 "tests/test_helpers.py"
             ],
-            "declared `calc` and `src/` modules stay editable; every non-source file the run read is frozen, also \
-             inside production code; configuration belongs to its guard, caches to nobody"
+            "declared `calc` modules (at the root or under `src/`) stay editable; undeclared modules under `src/` and \
+             every non-source file the run read are frozen; configuration belongs to its guard, caches to nobody"
         );
         let err = parse_loaded_modules("1 failed in 0.02s\nLYRA-LOADED tests/test_helpers.py\n", FILE, &declared())
             .unwrap_err();
@@ -3180,8 +3182,8 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             assert!(err.contains(expected), "{expected}: {err}");
         }
         assert!(
-            !err.contains("`src/other/x.py`") && !err.contains("`tests/") && !err.contains("`fixtures/input.json`"),
-            "src/, the test tree and data never need a declaration (data outside src/ is frozen either way): {err}"
+            err.contains("`src/support/helper.py`") && !err.contains("`tests/") && !err.contains("`fixtures/input.json`"),
+            "modules under src/ need a declaration too; the test tree and data never do (data is frozen either way): {err}"
         );
         // The recorder wraps the same flags and node id; classification ignores its report.
         let spec = PythonPytest.regression_command(&rec(), Path::new("/w")).unwrap();
@@ -3293,7 +3295,9 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         for (path, want) in [
             ("my_project/core.py", Classification::Production),
             ("cli.py", Classification::Production),
-            ("src/anything/at_all.py", Classification::Production),
+            // `src/` is a search path, not a declaration: only declared packages under it.
+            ("src/anything/at_all.py", Classification::TestSupport),
+            ("src/verse/poem.py", Classification::Production),
             ("support/helpers.py", Classification::TestSupport),
             ("helpers.py", Classification::TestSupport),
             ("tests/helpers.py", Classification::TestSupport),
@@ -3303,7 +3307,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         }
         // Nothing declared: only `src/` and the test side are certain.
         let none = ProductionCode::declared(&|_: &str| None);
-        assert_eq!(none.classify("src/pkg/a.py", "tests"), Classification::Production);
+        assert_eq!(none.classify("src/pkg/a.py", "tests"), Classification::Unknown);
         assert_eq!(none.classify("tests/helpers.py", "tests"), Classification::TestSupport);
         assert_eq!(none.classify("support/helpers.py", "tests"), Classification::Unknown);
         assert_eq!(none.classify("calc.py", "tests"), Classification::Unknown);
@@ -3327,6 +3331,8 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         let find_foo = "[tool.setuptools.packages.find]\ninclude = [\"foo*\"]\n";
         let poetry = "[tool.poetry]\npackages = [{ include = \"pkg\", from = \"lib\" }]\n";
         let find_lib = "[tool.setuptools.packages.find]\nwhere = [\"lib\"]\nexclude = [\"bench*\"]\n";
+        let find_lib_globs =
+            "[tool.setuptools.packages.find]\nwhere = [\"lib\"]\ninclude = [\"b*\", \"c*\"]\nexclude = [\"bench*\"]\n";
         let base = "[tool.setuptools]\npackages = [\"pkg\"]\npackage-dir = { \"\" = \"lib\" }\n";
         let mapped = "[tool.setuptools]\npackages = [\"pkg\"]\npackage-dir = { pkg = \"code/pkgsrc\" }\n";
         let hatch = "[tool.hatch.build.targets.wheel]\npackages = [\"lib/hatched\"]\n";
@@ -3341,10 +3347,13 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             (vec![("pyproject.toml", poetry)], "lib/pkg/core.py", Production),
             (vec![("pyproject.toml", poetry)], "pkg/core.py", TestSupport),
             (vec![("pyproject.toml", poetry)], "lib/other/core.py", TestSupport),
-            // find with where and exclude, no include: everything below a non-root where.
-            (vec![("pyproject.toml", find_lib)], "lib/anything/x.py", Production),
-            (vec![("pyproject.toml", find_lib)], "lib/benchmarks/x.py", TestSupport),
-            (vec![("pyproject.toml", find_lib)], "support/helpers.py", TestSupport),
+            // find without include is as broad as `*`: it declares nothing, wherever it searches.
+            (vec![("pyproject.toml", find_lib)], "lib/anything/x.py", Unknown),
+            (vec![("pyproject.toml", find_lib)], "support/helpers.py", Unknown),
+            // include globs with exclude below a non-root where.
+            (vec![("pyproject.toml", find_lib_globs)], "lib/core/x.py", Production),
+            (vec![("pyproject.toml", find_lib_globs)], "lib/benchmarks/x.py", TestSupport),
+            (vec![("pyproject.toml", find_lib_globs)], "lib/support/helper.py", TestSupport),
             // At the root, find without include declares nothing (support code would become production).
             (vec![("pyproject.toml", "[tool.setuptools.packages.find]\n")], "support/helpers.py", Unknown),
             // package-dir: a base for the package list, and per-package directories.
@@ -3389,18 +3398,25 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         let production = ProductionCode::declared(&reader(&files));
         assert_eq!(production.classify("support/helper.py", "tests"), Unknown);
         let message = production.unknown_message(&BTreeSet::from(["support/helper.py".to_string()]));
-        assert!(message.contains("`*` matches every top-level directory"), "{message}");
+        assert!(message.contains("`*` matches every package in its search path"), "{message}");
         let mixed = "[tool.setuptools.packages.find]\ninclude = [\"*\", \"?\", \"calc\"]\n";
         let files = HashMap::from([("pyproject.toml", mixed)]);
         let production = ProductionCode::declared(&reader(&files));
         assert_eq!(production.classify("support/helper.py", "tests"), TestSupport);
         assert_eq!(production.classify("calc/core.py", "tests"), Production);
-        // Below a dedicated directory a wildcard stays meaningful.
-        let files = HashMap::from([(
-            "pyproject.toml",
-            "[tool.setuptools.packages.find]\nwhere = [\"lib\"]\ninclude = [\"*\"]\n",
-        )]);
-        assert_eq!(ProductionCode::declared(&reader(&files)).classify("lib/any/x.py", "tests"), Production);
+        // The reviewer's case: `where = ["lib"]`, `include = ["*"]` (with `pythonpath = lib`).
+        // Every package in `lib/`, test support next to them included: it declares nothing.
+        let lib_star = "[tool.setuptools.packages.find]\nwhere = [\"lib\"]\ninclude = [\"*\"]\n";
+        let files = HashMap::from([("pyproject.toml", lib_star)]);
+        let production = ProductionCode::declared(&reader(&files));
+        assert_eq!(production.classify("lib/support/helper.py", "tests"), Unknown);
+        let message = production.unknown_message(&BTreeSet::from(["lib/support/helper.py".to_string()]));
+        assert!(message.contains("`lib/*` matches every package in its search path"), "{message}");
+        let named = "[tool.setuptools.packages.find]\nwhere = [\"lib\"]\ninclude = [\"*\", \"pkg\"]\n";
+        let files = HashMap::from([("pyproject.toml", named)]);
+        let production = ProductionCode::declared(&reader(&files));
+        assert_eq!(production.classify("lib/support/helper.py", "tests"), TestSupport);
+        assert_eq!(production.classify("lib/pkg/core.py", "tests"), Production);
         assert_eq!(join_dir("./lib/", "."), "lib");
         // A fix to the reviewer's `foobar/core.py` passes the lock.
         let files = HashMap::from([
@@ -3827,6 +3843,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             std::fs::write(path, text).unwrap();
         };
         write("pytest.ini", "[pytest]\n");
+        write("pyproject.toml", "[tool.setuptools]\npackages = [\"app\"]\n");
         write("src/app/__init__.py", "def add(a, b):\n    return a - b\n");
         write("src/app/data/test_vector.json", "[1, 2, 3]\n");
         write(
@@ -3842,10 +3859,11 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         let loaded = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap();
         assert_eq!(loaded, ["src/app/data/test_vector.json"], "{out}");
 
-        let frozen: HashMap<String, String> = [FILE, "src/app/__init__.py", "src/app/data/test_vector.json"]
-            .into_iter()
-            .map(|p| (p.to_string(), std::fs::read_to_string(root.join(p)).unwrap()))
-            .collect();
+        let frozen: HashMap<String, String> =
+            [FILE, "pyproject.toml", "src/app/__init__.py", "src/app/data/test_vector.json"]
+                .into_iter()
+                .map(|p| (p.to_string(), std::fs::read_to_string(root.join(p)).unwrap()))
+                .collect();
         let read_checkpoint = |p: &str| frozen.get(p).cloned();
         let read_now = |p: &str| std::fs::read_to_string(root.join(p)).ok();
         let with_recorder = ReproRecord { frozen_inputs: loaded, ..rec() };
@@ -3896,7 +3914,10 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
         assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Failed, "{out}");
         let err = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap_err();
-        assert!(err.contains("`support/helper.py`") && err.contains("`*` matches every top-level directory"), "{err}");
+        assert!(
+            err.contains("`support/helper.py`") && err.contains("`*` matches every package in its search path"),
+            "{err}"
+        );
 
         write("pyproject.toml", "[tool.setuptools.packages.find]\ninclude = [\"*\", \"calc\"]\n");
         let loaded = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap();
@@ -3921,6 +3942,73 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         let fix = vec![("M".to_string(), "calc/__init__.py".to_string())];
         check_fix_changes_with(&fix, &ReproRecord { frozen_inputs: loaded, ..rec() }, &read_checkpoint, &read_now)
             .unwrap();
+    }
+
+    /// The reviewer's follow-up: the same bypass below a non-root search path. With
+    /// `where = ["lib"]`, `include = ["*"]` and pytest's `pythonpath = lib`, the regression
+    /// imports `lib/support/helper.py` under a computed name. `lib/*` declares nothing, so S2
+    /// stops; with the package named, the helper is frozen and the edit that would make the
+    /// unchanged failing test pass is rejected.
+    #[tokio::test]
+    #[ignore = "needs a provisioned python3 with pytest on PATH"]
+    async fn a_wildcard_below_a_search_path_does_not_unfreeze_test_support() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("pytest.ini", "[pytest]\npythonpath = lib\n");
+        write("pyproject.toml", "[tool.setuptools.packages.find]\nwhere = [\"lib\"]\ninclude = [\"*\"]\n");
+        write("lib/calc/__init__.py", "def add(a, b):\n    return a - b\n");
+        write("lib/support/__init__.py", "");
+        write("lib/support/helper.py", "EXPECTED = 3\n");
+        write(
+            FILE,
+            "import importlib\nfrom calc import add\n\ndef test_issue_7_fails():\n    expected = importlib.import_module(\"sup\" + \"port.helper\").EXPECTED\n    assert add(1, 2) == expected, \"sum must be three\"\n",
+        );
+        let timeout = Duration::from_secs(120);
+        let cancel = CancellationToken::new();
+        let spec = PythonPytest.reproduction_environment(PythonPytest.regression_command(&rec(), root).unwrap(), root);
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Failed, "{out}");
+        let err = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap_err();
+        assert!(
+            err.contains("`lib/support/helper.py`") && err.contains("`lib/*` matches every package in its search path"),
+            "{err}"
+        );
+
+        write("pyproject.toml", "[tool.setuptools.packages.find]\nwhere = [\"lib\"]\ninclude = [\"*\", \"calc\"]\n");
+        let loaded = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap();
+        assert_eq!(loaded, ["lib/support/__init__.py", "lib/support/helper.py"], "{out}");
+        let paths = [
+            FILE,
+            "pytest.ini",
+            "pyproject.toml",
+            "lib/calc/__init__.py",
+            "lib/support/__init__.py",
+            "lib/support/helper.py",
+        ];
+        let frozen: HashMap<String, String> =
+            paths.into_iter().map(|p| (p.to_string(), std::fs::read_to_string(root.join(p)).unwrap())).collect();
+        let read_checkpoint = |p: &str| frozen.get(p).cloned();
+        let read_now = |p: &str| std::fs::read_to_string(root.join(p)).ok();
+        write("lib/support/helper.py", "EXPECTED = -1\n");
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "the attack works without the lock: {out}");
+        let change = vec![("M".to_string(), "lib/support/helper.py".to_string())];
+        for record in [&ReproRecord { frozen_inputs: loaded.clone(), ..rec() }, &rec()] {
+            let err = check_fix_changes_with(&change, record, &read_checkpoint, &read_now).unwrap_err();
+            assert!(err.contains("lib/support/helper.py"), "{err}");
+        }
+        write("lib/support/helper.py", &frozen["lib/support/helper.py"]);
+        write("lib/calc/__init__.py", "def add(a, b):\n    return a + b\n");
+        let fix = vec![("M".to_string(), "lib/calc/__init__.py".to_string())];
+        check_fix_changes_with(&fix, &ReproRecord { frozen_inputs: loaded, ..rec() }, &read_checkpoint, &read_now)
+            .unwrap();
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "{out}");
     }
 
     #[test]

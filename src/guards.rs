@@ -562,6 +562,10 @@ new file mode 100644
             std::fs::write(wt.join(manifest), "[package]\nname = \"foo\"\nversion = \"0.1.0\"\n").unwrap();
             std::fs::create_dir_all(wt.join("src")).unwrap();
             std::fs::write(wt.join(source), "buggy\n").unwrap();
+            if profile.id() == "python-pytest" {
+                // Production code is what the repository declares.
+                std::fs::write(wt.join("pyproject.toml"), "[tool.setuptools]\npy-modules = [\"core\"]\n").unwrap();
+            }
             git::commit_all(wt, "init").unwrap();
 
             // S2: the test plus a fixture holding the input that triggers the bug.
