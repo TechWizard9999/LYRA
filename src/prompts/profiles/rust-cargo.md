@@ -57,4 +57,5 @@ Also allowed: new fixture files under a `tests/` or `fixtures/` directory, and n
 
 {%- macro fix_lock(issue_number, test_file) -%}
 - Do NOT modify `{{ test_file }}`, its `#[cfg(test)] mod issue_{{ issue_number }}_tests;` registration line, any `[[test]]`, `autotests` or `[dev-dependencies]` entry in `Cargo.toml`, or anything under `.cargo/`. Do not add `#[ignore]` or `cfg` gates anywhere. The harness compares these with their frozen form and rejects the fix if any of them changed.
+- Other existing tests may be updated only when they encoded the buggy behaviour; explain each one in `notes`.
 {%- endmacro %}

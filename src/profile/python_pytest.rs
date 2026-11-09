@@ -233,18 +233,6 @@ fn ini_sections(text: &str) -> Vec<(String, Vec<String>)> {
     sections
 }
 
-/// The sections of `file` that configure pytest collection or plugins, in order.
-fn pytest_sections(file: &str, text: &str) -> Vec<(String, Vec<String>)> {
-    let name = guards::base_name(file);
-    ini_sections(text)
-        .into_iter()
-        .filter(|(header, _)| {
-            pytest_section_rules().iter().any(|(f, rule)| *f == name && rule(header))
-                || (name == "pyproject.toml" && header == "project.entry-points.pytest11")
-        })
-        .collect()
-}
-
 #[async_trait]
 impl ExecutionProfile for PythonPytest {
     fn id(&self) -> &'static str {
@@ -868,27 +856,16 @@ pub fn parse_loaded_modules(output: &str, test_file: &str, production: &Producti
 }
 
 /// A file the run read that counts as an input of the regression: anything but byte-code,
-/// path files and the pytest or packaging configuration pytest itself reads at start-up (the
-/// configuration guard owns those). Python sources read as text are inputs like any other.
+/// path files, pytest configuration files (frozen anywhere by the collection guard) and the
+/// root packaging files pytest itself reads at start-up (`pyproject.toml`, `setup.cfg`,
+/// `tox.ini`, `setup.py`, governed by the manifest and allowlist rules). A file with a
+/// configuration-like name anywhere else, such as `fixtures/pyproject.toml`, is data.
 fn is_data_input(path: &str) -> bool {
-    const CONFIGURATION: [&str; 4] = ["pyproject.toml", "setup.cfg", "tox.ini", "setup.py"];
+    const ROOT_CONFIGURATION: [&str; 4] = ["pyproject.toml", "setup.cfg", "tox.ini", "setup.py"];
     let name = guards::base_name(path);
     !(name.ends_with(".pyc") || name.ends_with(".pth"))
         && !PYTEST_CONFIG_FILES.contains(&name)
-        && !CONFIGURATION.contains(&name)
-}
-
-/// Top-level directories outside the test tree that hold a frozen input (a shared
-/// `support/helpers.py` the regression loaded, a `fixtures/input.json` it read, a file the
-/// repro created): the whole tree is test support and is locked with the test, so no module or
-/// file can be added next to the frozen one to shadow or redirect it.
-fn support_trees(frozen_inputs: &[String], tree: &str) -> BTreeSet<String> {
-    frozen_inputs
-        .iter()
-        .map(|p| guards::norm_path(p))
-        .filter(|p| !is_test_side(p, tree))
-        .filter_map(|p| p.split_once('/').map(|(top, _)| top.to_string()))
-        .collect()
+        && !ROOT_CONFIGURATION.contains(&path)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -993,14 +970,17 @@ impl ProductionCode {
 
     /// `path` is repository-relative; `tree` is the regression's test tree.
     fn classify(&self, path: &str, tree: &str) -> Classification {
-        if is_test_side(path, tree) {
+        if is_test_infrastructure(path, tree) {
             return Classification::TestSupport;
         }
         if path.starts_with("src/") {
             return Classification::Production;
         }
         if self.names.is_empty() {
-            return Classification::Unknown;
+            // Only a Python module outside `src/` might be undeclared production code; data and
+            // other files there are not production code either way.
+            let module = [".py", ".pyc", ".pyd", ".so", ".pyw"].iter().any(|ext| path.ends_with(ext));
+            return if module { Classification::Unknown } else { Classification::TestSupport };
         }
         let top = path.split('/').next().unwrap_or(path);
         if self.names.contains(top.strip_suffix(".py").unwrap_or(top)) {
@@ -1369,21 +1349,6 @@ fn test_tree(test_file: &str) -> String {
     }
 }
 
-/// Inside the test tree everything except other test modules is locked: a package
-/// initializer runs on import, a helper or a new module can change or shadow what the
-/// unchanged test exercises, and data files are its inputs. Other test modules may still be
-/// corrected when they encoded the buggy behaviour. A test at the repository root locks only
-/// the root `__init__.py`, because root modules are production code.
-fn locked_by_test_tree(path: &str, tree: &str) -> bool {
-    let name = guards::base_name(path);
-    if tree.is_empty() {
-        return path == "__init__.py";
-    }
-    let inside = path.strip_prefix(tree).is_some_and(|rest| rest.starts_with('/'));
-    let test_module = name.ends_with(".py") && (name.starts_with("test_") || name.ends_with("_test.py"));
-    inside && !test_module
-}
-
 /// Files that change how pytest collects, imports or reports, wherever they are.
 fn collection_control_violation(path: &str) -> Option<&'static str> {
     let name = guards::base_name(path);
@@ -1462,51 +1427,27 @@ pub fn check_fix_changes_with(
     if changes.is_empty() {
         return Err("fix produced no changes".to_string());
     }
-    // 1. The test module is byte-for-byte its frozen form.
+    // 1. The test module and every frozen input are byte-for-byte their frozen form. This
+    //    takes precedence over everything below, including inputs under `src/` or a package.
     let mut violations = guards::frozen_test_violations(changes, rec, read_checkpoint, read_now);
+    let frozen: BTreeSet<String> =
+        std::iter::once(&rec.test_file).chain(&rec.frozen_inputs).map(|p| guards::norm_path(p)).collect();
 
-    // 2. Nothing that changes collection, imports or plugin loading, and none of the test
-    //    infrastructure next to the frozen test.
+    // 2. Everything else may change only when it is declared production code (an allowlist,
+    //    PLAN §13.6): what the regression reads or runs need not be observed to be protected.
     let test_file = guards::norm_path(&rec.test_file);
     let tree = test_tree(&test_file);
     let production = ProductionCode::declared(read_checkpoint);
-    let imported = regression_imports(&test_file, read_checkpoint, &production).unwrap_or_else(|reason| {
+    if let Err(reason) = regression_imports(&test_file, read_checkpoint, &production) {
         violations.push(reason);
-        Default::default()
-    });
-    let support = support_trees(&rec.frozen_inputs, &tree);
+    }
     for (status, raw) in changes {
         let path = guards::norm_path(raw);
-        if let Some(reason) = collection_control_violation(&path) {
+        if frozen.contains(&path) {
+            continue; // reported by the frozen-test check above
+        }
+        if let Some(reason) = fix_may_not_change(&path, status, &production, &tree, read_checkpoint, read_now) {
             violations.push(format!("{status} {path}: {reason}"));
-            continue;
-        }
-        if imported.contains(&path) {
-            violations.push(format!("{status} {path}: imported by the frozen regression, so it is locked with it"));
-            continue;
-        }
-        if path != test_file && locked_by_test_tree(&path, &tree) {
-            let tree = if tree.is_empty() { "the repository root" } else { tree.as_str() };
-            violations.push(format!(
-                "{status} {path}: test infrastructure in {tree} (package initializers, helper modules, data) is locked with the frozen test"
-            ));
-            continue;
-        }
-        if let Some(top) =
-            support.iter().find(|top| path.strip_prefix(top.as_str()).is_some_and(|r| r.starts_with('/')))
-        {
-            violations.push(format!(
-                "{status} {path}: test support in {top}/ (loaded by the frozen regression) is locked with the frozen test"
-            ));
-            continue;
-        }
-        let name = guards::base_name(&path);
-        if ["pyproject.toml", "setup.cfg", "tox.ini"].contains(&name) {
-            let old = pytest_sections(&path, &read_checkpoint(&path).unwrap_or_default());
-            let new = pytest_sections(&path, &read_now(&path).unwrap_or_default());
-            if old != new {
-                violations.push(format!("{status} {path}: its pytest configuration or pytest11 plugins changed"));
-            }
         }
     }
 
@@ -1520,6 +1461,173 @@ pub fn check_fix_changes_with(
         Ok(())
     } else {
         Err(format!("fix violates the test lock: {}", violations.join("; ")))
+    }
+}
+
+/// Why a fix may not add, modify or delete `path` (a rename is a deletion and an addition, and
+/// both halves are checked), or `None` when it may. In order:
+///
+/// 1. collection controls anywhere (`conftest.py`, pytest configuration files, start-up hooks);
+/// 2. the root manifests, whose dependency fields only may change ([`manifest_violation`]);
+/// 3. test infrastructure anywhere, also under `src/` or a declared package: test modules,
+///    helpers, fixtures and data ([`is_test_infrastructure`]);
+/// 4. anything that is not declared production code ([`ProductionCode`]);
+/// 5. a new top-level module or package initializer under `src/`, which could shadow the test
+///    runner or a dependency on the bound import path.
+fn fix_may_not_change(
+    path: &str,
+    status: &str,
+    production: &ProductionCode,
+    tree: &str,
+    read_checkpoint: FileReader<'_>,
+    read_now: FileReader<'_>,
+) -> Option<String> {
+    if let Some(reason) = collection_control_violation(path) {
+        return Some(reason.to_string());
+    }
+    if is_root_manifest(path) {
+        return manifest_violation(path, status, read_checkpoint, read_now);
+    }
+    if is_test_infrastructure(path, tree) {
+        return Some(
+            "tests, test helpers and fixtures are frozen with the regression wherever they live, including under \
+             `src/` and declared packages"
+                .into(),
+        );
+    }
+    match production.classify(path, tree) {
+        Classification::Production if guards::is_new(status) && adds_top_level_module(path) => Some(
+            "a new top-level module or package under `src/` could shadow the test runner or a dependency; \
+             add it inside an existing package"
+                .into(),
+        ),
+        Classification::Production => None,
+        Classification::Unknown => Some(production.unknown_message(&BTreeSet::from([path.to_string()]))),
+        Classification::TestSupport => Some(format!(
+            "not declared production code; a fix may change only `src/`, the declared packages{} and the \
+             dependency fields of the root manifests",
+            if production.names.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", production.names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", "))
+            }
+        )),
+    }
+}
+
+/// Test code and data anywhere: everything in the regression's test tree, every test module
+/// and `conftest.py`, and every file below a directory named `tests`, `test`, `testing`,
+/// `fixtures`, `testdata` or `test_data`, also inside `src/` or a declared package
+/// (`src/pkg/tests/fixtures/input.json`).
+fn is_test_infrastructure(path: &str, tree: &str) -> bool {
+    is_test_side(path, tree)
+        || path
+            .split('/')
+            .rev()
+            .skip(1)
+            .any(|dir| matches!(dir, "tests" | "test" | "testing" | "fixtures" | "testdata" | "test_data"))
+}
+
+/// Manifests whose dependency fields a fix may change: the repository root's
+/// `pyproject.toml`, `setup.cfg` and `requirements*.txt`. A file with the same name anywhere
+/// else (a `fixtures/pyproject.toml`) is not a manifest.
+fn is_root_manifest(path: &str) -> bool {
+    !path.contains('/')
+        && (path == "pyproject.toml"
+            || path == "setup.cfg"
+            || (path.starts_with("requirements") && path.ends_with(".txt")))
+}
+
+/// A root manifest may only be modified, never added or deleted, and only in its dependency
+/// fields: `[project] dependencies` / `optional-dependencies`, `[dependency-groups]` and the
+/// poetry dependency tables in `pyproject.toml`; `install_requires` and
+/// `[options.extras_require]` in `setup.cfg`; any line of a root `requirements*.txt` (LYRA
+/// installs nothing, so these never change what runs). Pytest configuration, plugin entry
+/// points, package lists and every other field stay frozen.
+fn manifest_violation(
+    path: &str,
+    status: &str,
+    read_checkpoint: FileReader<'_>,
+    read_now: FileReader<'_>,
+) -> Option<String> {
+    let (Some(old), Some(new)) = (read_checkpoint(path), read_now(path)) else {
+        return Some("a root manifest may have its dependency fields changed, but not be added or deleted".into());
+    };
+    if guards::is_new(status) || status == "D" {
+        return Some("a root manifest may have its dependency fields changed, but not be added or deleted".into());
+    }
+    let same = match path {
+        "pyproject.toml" => match (pyproject_without_dependencies(&old), pyproject_without_dependencies(&new)) {
+            (Some(old), Some(new)) => old == new,
+            (None, _) => true, // a broken frozen manifest cannot be compared; the fix may repair it
+            (Some(_), None) => return Some("the manifest is no longer valid TOML".into()),
+        },
+        "setup.cfg" => setup_cfg_without_dependencies(&old) == setup_cfg_without_dependencies(&new),
+        _ => true,
+    };
+    (!same).then(|| "only the dependency fields of a root manifest may change".into())
+}
+
+fn pyproject_without_dependencies(text: &str) -> Option<toml::Value> {
+    let mut doc: toml::Value = text.parse().ok()?;
+    let table = doc.as_table_mut()?;
+    table.remove("dependency-groups");
+    if let Some(project) = table.get_mut("project").and_then(toml::Value::as_table_mut) {
+        project.remove("dependencies");
+        project.remove("optional-dependencies");
+    }
+    let poetry = table.get_mut("tool").and_then(|t| t.get_mut("poetry")).and_then(toml::Value::as_table_mut);
+    if let Some(poetry) = poetry {
+        poetry.remove("dependencies");
+        poetry.remove("dev-dependencies");
+        if let Some(groups) = poetry.get_mut("group").and_then(toml::Value::as_table_mut) {
+            for group in groups.iter_mut().filter_map(|(_, g)| g.as_table_mut()) {
+                group.remove("dependencies");
+            }
+        }
+    }
+    Some(doc)
+}
+
+/// `setup.cfg` as (section, line) pairs without `[options] install_requires` (with its
+/// indented continuation lines) and `[options.extras_require]`.
+fn setup_cfg_without_dependencies(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut section = String::new();
+    let mut skipping = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line.trim_matches(|c| c == '[' || c == ']').trim().to_string();
+            skipping = false;
+            if section != "options.extras_require" {
+                out.push((section.clone(), String::new()));
+            }
+            continue;
+        }
+        if !raw.starts_with([' ', '\t']) {
+            let key = line.split(['=', ':']).next().unwrap_or("").trim();
+            skipping = section == "options" && key == "install_requires";
+        }
+        if !skipping && section != "options.extras_require" {
+            out.push((section.clone(), line.to_string()));
+        }
+    }
+    out
+}
+
+/// `src/<name>.<ext>` for an importable extension, or `src/<name>/__init__.<ext>`.
+fn adds_top_level_module(path: &str) -> bool {
+    const IMPORTABLE: [&str; 5] = [".py", ".pyc", ".pyd", ".so", ".pyw"];
+    let Some(rest) = path.strip_prefix("src/") else { return false };
+    let parts: Vec<&str> = rest.split('/').collect();
+    match parts.as_slice() {
+        [file] => IMPORTABLE.iter().any(|ext| file.ends_with(ext)),
+        [_, init] => init.starts_with("__init__.") && IMPORTABLE.iter().any(|ext| init.ends_with(ext)),
+        _ => false,
     }
 }
 
@@ -1946,7 +2054,10 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
 
     #[test]
     fn fix_lock_freezes_test_package_initializers_helpers_and_data() {
-        let frozen = HashMap::from([(FILE, "from tests.helpers import expected\n")]);
+        let frozen = HashMap::from([
+            (FILE, "from tests.helpers import expected\n"),
+            ("pyproject.toml", "[tool.setuptools]\npackages = [\"textkit\"]\n"),
+        ]);
         let read = reader(&frozen);
         let check = |path: &str, status: &str| {
             let changes =
@@ -1962,15 +2073,127 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             ("tests/data/golden.txt", "M"),
         ] {
             let err = check(path, status).unwrap_err();
-            assert!(err.contains("test infrastructure in tests"), "{path}: {err}");
+            assert!(err.contains("frozen with the regression"), "{path}: {err}");
         }
-        assert!(check("tests/test_other.py", "M").is_ok(), "other tests may be corrected");
+        assert!(check("tests/test_other.py", "M").is_err(), "every test module is frozen");
         assert!(check("textkit/__init__.py", "M").is_ok(), "production package initializers may change");
         assert_eq!(test_tree("src/pkg/tests/unit/test_x.py"), "src/pkg/tests");
         assert_eq!(test_tree("pkg/test_x.py"), "pkg");
         assert_eq!(test_tree("test_x.py"), "");
-        assert!(locked_by_test_tree("__init__.py", "") && !locked_by_test_tree("calc.py", ""));
-        assert!(!locked_by_test_tree("tests_extra/helpers.py", "tests"));
+    }
+
+    /// The lock is an allowlist: a fix may change declared production code and the dependency
+    /// fields of the root manifests, nothing else. Frozen tests, helpers and fixtures take
+    /// precedence even under `src/` or a declared package; a manifest-named fixture is a
+    /// fixture. Additions, deletions and renames (a deletion plus an addition) are all checked.
+    #[test]
+    fn fix_may_change_only_declared_production_code() {
+        let pyproject = "[project]\nname = \"calc\"\ndependencies = [\"attrs\"]\n[tool.setuptools]\npackages = [\"calc\", \"textkit\"]\n[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n[project.entry-points.pytest11]\n";
+        let setup_cfg = "[metadata]\nname = calc\n[options]\npackages = calc\ninstall_requires =\n    attrs>=21\n    six==1.16\n[options.extras_require]\ntest = pytest\n[tool:pytest]\ntestpaths = tests\n";
+        let checkpoint = HashMap::from([
+            (FILE, "from calc import add\n"),
+            ("pyproject.toml", pyproject),
+            ("setup.cfg", setup_cfg),
+            ("requirements.txt", "attrs\n"),
+            ("calc/__init__.py", ""),
+            ("calc/core.py", "x = 1\n"),
+            ("src/app/__init__.py", ""),
+            ("src/app/a.py", "x = 1\n"),
+            ("src/app/data.json", "{}\n"),
+            ("src/app/tests/fixtures/input.json", "{}\n"),
+            ("calc/fixtures/table.csv", "1\n"),
+            ("fixtures/pyproject.toml", "[project]\nname = \"fixture\"\n"),
+            ("fixtures/input.json", "{}\n"),
+            ("README.md", "readme\n"),
+        ]);
+        let read_checkpoint = reader(&checkpoint);
+        let check_with = |changes: &[(&str, &str)], now: &HashMap<&str, &str>, record: &ReproRecord| {
+            let mut all = vec![("M".to_string(), "calc/core.py".to_string())];
+            all.extend(changes.iter().map(|(s, p)| (s.to_string(), p.to_string())));
+            check_fix_changes_with(&all, record, &read_checkpoint, &reader(now))
+        };
+        let check = |changes: &[(&str, &str)]| check_with(changes, &checkpoint, &rec());
+
+        // Production code: modify, add inside a package, delete, rename.
+        for changes in [
+            vec![("M", "src/app/a.py")],
+            vec![("A", "src/app/new.py")],
+            vec![("D", "src/app/a.py")],
+            vec![("D", "src/app/a.py"), ("A", "src/app/b.py")],
+            vec![("M", "src/app/data.json")],
+            vec![("A", "calc/util.py")],
+        ] {
+            assert!(check(&changes).is_ok(), "{changes:?}");
+        }
+        // Everything else, in every form.
+        for changes in [
+            vec![("M", "README.md")],
+            vec![("A", "docs/guide.md")],
+            vec![("M", "tests/test_other.py")],
+            vec![("A", "tests/test_new.py")],
+            vec![("M", "src/app/tests/fixtures/input.json")],
+            vec![("D", "src/app/tests/fixtures/input.json")],
+            vec![("D", "src/app/tests/fixtures/input.json"), ("A", "src/app/tests/fixtures/moved.json")],
+            vec![("A", "src/app/tests/fixtures/extra.json")],
+            vec![("M", "calc/fixtures/table.csv")],
+            vec![("M", "fixtures/pyproject.toml")],
+            vec![("D", "fixtures/pyproject.toml")],
+            vec![("D", "fixtures/pyproject.toml"), ("A", "fixtures/renamed.toml")],
+            vec![("A", "fixtures/setup.cfg")],
+            vec![("A", "fixtures/requirements.txt")],
+            vec![("M", "fixtures/input.json")],
+            vec![("M", "support/helpers.py")],
+            vec![("M", "tox.ini")],
+            vec![("M", "lyra.toml")],
+            vec![("A", "src/pytest.py")],
+            vec![("A", "src/_pytest/__init__.py")],
+            vec![("A", "src/json.cpython-314-darwin.so")],
+            vec![("A", "requirements-extra.txt")],
+            vec![("D", "requirements.txt")],
+            vec![("D", "pyproject.toml")],
+        ] {
+            let err = check(&changes).expect_err(&format!("{changes:?}"));
+            let last = changes.last().unwrap().1;
+            assert!(err.contains(last), "{changes:?}: {err}");
+        }
+        // A frozen input takes precedence over the production allowlist, even under src/.
+        let mut record = rec();
+        record.frozen_inputs = vec!["src/app/data.json".into()];
+        let mut edited = checkpoint.clone();
+        edited.insert("src/app/data.json", "{\"benign\": true}\n");
+        let err = check_with(&[("M", "src/app/data.json")], &edited, &record).unwrap_err();
+        assert!(err.contains("src/app/data.json") && err.contains("locked"), "{err}");
+
+        // Root manifests: dependency fields only.
+        let manifest = |path: &'static str, text: String| {
+            let mut now = checkpoint.clone();
+            now.insert(path, Box::leak(text.into_boxed_str()));
+            check_with(&[("M", path)], &now, &rec())
+        };
+        assert!(manifest("pyproject.toml", pyproject.replace("[\"attrs\"]", "[\"attrs>=23\", \"six\"]")).is_ok());
+        assert!(manifest(
+            "pyproject.toml",
+            format!("{pyproject}[project.optional-dependencies]\nfast = [\"ujson\"]\n[dependency-groups]\ndev = [\"ruff\"]\n")
+        )
+        .is_ok());
+        for broken in [
+            pyproject.replace("name = \"calc\"", "name = \"other\""),
+            pyproject.replace("testpaths = [\"tests\"]", "testpaths = [\"src\"]"),
+            pyproject.replace("[\"calc\", \"textkit\"]", "[\"calc\"]"),
+            format!("{pyproject}hide = \"calc.plugin\"\n"),
+            "[project\n".to_string(),
+        ] {
+            assert!(manifest("pyproject.toml", broken.clone()).is_err(), "{broken}");
+        }
+        assert!(manifest("setup.cfg", setup_cfg.replace("    six==1.16\n", "    six==1.17\n    idna>=3\n")).is_ok());
+        assert!(manifest("setup.cfg", setup_cfg.replace("test = pytest", "test = pytest\nfast = ujson")).is_ok());
+        for broken in [
+            setup_cfg.replace("packages = calc", "packages = other"),
+            setup_cfg.replace("testpaths = tests", "testpaths = src"),
+        ] {
+            assert!(manifest("setup.cfg", broken.clone()).is_err(), "{broken}");
+        }
+        assert!(manifest("requirements.txt", "attrs>=23\nsix\n".into()).is_ok());
     }
 
     #[test]
@@ -2251,7 +2474,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             let read_now = |p: &str| std::fs::read_to_string(root.join(p)).ok();
             let err =
                 check_fix_changes_with(&[("M".into(), path.into())], &rec(), &read_checkpoint, &read_now).unwrap_err();
-            assert!(err.contains(path) && err.contains("locked"), "{err}");
+            assert!(err.contains(path) && err.contains("test lock"), "{err}");
             std::fs::write(root.join(path), original).unwrap();
         }
     }
@@ -2420,9 +2643,9 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         };
         for path in ["tests/test_helpers.py", "tests/test_base.py", "tests/test_shared.py"] {
             let err = check(path).unwrap_err();
-            assert!(err.contains("imported by the frozen regression"), "{path}: {err}");
+            assert!(err.contains("frozen with the regression"), "{path}: {err}");
         }
-        assert!(check("tests/test_other.py").is_ok(), "tests the regression does not import stay editable");
+        assert!(check("tests/test_other.py").is_err(), "every test module is frozen, imported or not");
 
         // pytest's default import mode puts the first directory without __init__.py on sys.path,
         // so a bare `import test_helpers` from tests/ resolves to tests/test_helpers.py.
@@ -2612,7 +2835,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             vec![("M".to_string(), "calc.py".to_string()), ("M".to_string(), "tests/test_helpers.py".to_string())];
         assert!(check_fix_changes_with(&changes, &rec(), &read, &read)
             .unwrap_err()
-            .contains("imported by the frozen regression"));
+            .contains("frozen with the regression"));
 
         // Past the limit the guard reports that it cannot establish the inputs, never a silent pass.
         let many: String = (0..2001).map(|i| format!("import tests.test_h{i}\n")).collect();
@@ -2669,29 +2892,12 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         // With nothing declared, production and support cannot be told apart: a visible error
         // naming the files and the remedy, never a silent choice.
         let err = parse_loaded_modules(report, FILE, &ProductionCode::default()).unwrap_err();
-        for expected in [
-            "`calc.py`",
-            "`support/helpers.py`",
-            "`helpers.py`",
-            "`fixtures/input.json`",
-            "`data/golden.bin`",
-            "declares no packages",
-            "lyra.toml",
-        ] {
+        for expected in ["`calc.py`", "`support/helpers.py`", "`helpers.py`", "declares no packages", "lyra.toml"] {
             assert!(err.contains(expected), "{expected}: {err}");
         }
         assert!(
-            !err.contains("`src/other/x.py`") && !err.contains("`tests/"),
-            "src/ and the test tree never need a declaration: {err}"
-        );
-        assert_eq!(
-            support_trees(
-                &["support/helpers.py".into(), "fixtures/a.json".into(), "helpers.py".into(), "tests/data.json".into()],
-                "tests"
-            )
-            .into_iter()
-            .collect::<Vec<_>>(),
-            ["fixtures", "support"]
+            !err.contains("`src/other/x.py`") && !err.contains("`tests/") && !err.contains("`fixtures/input.json`"),
+            "src/, the test tree and data never need a declaration (data outside src/ is frozen either way): {err}"
         );
         // The recorder wraps the same flags and node id; classification ignores its report.
         let spec = PythonPytest.regression_command(&rec(), Path::new("/w")).unwrap();
@@ -2754,7 +2960,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             let read_now = |p: &str| std::fs::read_to_string(root.join(p)).ok();
             let err =
                 check_fix_changes_with(&[("M".into(), path.into())], &record, &read_checkpoint, &read_now).unwrap_err();
-            assert!(err.contains(path) && err.contains("locked"), "{err}");
+            assert!(err.contains(path) && err.contains("test lock"), "{err}");
             write(path, &frozen[path]);
         }
     }
@@ -2842,11 +3048,9 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         );
         let changes = |path: &str| vec![("M".to_string(), "calc.py".to_string()), ("M".to_string(), path.to_string())];
         let err = check_fix_changes_with(&changes("support/helpers.py"), &rec(), &read, &read).unwrap_err();
-        assert!(err.contains("support/helpers.py") && err.contains("locked"), "{err}");
-        assert!(
-            check_fix_changes_with(&changes("tools/release.py"), &rec(), &read, &read).is_ok(),
-            "unrelated code stays editable"
-        );
+        assert!(err.contains("support/helpers.py") && err.contains("test lock"), "{err}");
+        let err = check_fix_changes_with(&changes("tools/release.py"), &rec(), &read, &read).unwrap_err();
+        assert!(err.contains("not declared production code"), "undeclared code is frozen too: {err}");
 
         // Recorder layer: what the run loaded is frozen, and its whole tree with it, so nothing
         // can be added or changed next to the frozen helper even when the static layer sees no import.
@@ -2868,9 +3072,9 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         ] {
             let changes = vec![("M".to_string(), "calc.py".to_string()), (status.to_string(), path.to_string())];
             let err = check_fix_changes_with(&changes, &record, &read, &read).unwrap_err();
-            assert!(err.contains(path) && err.contains("locked"), "{status} {path}: {err}");
+            assert!(err.contains(path) && err.contains("test lock"), "{status} {path}: {err}");
         }
-        assert!(check_fix_changes_with(&changes("tools/release.py"), &record, &read, &read).is_ok());
+        assert!(check_fix_changes_with(&[("M".to_string(), "calc.py".to_string())], &record, &read, &read).is_ok());
 
         // Without a declaration the fix is rejected visibly instead of guessing which is which.
         let undeclared: HashMap<&str, &str> =
@@ -2950,13 +3154,13 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         with_recorder.frozen_inputs = loaded;
         for record in [&with_recorder, &rec()] {
             let err = check_fix_changes_with(&change, record, &read_checkpoint, &read_now).unwrap_err();
-            assert!(err.contains("support/helpers.py") && err.contains("locked"), "{err}");
+            assert!(err.contains("support/helpers.py") && err.contains("test lock"), "{err}");
         }
         write("support/helpers.py", &frozen["support/helpers.py"]);
         write("support/shadow.py", "EXPECTED = -1\n");
         let added = vec![("M".to_string(), "calc.py".to_string()), ("A".to_string(), "support/shadow.py".to_string())];
         let err = check_fix_changes_with(&added, &with_recorder, &read_checkpoint, &read_now).unwrap_err();
-        assert!(err.contains("support/shadow.py") && err.contains("test support in support/"), "{err}");
+        assert!(err.contains("support/shadow.py") && err.contains("not declared production code"), "{err}");
     }
 
     /// End to end with real pytest, the reviewer's fixture-only bypass: the regression reads a
@@ -2998,10 +3202,12 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             "every read input is frozen, production `calc` is not: {out}"
         );
 
-        // Without a declaration of the production code, the reads cannot be classified: S2 stops.
+        // Without a declaration of the production code, the module `calc.py` cannot be
+        // classified: S2 stops. Data outside `src/` is frozen either way and needs no declaration.
         std::fs::remove_file(root.join("pyproject.toml")).unwrap();
         let err = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap_err();
-        assert!(err.contains("`fixtures/input.json`") && err.contains("declares no packages"), "{err}");
+        assert!(err.contains("`calc.py`") && err.contains("declares no packages"), "{err}");
+        assert!(!err.contains("`fixtures/input.json`"), "{err}");
         write("pyproject.toml", PYPROJECT);
 
         let frozen: HashMap<String, String> =
@@ -3027,14 +3233,14 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
             );
             let change = vec![("M".to_string(), path.to_string())];
             let err = check_fix_changes_with(&change, &record, &read_checkpoint, &read_now).unwrap_err();
-            assert!(err.contains(path) && err.contains("locked"), "{path}: {err}");
+            assert!(err.contains(path) && err.contains("test lock"), "{path}: {err}");
             write(path, &frozen[path]);
         }
         // Nothing can be added next to a frozen input either, and the real fix is accepted.
         write("fixtures/other.json", "{}\n");
         let added = vec![("A".to_string(), "fixtures/other.json".to_string())];
         let err = check_fix_changes_with(&added, &record, &read_checkpoint, &read_now).unwrap_err();
-        assert!(err.contains("test support in fixtures/"), "{err}");
+        assert!(err.contains("frozen with the regression"), "{err}");
         std::fs::remove_file(root.join("fixtures/other.json")).unwrap();
         write("calc.py", &frozen["calc.py"].replace("a - b", "a + b"));
         let fix = vec![("M".to_string(), "calc.py".to_string())];
@@ -3098,7 +3304,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "the attack works without the lock: {out}");
         let change = vec![("M".to_string(), "fixtures/input.json".to_string())];
         let err = check_fix_changes_with(&change, &record, &read_checkpoint, &read_now).unwrap_err();
-        assert!(err.contains("fixtures/input.json") && err.contains("locked"), "{err}");
+        assert!(err.contains("fixtures/input.json") && err.contains("test lock"), "{err}");
         write("fixtures/input.json", &frozen["fixtures/input.json"]);
 
         // A child process reads the fixture: the parent cannot see that read, so S2 stops.
@@ -3120,6 +3326,102 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
         let err = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap_err();
         assert!(err.contains("`os.system cat fixtures/input.json > /dev/null`"), "{err}");
+    }
+
+    /// End to end with real pytest, the reviewer's two cases for the allowlist lock: a fixture
+    /// inside `src/` (under a package's own `tests/fixtures/`) and a pre-existing
+    /// `fixtures/pyproject.toml` the regression reads as data. Changing either makes the
+    /// unchanged failing test pass; the lock rejects modification, deletion, a rename (a
+    /// deletion plus an addition) and an addition next to them, whether or not the recorder saw
+    /// the read; the real fix in the declared package is accepted.
+    #[tokio::test]
+    #[ignore = "needs a provisioned python3 with pytest on PATH"]
+    async fn fixtures_inside_src_and_manifest_named_fixtures_are_frozen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("pytest.ini", "[pytest]\n");
+        write("pyproject.toml", "[project]\nname = \"published-calc\"\n[tool.setuptools]\npackages = [\"calc\"]\n");
+        write("src/calc/__init__.py", "def add(a, b):\n    return a - b\n");
+        write("src/calc/tests/fixtures/input.json", "[1, 2]\n");
+        write("fixtures/pyproject.toml", "[project]\nversion = \"3\"\n");
+        write(
+            FILE,
+            "import json, pathlib, tomllib\nfrom calc import add\n\ndef test_issue_7_fails():\n    a, b = json.loads(pathlib.Path(\"src/calc/tests/fixtures/input.json\").read_text())\n    expected = int(tomllib.loads(pathlib.Path(\"fixtures/pyproject.toml\").read_text())[\"project\"][\"version\"])\n    assert add(a, b) == expected, \"sum must be three\"\n",
+        );
+        let timeout = Duration::from_secs(120);
+        let cancel = CancellationToken::new();
+        let spec = PythonPytest.reproduction_environment(PythonPytest.regression_command(&rec(), root).unwrap(), root);
+        let run = proc::run(&spec, timeout, &cancel).await.unwrap();
+        let out = run.combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Failed, "{out}");
+        let loaded = PythonPytest.loaded_test_inputs(&out, &rec(), root).unwrap();
+        assert_eq!(
+            loaded,
+            ["fixtures/pyproject.toml", "src/calc/tests/fixtures/input.json"],
+            "a manifest-named fixture is data, and test fixtures inside src/ are not production: {out}"
+        );
+
+        let paths =
+            ["pyproject.toml", "src/calc/__init__.py", "src/calc/tests/fixtures/input.json", "fixtures/pyproject.toml"];
+        let frozen: HashMap<String, String> = std::iter::once(FILE)
+            .chain(paths)
+            .map(|p| (p.to_string(), std::fs::read_to_string(root.join(p)).unwrap()))
+            .collect();
+        let read_checkpoint = |p: &str| frozen.get(p).cloned();
+        let read_now = |p: &str| std::fs::read_to_string(root.join(p)).ok();
+        let with_recorder = ReproRecord { frozen_inputs: loaded, ..rec() };
+        for (path, benign) in [
+            ("src/calc/tests/fixtures/input.json", "[4, 1]\n"),
+            ("fixtures/pyproject.toml", "[project]\nversion = \"-1\"\n"),
+        ] {
+            write(path, benign);
+            let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+            assert_eq!(
+                classify_pytest(&out, ID_),
+                RegressionOutcome::Passed,
+                "{path}: the attack works without the lock: {out}"
+            );
+            let modified = vec![("M".to_string(), path.to_string())];
+            // Rejected through the frozen inputs and, independently, through the allowlist alone.
+            for record in [&with_recorder, &rec()] {
+                let err = check_fix_changes_with(&modified, record, &read_checkpoint, &read_now).unwrap_err();
+                assert!(err.contains(path), "{path}: {err}");
+            }
+            write(path, &frozen[path]);
+
+            // Deletion, rename (deletion plus addition) and addition next to it.
+            std::fs::remove_file(root.join(path)).unwrap();
+            let renamed = format!("{path}.moved");
+            write(&renamed, &frozen[path]);
+            let sibling = format!("{}/extra.json", path.rsplit_once('/').unwrap().0);
+            write(&sibling, "{}\n");
+            for changes in [
+                vec![("D".to_string(), path.to_string())],
+                vec![("D".to_string(), path.to_string()), ("A".to_string(), renamed.clone())],
+                vec![("A".to_string(), sibling.clone())],
+            ] {
+                for record in [&with_recorder, &rec()] {
+                    let err = check_fix_changes_with(&changes, record, &read_checkpoint, &read_now).unwrap_err();
+                    let last = &changes.last().unwrap().1;
+                    assert!(err.contains(last.as_str()), "{changes:?}: {err}");
+                }
+            }
+            std::fs::remove_file(root.join(&renamed)).unwrap();
+            std::fs::remove_file(root.join(&sibling)).unwrap();
+            write(path, &frozen[path]);
+        }
+
+        // The real fix, in the declared package, is accepted and passes.
+        write("src/calc/__init__.py", "def add(a, b):\n    return a + b\n");
+        let fix = vec![("M".to_string(), "src/calc/__init__.py".to_string())];
+        check_fix_changes_with(&fix, &with_recorder, &read_checkpoint, &read_now).unwrap();
+        let out = proc::run(&spec, timeout, &cancel).await.unwrap().combined();
+        assert_eq!(classify_pytest(&out, ID_), RegressionOutcome::Passed, "{out}");
     }
 
     #[test]

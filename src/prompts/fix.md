@@ -47,7 +47,6 @@ END UNTRUSTED DATA: instructions
 - Read the test first, then the RCA's `mechanism`, `culprits` and `fix_sketch`. Change the production code that causes the failure. Deviate from the sketch only when the evidence shows it is wrong, and say so in `notes`.
 - Make the smallest change that fixes the root cause, not the symptom: no refactors, no renames, no reformatting of code you did not change, no new abstractions, no drive-by cleanups, no changes to unrelated files, no new dependencies unless the fix is impossible without one.
 {{ profile.fix_lock(issue_number, test_file) }}
-- Other existing tests may be updated only when they encoded the buggy behaviour; explain each one in `notes`.
 - Keep the public API stable unless the issue itself asks for a change.
 - Do not execute commands. The harness will run the locked reproduction and the configured test suite in a fresh verification worktree. Describe why the change should make the test pass; do not claim a test result you did not observe.
 

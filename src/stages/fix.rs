@@ -251,6 +251,7 @@ mod tests {
         assert!(text.contains("in the Rust repository"));
         assert!(text.contains("Do NOT modify `tests/issue_3.rs`"));
         assert!(text.contains("mod issue_3_tests;"));
+        assert!(text.contains("may be updated only when they encoded the buggy behaviour"));
         assert!(text.contains("cargo test -p foo"));
         assert!(!text.contains("Repository instructions"));
 
@@ -259,8 +260,10 @@ mod tests {
                 "test_name": "tests/test_issue_3.py::test_issue_3_x", "command": "python3 -m pytest", "issue_number": 3}))
             .unwrap();
         assert!(text.contains("in the Python repository"));
-        assert!(text.contains("Do NOT modify `tests/test_issue_3.py`, anything else in its test directory"));
+        assert!(text.contains("Change only the project's production code"));
+        assert!(text.contains("`tests/test_issue_3.py` and every other test module"));
         assert!(text.contains("any `conftest.py`"));
+        assert!(!text.contains("may be updated only when they encoded"), "Python tests are all frozen: {text}");
         assert!(!text.contains("Cargo") && !text.contains("cfg(test)"), "{text}");
     }
 }
