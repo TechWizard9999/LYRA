@@ -1,6 +1,6 @@
 # .agents/
 
-Single home for everything humans and coding agents (Claude Code, Codex) need to work on LYRA the same way. Nothing agent-specific lives anywhere else in the tree.
+Canonical contributor rules and playbooks live here alongside the root `AGENTS.md` entry point. Tool-specific entry points and generated copies refer to those sources.
 
 ```
 AGENTS.md              canonical entry: purpose, architecture map, rules, definition of done
@@ -64,7 +64,7 @@ PowerShell (three separate commands; `|` would be a pipeline there):
 
 ## Adding a rule or decision
 
-- Rules go in `rules/` (small, specific, verifiable). If a rule is one of the ten that matter most, it also belongs in `AGENTS.md` and `CLAUDE.md`.
+- Rules go in `rules/` (small, specific, verifiable). Put repository-wide rules in the canonical `AGENTS.md`; keep tool-specific entry points as pointers to it.
 - Design choices that someone might re-argue go in `decisions/NNNN-title.md`.
 
 ## Not in this folder

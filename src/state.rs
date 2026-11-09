@@ -15,9 +15,9 @@ pub type RunId = String;
 pub struct RunRequest {
     /// Local path of an already-cloned repository.
     pub repo: PathBuf,
-    /// Issue URL, `#123`, or `123`. If `issue_text` is set this is only a label.
+    /// Issue URL, `#123`, or `123`; a valid reference is required even with `issue_text`.
     pub issue: String,
-    /// Pasted issue text for offline runs (skips `gh issue view`).
+    /// Pasted issue text skips the issue fetch but does not make later stages offline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue_text: Option<String>,
     /// Provider id from config (`claude` | `codex`). None = config default.
