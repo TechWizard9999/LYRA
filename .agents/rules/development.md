@@ -19,7 +19,7 @@ Complements the numbered rules in `AGENTS.md`; it does not repeat them.
 | Subprocesses | `proc::CommandSpec` + `run_blocking` / the async runner; never `std::process::Command` directly, so the hang guard, cancellation, and env scrubbing apply |
 | Git | `git.rs` helpers; they disable hooks and fsmonitor |
 | GitHub | `github.rs` (`gh`) |
-| Config | `config.rs`; per-repo `lyra.toml` may override `[verify]` only |
+| Config | `config.rs`; per-repo `lyra.toml` supports scoped verify overrides and Python package declarations (see README Configuration) |
 
 ## Errors
 

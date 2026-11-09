@@ -9,7 +9,7 @@ If Windows execution policy blocks the script, run `powershell -ExecutionPolicy 
 | Tool | Why | Install / check |
 |---|---|---|
 | Rust stable | builds LYRA; the built-in `rust-cargo` profile also runs `cargo`/`rustfmt` on the target repo | [rustup](https://rustup.rs), then `rustup default stable` |
-| Python 3 with pytest (Python repositories only) | the `python-pytest` profile runs `python3 -m pytest` on the target repo | a virtual environment with the project's dependencies and pytest, activated before starting LYRA (`python3 -m venv .venv && . .venv/bin/activate && pip install -e . pytest`) |
+| Python 3 with pytest (Python repositories only) | the `python-pytest` profile runs pytest on the target repo | a virtual environment with pytest and the project's dependencies, activated before starting LYRA; see below |
 | A linker (Windows) | Rust needs one | either the GNU toolchain: `rustup toolchain install stable-x86_64-pc-windows-gnu` + `rustup default stable-x86_64-pc-windows-gnu` with [WinLibs](https://winlibs.com) gcc (MinGW-w64) on `PATH`; or the MSVC toolchain with **Visual Studio Build Tools** ("Desktop development with C++") |
 | git | worktrees, branches, checkpoints | `git --version` |
 | GitHub CLI | reads issues, pushes, opens draft PRs | [cli.github.com](https://cli.github.com), then `gh auth login` and `gh auth status` |
@@ -22,6 +22,24 @@ At least one runtime:
   - `auth = "login"`: run `claude` once and log in. LYRA preserves that login while using restricted/safe mode, disabling hooks and MCP servers, and ignoring user/project customization. Agents get file tools; the harness runs build and test commands.
 - **Codex CLI**: `npm i -g @openai/codex`, then `codex login`, or set `CODEX_API_KEY`. Select it with `[run] provider = "codex"` or per run in the dashboard.
 
+### Python targets
+
+From the target checkout, create and activate a virtual environment. Install pytest and the project's dependencies into that environment, following the project's setup instructions. Start `lyra serve` or `lyra run` from the activated shell.
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install pytest
+```
+
+On Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install pytest
+```
+
 ## Build
 
 ```sh
@@ -32,7 +50,7 @@ The binary is `target/release/lyra` (`target\release\lyra.exe` on Windows). Put 
 
 ## Configure
 
-LYRA reads `~/.lyra/config.toml`. Set `LYRA_HOME` to use another directory (config and runs both move). The file is created with defaults the first time you run any `lyra` command (or by the setup script); `lyra config` prints the effective configuration. The keys are described in [README.md](README.md#configuration). A repository may contain a `lyra.toml` with a `[verify]` table to override the build / test / fmt commands.
+LYRA reads `~/.lyra/config.toml`. Set `LYRA_HOME` to use another directory (config and runs both move). The file is created with defaults the first time you run any `lyra` command (or by the setup script); `lyra config` prints the effective configuration. A repository may set profile-specific verify commands and Python package names in `lyra.toml`; the top-level `[verify]` applies to Cargo only. See [configuration](README.md#configuration) for scope and precedence.
 
 ## Check
 
@@ -44,9 +62,9 @@ It checks that the selected runtime is on `PATH` and has a local login or a none
 
 ## First run
 
-1. Clone the repository you want to fix and make sure it builds: `git clone https://github.com/owner/repo && cd repo && cargo build`. LYRA never clones; it works in its own git worktree of that clone, on a new branch `lyra/issue-<n>-<run-id>`, so your checkout is left alone. The repository must match a built-in execution profile: a `Cargo.toml` at the repository root (`rust-cargo`), or pytest evidence at the root such as `pytest.ini` or a `[tool.pytest.ini_options]` table in `pyproject.toml` (`python-pytest`). For a Python repository, activate its environment (with pytest and the project's dependencies installed) in the shell you start LYRA from. Otherwise Intake fails with a message naming what was looked for and the supported profile ids (see Troubleshooting).
+1. Use an already-cloned repository and prepare its build and test tools according to its instructions. LYRA never clones; it works in its own git worktree of that clone, on a new branch `lyra/issue-<n>-<run-id>`, so your checkout is left alone. The repository must match a [built-in execution profile](README.md#execution-profiles). For a Python repository, activate its environment in the shell you start LYRA from. If no profile matches, Intake reports what it looked for and the supported profile ids (see Troubleshooting).
 2. Start the dashboard: `lyra serve`. It prints the URL (`http://127.0.0.1:7700` by default) and opens the browser (`[server] open_browser = false` turns that off).
-3. Fill in the repository path and the issue (URL, `#123` or `123`; or paste the issue text to run without GitHub access), pick the runtime, tick the policy box if you read the repository's contribution / AI policy, press **Run**.
+3. Fill in the repository path and a valid issue reference (URL, `#123` or `123`), pick the runtime, tick the policy box if you read the repository's contribution / AI policy, press **Run**. You may also paste the issue text; this skips fetching the issue only, and later stages can still need network and GitHub access.
 4. Watch the run page: each stage turns blue while running and green when done; the live log shows the agent's tool calls (`[Read] src/x.rs`), text and file edits. Artifact links appear as files are written; you can open them, including any `policy.md` excerpts, while the run continues.
 5. Outcome: either **Open PR** (a draft PR whose head is the verified commit), or a stopped / failed stage with the message, a details link and **Retry from <stage>** buttons. If the PR stage stops because a contribution policy was not acknowledged, read the full applicable rules in `10-context/instructions.md` alongside intake's `policy.md` excerpts, tick the run page's acknowledgment checkbox and press **Retry from S6 Draft PR**. Acknowledgment does not override the repository's rules.
 
@@ -65,7 +83,7 @@ Use one writer process per `LYRA_HOME`: stop the dashboard before running CLI `r
 - **`link.exe` not found** (Windows, MSVC toolchain without Build Tools): install Visual Studio Build Tools, or switch to the GNU toolchain (`rustup default stable-x86_64-pc-windows-gnu`) with WinLibs gcc on `PATH`.
 - **Linker errors only from Git Bash** (Windows): Git Bash puts its own `link` (coreutils) ahead of the real linker on `PATH`. Run `cargo` from PowerShell or cmd.
 - **"no built-in execution profile matches this repository"**: Intake found neither a `Cargo.toml` nor pytest evidence at the root of the Git repository. Both built-in profiles are detected at the repository root only: LYRA always creates its worktree for the whole repository, so pointing `--repo` at a subdirectory does not help, and a project that lives only in a subdirectory (for example `tools/app/Cargo.toml`) is not supported yet. A Python repository needs pytest evidence: Python files or `setup.py` alone do not choose a test runner. Project-directory support and other languages arrive as new profiles ([docs/PLAN.md](docs/PLAN.md) §13). This is not a check of the repository's language, only of the profiles this binary provides.
-- **"the python-pytest profile needs python3 on PATH"** or **"pytest is not installed"**: start LYRA from a shell where the project's virtual environment is active, check `python3 -m pytest --version`, and retry from Intake (or Repro).
+- **"the python-pytest profile needs python3 on PATH"** or **"pytest is not installed"**: activate the project's virtual environment, check `python3 -m pytest --version` (Windows: `python -m pytest --version`), then start LYRA from that shell and retry from Intake (or Repro). If the dashboard is already running, restart it from the activated shell first.
 - **`gh` not authenticated**: intake fails with the `gh` message. Run `gh auth login`, check `gh auth status`, and make sure the account can read the issue and push to the repo or a fork. With no push rights the PR stage stops and shows the `gh repo fork` command to run.
 - **`claude` / `codex` not found on Windows**: npm installs `.cmd` shims (`claude.cmd`, `codex.cmd`). LYRA resolves them through `PATH`; check `where claude`. If they are elsewhere, set `bin = "C:\\path\\to\\claude.cmd"` in the provider table.
 - **Auth errors from the runtime**: `auth = "api_key"` needs `ANTHROPIC_API_KEY` in the environment `lyra serve` was started from; `auth = "login"` needs a prior `claude` login. For Codex use `codex login` or `CODEX_API_KEY`.
@@ -75,7 +93,7 @@ Use one writer process per `LYRA_HOME`: stop the dashboard before running CLI `r
 - **Port 7700 in use**: change `[server] bind` to another loopback address and port, for example `127.0.0.1:7701`. The dashboard refuses LAN/wildcard binds such as `0.0.0.0:7700`.
 - **API request returns 403**: use the loopback dashboard URL and send its origin (for example `Origin: http://127.0.0.1:7700`) on POST requests. When bound to port 80, `http://127.0.0.1` and `http://127.0.0.1:80` are equivalent; a different hostname, scheme or port is rejected. Cross-site browser requests and unexpected Host headers are rejected.
 
-Verification selects a temporary workspace outside inherited ancestor Cargo configuration and deletes its checkout, Cargo home and target directory afterward, including after cancellation. If none is writable, choose a writable `LYRA_HOME` outside those ancestors. A missing Cargo.lock is generated before the verification baseline and protected afterward. Fresh verification does not import global caches, registry mirrors or credentials; offline/vendor or mirror support requires a self-contained repository configuration. Discovery and actual verification can compile dependencies separately, so large workspaces may need a longer per-command hang guard.
+For Cargo repositories, verification selects a temporary workspace outside inherited ancestor Cargo configuration and deletes its checkout, Cargo home and target directory afterward, including after cancellation. If none is writable, choose a writable `LYRA_HOME` outside those ancestors. A missing Cargo.lock is generated before the verification baseline and protected afterward. Fresh verification does not import global caches, registry mirrors or credentials; offline/vendor or mirror support requires a self-contained repository configuration. Discovery and actual verification can compile dependencies separately, so large workspaces may need a longer per-command hang guard.
 
 Codex command tools are disabled in every stage. Editing uses complete candidate/culprit/test files and ancestor manifests, plus a bounded fallback overview, with apply_patch; other omitted files may still limit what the model can fix. Artifact downloads reject symlink/reparse traversal and hard links, but LYRA remains a local executor rather than OS isolation for hostile code.
 Provider transcripts retain up to 8 MiB of raw evidence per attempt; the dashboard/log warns when later raw output is omitted, while structured result parsing continues. Transcript write errors and unreadable contribution policies fail visibly; correct the filesystem or policy access before retrying.

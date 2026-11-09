@@ -23,7 +23,7 @@ enum Cmd {
         /// Issue URL, `#123` or `123`.
         #[arg(long)]
         issue: String,
-        /// Read the issue text from a file instead of GitHub (offline runs).
+        /// Read issue text from a file instead of fetching it from GitHub.
         #[arg(long)]
         issue_file: Option<PathBuf>,
         /// Provider id from config (`claude` | `codex`).

@@ -11,7 +11,7 @@ LYRA is a Rust harness around a coding-agent CLI (Claude Code or Codex). Given a
 | Module | Role |
 |---|---|
 | `src/main.rs` | CLI: `serve`, `run`, `retry`, `runs`, `doctor`, `config` |
-| `src/config.rs` | `~/.lyra/config.toml` (`LYRA_HOME` override) + `<repo>/lyra.toml` (verify overrides only) |
+| `src/config.rs` | `~/.lyra/config.toml` (`LYRA_HOME` override) + `<repo>/lyra.toml` (scoped verify overrides and Python package declarations) |
 | `src/events.rs` | `StageId`, `Event`/`EventKind`/`AgentEvent`, the append-only `events.jsonl` writer and live broadcast |
 | `src/state.rs` | `run.json`: `RunRequest`, `RunState`, statuses, checkpoints, attempts |
 | `src/error.rs` | `StageError`, `ErrorKind`, `StopReason`, `StageOutcome` |

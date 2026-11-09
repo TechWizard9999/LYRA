@@ -29,7 +29,7 @@ A change to one needs a **"Contract change"** note in the PR description (what c
 ## Config
 
 - New config keys have defaults so an existing `~/.lyra/config.toml` still loads. Update the default text written by `Config::ensure_default`, README's Configuration section, and PLAN §7.
-- Per-repo `lyra.toml` may override `[verify]` only. Don't widen that.
+- Per-repo `lyra.toml` supports scoped verify overrides and Python package declarations; top-level `[verify]` applies to Cargo only. Don't widen that scope.
 
 ## Docs to update with a contract change
 
