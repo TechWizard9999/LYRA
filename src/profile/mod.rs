@@ -152,9 +152,14 @@ pub trait ExecutionProfile: Send + Sync {
     fn describe_outcome(&self, outcome: &RegressionOutcome, rec: &ReproRecord) -> String;
     /// S2: a `Failed` classification must also be exactly one failing case and the
     /// runner's test-failure exit status, so a crashed or partial run is not a reproduction.
+    /// Profiles with a separate report also confirm the expected assertion text in the report.
     fn confirm_failure(&self, run: &CommandOutput, rec: &ReproRecord) -> Result<(), String>;
     /// S5: the selected test passed and exactly one test ran.
     fn assert_passed(&self, output: &str, rec: &ReproRecord) -> Result<(), String>;
+    /// Validate separate evidence from a built-in non-regression verification command.
+    fn assert_verification_report(&self, _report: &str) -> Result<(), String> {
+        Ok(())
+    }
     /// Source binding: the selected test is absent from a discovery run with its source emptied.
     fn assert_absent_from_discovery(&self, output: &str, rec: &ReproRecord) -> Result<(), String>;
     /// S2: files the failing regression run actually loaded that are not production code
@@ -190,6 +195,7 @@ pub trait ExecutionProfile: Send + Sync {
         rec: &ReproRecord,
         read_checkpoint: FileReader<'_>,
         read_now: FileReader<'_>,
+        checkpoint_paths: Option<&std::collections::BTreeSet<String>>,
     ) -> Result<(), String>;
 
     // --- environments --------------------------------------------------------------
@@ -200,7 +206,12 @@ pub trait ExecutionProfile: Send + Sync {
     /// upward resolution finds it). Refuses an install that does not match the checkout's
     /// manifests. Called for the run's worktree at Intake and for each verification checkout,
     /// after it exists. Default: nothing to provide.
-    fn provision_dependencies(&self, _source_repo: &Path, _checkout: &Path) -> Result<(), String> {
+    async fn provision_dependencies(
+        &self,
+        _source_repo: &Path,
+        _checkout: &Path,
+        _cancel: &CancellationToken,
+    ) -> Result<(), String> {
         Ok(())
     }
     /// S2: where build outputs of the agent's worktree go (outside the worktree).

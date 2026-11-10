@@ -1,0 +1,41 @@
+name: vitest-profile
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/vitest-profile.yml'
+      - 'Cargo.*'
+      - 'src/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/vitest-profile.yml'
+      - 'Cargo.*'
+      - 'src/**'
+
+permissions:
+  contents: read
+
+jobs:
+  recorder:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: Run the Vitest integration fixtures
+        shell: pwsh
+        run: |
+          $fixture = Join-Path $env:RUNNER_TEMP 'lyra-vitest'
+          New-Item -ItemType Directory -Path $fixture | Out-Null
+          npm install --prefix $fixture --ignore-scripts --no-audit --no-fund --no-save vitest@3.2.4
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:LYRA_TEST_NODE_MODULES = Join-Path $fixture 'node_modules'
+          cargo test --locked --lib js_vitest -- --include-ignored --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --lib javascript_verification_cleanup_keeps_the_operator_install_intact

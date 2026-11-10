@@ -138,7 +138,7 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
     let run =
         proc::run(&spec, ctx.timeout(), &ctx.cancel).await.map_err(|e| StageError::from_anyhow(ErrorKind::Tool, e))?;
     let output = run.combined();
-    let out_rel = write(ctx, "20-repro/output.txt", &output)?;
+    let out_rel = write(ctx, "20-repro/output.txt", run.combined_with_report())?;
     if run.cancelled {
         return Err(StageError::new(ErrorKind::Tool, "repro cancelled"));
     }
@@ -147,12 +147,13 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
         return Err(StageError::new(ErrorKind::Timeout, msg).with_details(out_rel));
     }
     require_complete_evidence(&run).map_err(|error| error.with_details(&out_rel))?;
-    match profile.classify(&output, &rec) {
+    let evidence = run.report.as_deref().unwrap_or(&output);
+    match profile.classify(evidence, &rec) {
         RegressionOutcome::Failed => {
             profile
                 .confirm_failure(&run, &rec)
                 .map_err(|msg| StageError::new(ErrorKind::Guard, msg).with_details(&out_rel))?;
-            if !guards::output_contains_expected(&output, &rec.expected) {
+            if run.report.is_none() && !guards::output_contains_expected(&output, &rec.expected) {
                 let msg = format!(
                     "test {} failed, but its output does not contain the expected text {:?}",
                     rec.test_name,
@@ -173,7 +174,7 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
     ctx.events.info(format!("repro: test {} fails with the expected text", rec.test_name));
     // Test-side modules and test support the failing run actually loaded are frozen with the test.
     let loaded = profile
-        .loaded_test_inputs(&output, &rec, &worktree)
+        .loaded_test_inputs(evidence, &rec, &worktree)
         .map_err(|msg| StageError::new(ErrorKind::Guard, msg).with_details(&out_rel))?;
 
     // 5. Build scripts may have written files; guard that final diff before committing.
@@ -243,7 +244,7 @@ pub(crate) async fn check_source_binding(
             rec.test_file,
             discovery.spec.display(),
             discovery.note,
-            run.combined()
+            run.combined_with_report()
         ),
     )?;
     require_complete_evidence(&run).map_err(|error| error.with_details(&log))?;
@@ -252,7 +253,7 @@ pub(crate) async fn check_source_binding(
         return Err(StageError::new(kind, "reproduction source binding could not be established: test discovery failed with the new source temporarily empty").with_details(log));
     }
     profile
-        .assert_absent_from_discovery(&run.stdout, rec)
+        .assert_absent_from_discovery(run.report.as_deref().unwrap_or(&run.stdout), rec)
         .map_err(|message| StageError::new(ErrorKind::Guard, message).with_details(log))
 }
 

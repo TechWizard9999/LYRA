@@ -37,7 +37,7 @@ Also allowed: new non-code fixture files (JSON, text) in a test or fixture direc
 {%- macro repro_fields() -%}
 - `crate`: "" (empty: Vitest needs no package name).
 - `test_file`: repository-relative path with forward slashes, for example `tests/issue-7.test.ts`.
-- `test_name`: the test's full name, its `describe` names and the test name joined by ` > `, for example `issue 7 > rejects a short frame`.
+- `test_name`: the test's full name, its `describe` names and the test name joined by ` > `, for example `issue 7 > rejects a short frame`. Escape a literal `>` as `\>` and a literal backslash as `\\` within a title segment. Use JSON escapes for the backslashes in the response.
 - `command`: `npx vitest run <test_file> -t "<full name>"`.
 {%- endmacro %}
 

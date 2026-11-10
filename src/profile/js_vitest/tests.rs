@@ -1,5 +1,6 @@
 use super::*;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 const FILE: &str = "tests/issue-7.test.ts";
 const NAME: &str = "issue 7 > sums two numbers";
@@ -10,7 +11,7 @@ fn rec() -> ReproRecord {
         krate: String::new(),
         test_file: FILE.into(),
         test_name: NAME.into(),
-        command: regression_line(FILE, NAME, None),
+        command: regression_line(FILE, &name_segments(NAME).unwrap(), None),
         expected: "sum must be three".into(),
         observed: String::new(),
         registration_file: None,
@@ -35,41 +36,28 @@ fn reader<'a>(map: &'a HashMap<&'a str, &'a str>) -> impl Fn(&str) -> Option<Str
     }
 }
 
-/// A recorder report: `tests`, `fileErrors`, `unhandled`, with the test file loaded and the
-/// module graph observed.
-fn report(tests: Value, file_errors: Value, unhandled: u64) -> String {
-    report_with(json!({ "tests": tests, "fileErrors": file_errors, "unhandled": unhandled }), &[FILE], &[])
+fn report(tests: Value, suite_errors: Value, unhandled: u64) -> Value {
+    json!({
+        "version": 1, "mode": "regression", "tests": tests, "suiteErrors": suite_errors,
+        "unhandled": unhandled, "collected": [FILE], "loaded": [FILE], "setup": [], "foreign": []
+    })
 }
 
-/// A complete report from `fields` (defaults filled in) and module records.
-fn report_with(fields: Value, loaded: &[&str], foreign: &[&str]) -> String {
-    let mut value = json!({
-        "started": true, "graph": true, "tests": [], "fileErrors": [], "suiteErrors": [], "unhandled": 0, "setup": []
-    });
-    for (k, v) in fields.as_object().unwrap() {
-        value[k] = v.clone();
-    }
-    let mut out = format!(
-        " RUN  v3.2.4 /w\n × tests/issue-7.test.ts > issue 7 > sums two numbers\nAssertionError: sum must be three\n{RESULT_PREFIX}{value}\n"
-    );
-    for path in loaded {
-        out.push_str(&format!("{LOADED_PREFIX}{path}\n"));
-    }
-    for path in foreign {
-        out.push_str(&format!("{FOREIGN_PREFIX}{path}\n"));
-    }
-    out.push_str(END_MARKER);
-    out.push('\n');
-    out
+fn test(name: &str, state: Option<&str>) -> Value {
+    let errors = if state == Some("fail") {
+        json!([{ "name": "AssertionError", "message": "sum must be three: expected -1 to be 3" }])
+    } else {
+        json!([])
+    };
+    json!({ "file": FILE, "name": name_segments(name).unwrap(), "state": state, "errors": errors, "inverted": false })
 }
 
-fn test(name: &str, mode: &str, state: Option<&str>) -> Value {
-    let errors = if state == Some("fail") { json!(["sum must be three: expected -1 to be 3"]) } else { json!([]) };
-    json!({ "file": FILE, "name": name, "mode": mode, "state": state, "errors": errors })
+fn suite_error(file: &str) -> Value {
+    json!({ "file": file, "errors": [{ "name": "Error", "message": "setup failed" }] })
 }
 
-fn output(exit: i32, text: &str) -> CommandOutput {
-    CommandOutput { exit_code: Some(exit), stdout: text.into(), ..Default::default() }
+fn output(exit: i32, evidence: &Value) -> CommandOutput {
+    CommandOutput { exit_code: Some(exit), report: Some(evidence.to_string()), ..Default::default() }
 }
 
 #[test]
@@ -109,25 +97,27 @@ fn test_identity_is_validated_and_selected_exactly() {
     for bad in ["", "a >  > b", "a\nb", &"x".repeat(501)] {
         assert!(name_segments(bad).is_err(), "{bad:?}");
     }
-    let pattern = name_pattern("issue (7) > adds $1.50 + [tax]?");
-    assert_eq!(pattern, r"^issue \(7\)(?: | > )adds \$1\.50 \+ \[tax\]\?$");
+    let pattern = name_pattern(&name_segments("issue (7) > adds $1.50 + [tax]?").unwrap());
+    assert_eq!(pattern, r"^issue \(7\) adds \$1\.50 \+ \[tax\]\?$");
     let re = regex::Regex::new(&pattern).unwrap();
     assert!(re.is_match("issue (7) adds $1.50 + [tax]?") && !re.is_match("issue (7) adds $1.50 + [tax]? twice"));
     // A title that itself contains ` > ` keeps it: Vitest reports `issue 7 > rejects x > y` for
     // `describe('issue 7', () => it('rejects x > y'))` and matches `issue 7 rejects x > y`.
-    let re = regex::Regex::new(&name_pattern("issue 7 > rejects x > y")).unwrap();
+    let re = regex::Regex::new(&name_pattern(&name_segments(r"issue 7 > rejects x \> y").unwrap())).unwrap();
     assert!(re.is_match("issue 7 rejects x > y"), "the literal separator in the title survives");
     assert!(!re.is_match("issue 7 rejects x y z"));
 
-    let line = regression_line(FILE, NAME, None);
-    assert_eq!(line, r"npx vitest run tests/issue-7.test.ts -t '^issue 7(?: | > )sums two numbers$'");
+    let line = regression_line(FILE, &name_segments(NAME).unwrap(), None);
+    assert_eq!(line, r"npx vitest run ./tests/issue-7.test.ts -t '^issue 7 sums two numbers$'");
     assert!(!line.contains('\n'));
     // Paths and patterns stay literal when pasted into a POSIX shell.
-    let odd = regression_line("tests/a b/it's $(x).test.ts", "a's > b", Some("config/unit.ts"));
-    assert_eq!(odd, r"npx vitest run 'tests/a b/it'\''s $(x).test.ts' -t '^a'\''s(?: | > )b$' --config config/unit.ts");
+    let odd =
+        regression_line("tests/a b/it's $(x).test.ts", &name_segments("a's > b").unwrap(), Some("config/unit.ts"));
+    assert_eq!(odd, r"npx vitest run './tests/a b/it'\''s $(x).test.ts' -t '^a'\''s b$' --config config/unit.ts");
     let words = shell_words(&odd);
-    assert_eq!(words[3], "tests/a b/it's $(x).test.ts");
-    assert_eq!(words[5], "^a's(?: | > )b$");
+    assert_eq!(words[3], "./tests/a b/it's $(x).test.ts");
+    assert_eq!(words[5], "^a's b$");
+    assert!(regression_line("--sample.test.js", &name_segments(NAME).unwrap(), None).contains("./--sample.test.js"));
 
     let mut record = rec();
     record.registration_file = Some("x".into());
@@ -136,7 +126,7 @@ fn test_identity_is_validated_and_selected_exactly() {
     let spec = JsVitest.regression_command(&rec(), dir.path()).unwrap();
     assert_eq!(spec.program, NODE);
     assert_eq!(spec.args[..4], ["--input-type=module".to_string(), "-e".into(), RECORDER.into(), "--".into()]);
-    assert_eq!(spec.args[4..], [FILE.to_string(), name_pattern(NAME), String::new()]);
+    assert_eq!(spec.args[4..], [FILE.to_string(), name_pattern(&name_segments(NAME).unwrap()), String::new()]);
     assert_eq!(spec.display(), line, "the shown command is the copyable line");
     assert_eq!(JsVitest.regression_command_line(&rec(), dir.path()), line);
 }
@@ -193,7 +183,7 @@ fn a_nondefault_vitest_config_is_declared_and_shared_or_refused() {
     assert_eq!(spec.args.last().unwrap(), "config/unit.ts");
     assert!(spec.display().ends_with(" --config config/unit.ts"), "{}", spec.display());
     let discovery = JsVitest.discovery(&spec);
-    assert_eq!(discovery.spec.args[4..], [FILE.to_string(), String::new(), "config/unit.ts".into()]);
+    assert_eq!(discovery.spec.args, spec.args, "discovery keeps the file and config selectors");
     let steps = JsVitest.verification_steps(&VerifyCommands::default(), &rec(), dir.path()).unwrap();
     assert_eq!(steps[1].spec.args.last().unwrap(), "config/unit.ts");
     assert_eq!(steps[1].spec.display(), "npx vitest run --config config/unit.ts");
@@ -206,136 +196,96 @@ fn a_nondefault_vitest_config_is_declared_and_shared_or_refused() {
 #[test]
 fn classification_covers_every_outcome() {
     let r = rec();
-    let ours = |state: Option<&str>, mode: &str| report(json!([test(NAME, mode, state)]), json!([]), 0);
-    assert_eq!(classify_report(&ours(Some("fail"), "run"), &r), RegressionOutcome::Failed);
-    assert_eq!(classify_report(&ours(Some("pass"), "run"), &r), RegressionOutcome::Passed);
-    assert_eq!(classify_report(&ours(None, "skip"), &r), RegressionOutcome::Skipped);
-    assert_eq!(classify_report(&ours(None, "todo"), &r), RegressionOutcome::Skipped);
-    assert_eq!(classify_report(&ours(Some("skip"), "run"), &r), RegressionOutcome::Skipped);
+    let ours = |state: Option<&str>| report(json!([test(NAME, state)]), json!([]), 0).to_string();
+    assert_eq!(classify_report(&ours(Some("fail")), &r), RegressionOutcome::Failed);
+    assert_eq!(classify_report(&ours(Some("pass")), &r), RegressionOutcome::Passed);
+    assert_eq!(classify_report(&ours(None), &r), RegressionOutcome::Skipped);
+    assert_eq!(classify_report(&ours(Some("skip")), &r), RegressionOutcome::Skipped);
     assert_eq!(
-        classify_report(&report(json!([test("other", "run", Some("fail"))]), json!([]), 0), &r),
+        classify_report(&report(json!([test("other", Some("fail"))]), json!([]), 0).to_string(), &r),
         RegressionOutcome::NotDiscovered
     );
-    let broken = report(json!([]), json!([{ "file": FILE, "errors": ["SyntaxError: Unexpected token"] }]), 0);
+    let broken = report(json!([]), json!([suite_error(FILE)]), 0).to_string();
     assert_eq!(classify_report(&broken, &r), RegressionOutcome::SetupFailed);
-    assert_eq!(
-        classify_report(&report(json!([test(NAME, "run", Some("fail"))]), json!([]), 1), &r),
-        RegressionOutcome::SetupFailed
-    );
-    let hook = report_with(
-        json!({ "tests": [test(NAME, "run", Some("fail"))], "suiteErrors": [{ "file": FILE, "name": "issue 7", "errors": ["afterAll broke"] }] }),
-        &[FILE],
-        &[],
-    );
-    assert_eq!(classify_report(&hook, &r), RegressionOutcome::SetupFailed, "a suite hook error");
-    let truncated = ours(Some("fail"), "run").replace(END_MARKER, "");
-    assert!(matches!(classify_report(&truncated, &r), RegressionOutcome::Other(_)), "no end marker");
-    assert!(matches!(classify_report("garbled", &r), RegressionOutcome::Other(_)));
-    let not_started = report_with(json!({ "started": false }), &[], &[]);
-    assert_eq!(classify_report(&not_started, &r), RegressionOutcome::SetupFailed);
-    // CRLF output parses the same.
-    assert_eq!(classify_report(&ours(Some("fail"), "run").replace('\n', "\r\n"), &r), RegressionOutcome::Failed);
-}
+    let unhandled = report(json!([test(NAME, Some("fail"))]), json!([]), 1).to_string();
+    assert_eq!(classify_report(&unhandled, &r), RegressionOutcome::SetupFailed);
 
-#[test]
-fn a_result_printed_by_the_test_never_replaces_the_recorders() {
-    let r = rec();
-    let real = report(json!([test(NAME, "run", Some("fail"))]), json!([]), 0);
-    let forged = report(json!([test(NAME, "run", Some("pass"))]), json!([]), 0);
-    // A forged result (and end marker) on stderr, after the real one in the combined output.
-    let run = CommandOutput { exit_code: Some(0), stdout: real.clone(), stderr: forged.clone(), ..Default::default() };
-    assert!(parse_report(&run.combined()).is_none(), "two results are inconclusive");
-    assert!(matches!(classify_report(&run.combined(), &r), RegressionOutcome::Other(_)));
-    assert!(assert_passed_in(&run.combined(), &r).is_err());
-    // Only the result line forged (no second end marker), before the real one.
-    let line = forged.lines().find(|l| l.starts_with(RESULT_PREFIX)).unwrap();
-    assert!(parse_report(&format!("{line}\n{real}")).is_none());
-    // A stray end marker printed by the test before the real result.
-    assert!(parse_report(&format!("{END_MARKER}\n{real}")).is_none());
-    // Module records count only inside the recorder's block.
-    let outside = format!("{LOADED_PREFIX}tests/sneaky.ts\n{FOREIGN_PREFIX}/elsewhere/x.js\n{real}");
-    let parsed = parse_report(&outside).unwrap();
-    assert_eq!((parsed.loaded, parsed.foreign), (vec![FILE.to_string()], Vec::<String>::new()));
+    let mut malformed = report(json!([test(NAME, Some("fail"))]), json!([]), 0);
+    malformed.as_object_mut().unwrap().remove("unhandled");
+    assert!(matches!(classify_report(&malformed.to_string(), &r), RegressionOutcome::Other(_)));
+    malformed["unhandled"] = json!(0);
+    malformed["tests"][0].as_object_mut().unwrap().remove("state");
+    assert!(matches!(classify_report(&malformed.to_string(), &r), RegressionOutcome::Other(_)));
+    assert!(matches!(classify_report("garbled", &r), RegressionOutcome::Other(_)));
 }
 
 #[test]
 fn confirmation_and_pass_require_exactly_the_selected_test() {
     let r = rec();
-    let failed = report(json!([test(NAME, "run", Some("fail")), test("issue 7 > other", "skip", None)]), json!([]), 0);
+    let failed = report(json!([test(NAME, Some("fail")), test("issue 7 > other", None)]), json!([]), 0);
     assert!(confirm_failure_in(&output(1, &failed), &r).is_ok());
     assert!(confirm_failure_in(&output(0, &failed), &r).is_err(), "exit status 1 required");
-    let two =
-        report(json!([test(NAME, "run", Some("fail")), test("issue 7 > other", "run", Some("pass"))]), json!([]), 0);
+    let two = report(json!([test(NAME, Some("fail")), test("issue 7 > other", Some("pass"))]), json!([]), 0);
     assert!(confirm_failure_in(&output(1, &two), &r).is_err(), "only one test may execute");
-    let other_file = report(
-        json!([{ "file": "tests/x.test.ts", "name": NAME, "mode": "run", "state": "fail", "errors": [] }]),
-        json!([]),
-        0,
-    );
+    let mut other_file = failed.clone();
+    other_file["tests"][0]["file"] = json!("tests/x.test.ts");
     assert!(confirm_failure_in(&output(1, &other_file), &r).is_err(), "same name in another file");
-    let with_file_error =
-        report(json!([test(NAME, "run", Some("fail"))]), json!([{ "file": "tests/y.test.ts", "errors": ["boom"] }]), 0);
-    assert!(confirm_failure_in(&output(1, &with_file_error), &r).is_err());
-    let hook = report_with(
-        json!({ "tests": [test(NAME, "run", Some("fail"))], "suiteErrors": [{ "file": FILE, "name": "issue 7", "errors": ["afterAll broke"] }] }),
-        &[FILE],
-        &[],
-    );
-    let err = confirm_failure_in(&output(1, &hook), &r).unwrap_err();
-    assert!(err.contains("suite hook"), "{err}");
-    // The expected text must be in the selected test's own error, not just in the output.
-    let unrelated = report(
-        json!([{ "file": FILE, "name": NAME, "mode": "run", "state": "fail", "errors": ["TypeError: x is not a function"] }]),
-        json!([]),
-        0,
-    );
-    assert!(guards::output_contains_expected(&unrelated, &r.expected), "precondition: the logs contain it");
-    let err = confirm_failure_in(&output(1, &unrelated), &r).unwrap_err();
-    assert!(err.contains("own error"), "{err}");
+    let with_suite_error = report(json!([test(NAME, Some("fail"))]), json!([suite_error("tests/y.test.ts")]), 0);
+    assert!(confirm_failure_in(&output(1, &with_suite_error), &r).is_err());
+    let passed = report(json!([test(NAME, Some("pass"))]), json!([]), 0);
+    assert!(assert_passed_in(&passed.to_string(), &r).is_ok());
+    assert!(assert_passed_in(&failed.to_string(), &r).is_err());
+    assert!(assert_passed_in(&report(json!([test(NAME, None)]), json!([]), 0).to_string(), &r).is_err());
 
-    let passed = report(json!([test(NAME, "run", Some("pass"))]), json!([]), 0);
-    assert!(assert_passed_in(&passed, &r).is_ok());
-    assert!(assert_passed_in(&failed, &r).is_err());
-    assert!(assert_passed_in(&report(json!([test(NAME, "skip", None)]), json!([]), 0), &r).is_err());
-    // Verify rejects a passing report that used code from outside the checkout too.
-    let fields = json!({ "tests": [test(NAME, "run", Some("pass"))] });
-    let foreign = report_with(fields.clone(), &[FILE], &["/home/op/repo/src/calc.ts"]);
-    let err = assert_passed_in(&foreign, &r).unwrap_err();
-    assert!(err.contains("/home/op/repo/src/calc.ts"), "{err}");
-    // ... and one whose module graph could not be observed.
-    let blind = report_with(json!({ "tests": [test(NAME, "run", Some("pass"))], "graph": false }), &[FILE], &[]);
-    assert!(assert_passed_in(&blind, &r).unwrap_err().contains("module graph"));
-    let unloaded = report_with(fields, &[], &[]);
-    assert!(assert_passed_in(&unloaded, &r).unwrap_err().contains("module graph"));
+    let mut foreign = passed;
+    foreign["foreign"] = json!(["/operator/src/calc.js"]);
+    assert!(assert_passed_in(&foreign.to_string(), &r).unwrap_err().contains("outside the checkout"));
+    foreign["loaded"] = json!([]);
+    assert!(assert_passed_in(&foreign.to_string(), &r).unwrap_err().contains("module graph"));
 }
 
 #[test]
-fn source_binding_requires_an_empty_file_and_nothing_else() {
+fn confirmation_checks_structured_assertion_instead_of_console_output() {
     let r = rec();
-    let collected = |file_errors: Value, unhandled: u64| {
-        report_with(json!({ "collected": [FILE], "fileErrors": file_errors, "unhandled": unhandled }), &[FILE], &[])
-    };
-    assert!(assert_absent(&collected(json!([]), 0), &r).is_ok());
-    let empty = collected(json!([{ "file": FILE, "errors": ["No test suite found in file /w/x"] }]), 0);
-    assert!(assert_absent(&empty, &r).is_ok(), "the empty-file error itself is expected");
-    let still = report(json!([test("issue 7 > injected", "run", Some("pass"))]), json!([]), 0);
-    assert!(assert_absent(&still, &r).is_err(), "a test still comes from the file");
+    let mut evidence = report(json!([test(NAME, Some("fail"))]), json!([]), 0);
+    let spoof = CommandOutput { exit_code: Some(1), stderr: evidence.to_string(), ..Default::default() };
+    assert!(confirm_failure_in(&spoof, &r).is_err());
+
+    evidence["tests"][0]["errors"] = json!([{ "name": "Error", "message": r.expected }]);
+    assert!(confirm_failure_in(&output(1, &evidence), &r).is_err());
+    evidence["tests"][0]["errors"] = json!([{ "name": "AssertionError", "message": "unrelated" }]);
+    let logged_expected = CommandOutput { stderr: r.expected.clone(), ..output(1, &evidence) };
+    assert!(confirm_failure_in(&logged_expected, &r).is_err());
+    evidence["tests"][0]["errors"][0]["message"] = json!(r.expected);
+    evidence["tests"][0]["inverted"] = json!(true);
+    assert!(confirm_failure_in(&output(1, &evidence), &r).unwrap_err().contains("fails modifier"));
+}
+
+#[test]
+fn source_binding_requires_clean_empty_collection() {
+    let r = rec();
+    let mut empty = report(json!([]), json!([]), 0);
+    assert!(assert_absent(&empty.to_string(), &r).is_err(), "wrong report mode");
+    empty["mode"] = json!("discover");
+    assert!(assert_absent(&empty.to_string(), &r).is_ok());
+    let mut still = empty.clone();
+    still["tests"] = json!([test("issue 7 > injected", None)]);
+    assert!(assert_absent(&still.to_string(), &r).is_err(), "a test still comes from the file");
+    let mut failed_setup = empty.clone();
+    failed_setup["suiteErrors"] = json!([{
+        "file": FILE, "errors": [{ "name": "Error", "message": "No test suite found in file: service unavailable" }]
+    }]);
+    assert!(assert_absent(&failed_setup.to_string(), &r).is_err());
+    let mut wrong_file = empty.clone();
+    wrong_file["collected"] = json!(["tests/other.test.ts"]);
+    assert!(assert_absent(&wrong_file.to_string(), &r).unwrap_err().contains("did not collect"));
+    empty["unhandled"] = json!(1);
+    assert!(assert_absent(&empty.to_string(), &r).is_err());
     assert!(assert_absent("", &r).is_err(), "no report is not evidence");
-    let not_collected = report(json!([]), json!([]), 0);
-    assert!(assert_absent(&not_collected, &r).unwrap_err().contains("did not collect"));
-    for broken in [
-        collected(json!([{ "file": FILE, "errors": ["Error: setup exploded"] }]), 0),
-        collected(json!([{ "file": "tests/other.test.ts", "errors": ["x"] }]), 0),
-        collected(json!([]), 1),
-    ] {
-        assert!(assert_absent(&broken, &r).unwrap_err().contains("failed instead of finding no test"), "{broken}");
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let spec = JsVitest.regression_command(&r, dir.path()).unwrap();
+    let spec = JsVitest.regression_command(&r, Path::new("/w")).unwrap();
     let discovery = JsVitest.discovery(&spec);
-    assert_eq!(discovery.spec.args[4..], [FILE.to_string(), String::new(), String::new()], "the whole file");
+    assert_eq!(discovery.spec.args, spec.args, "discovery keeps the original selector and changes mode only");
     assert!(discovery.spec.env.iter().any(|(k, v)| k == "LYRA_VITEST_MODE" && v == "discover"));
-    assert_eq!(discovery.spec.display(), format!("npx vitest run {FILE}"));
 }
 
 #[test]
@@ -353,13 +303,19 @@ fn production_code_is_what_the_repository_declares_and_exists() {
         ("extra/a.js", ""),
         ("README.md", ""),
     ]);
-    let production = ProductionCode::declared(&reader(&files));
-    let roots: Vec<&str> = production.roots.iter().map(String::as_str).collect();
-    assert_eq!(roots, ["README.md", "bin", "dist", "extra", "lib", "src", "types", "util"]);
-    assert_eq!(production.missing, BTreeSet::from(["ghost".to_string()]));
+    let paths = files.keys().map(|path| path.to_string()).collect();
+    let production = ProductionCode::declared(&reader(&files), Some(&paths));
+    assert_eq!(
+        production.describe(),
+        "`bin/calc.js`, `dist`, `extra`, `lib/index.mjs`, `src/**/*`, `src`, `types`, `util/index.js`"
+    );
+    assert_eq!(production.missing, BTreeSet::from(["*.d.ts".to_string(), "ghost".to_string()]));
     // `dist` named only by entry points is build output; `files` names it explicitly here.
     let entry_only = HashMap::from([("package.json", r#"{"main":"dist/index.js"}"#), ("dist/index.js", "")]);
-    assert!(ProductionCode::declared(&reader(&entry_only)).is_empty(), "build output named by main is not source");
+    assert!(
+        ProductionCode::declared(&reader(&entry_only), None).is_empty(),
+        "build output named by main is not source"
+    );
     for (path, want) in [
         ("src/calc.ts", Classification::Production),
         ("src/calc.test.ts", Classification::TestSupport),
@@ -372,47 +328,84 @@ fn production_code_is_what_the_repository_declares_and_exists() {
     ] {
         assert_eq!(production.classify(path), want, "{path}");
     }
-    let none = ProductionCode::declared(&reader(&HashMap::from([("package.json", "{}")])));
+    let none = ProductionCode::declared(&reader(&HashMap::from([("package.json", "{}")])), None);
     assert_eq!(none.classify("src/calc.ts"), Classification::Unknown);
     assert_eq!(none.classify("data/x.json"), Classification::TestSupport, "data is frozen either way");
     let message = production.unknown_message(&BTreeSet::from(["x.ts".to_string()]));
     assert!(message.contains("`ghost`") && message.contains("lyra.toml"), "{message}");
-    assert_eq!(declared_path("./src/**/*.ts").as_deref(), Some("src"));
-    assert_eq!(declared_path("src/app/**/*.ts").as_deref(), Some("src/app"));
-    assert_eq!(declared_path("*.d.ts"), None, "wildcard-only declares nothing");
+    assert_eq!(declared_path("./src/**/*.ts").as_deref(), Some("src/**/*.ts"));
+    assert!(production.missing.contains("*.d.ts"), "wildcard-only declares nothing");
     assert_eq!(declared_path("../outside"), None);
+    assert_eq!(declared_path("/outside"), None);
+    assert_eq!(declared_path("C:\\outside"), None);
 }
 
 #[test]
-fn a_declaration_authorizes_only_its_own_scope() {
+fn declarations_preserve_nested_files_and_directories() {
     let files = HashMap::from([
-        ("package.json", r#"{"main":"./src/lib/index.js","bin":"cli.js"}"#),
-        ("lyra.toml", "[profiles.js-vitest]\nsources = [\"src/app\", \"src/ghost\", \"src/app/**/*.ts\"]\n"),
+        ("package.json", r#"{"main":"src/main.js","types":"src/missing.js","files":["src/lib"]}"#),
+        ("src/main.js", ""),
         ("src/lib/index.js", ""),
-        ("src/app/main.ts", ""),
-        ("src/support/helper.js", ""),
-        ("cli.js", ""),
-        ("other.js", ""),
+        ("src/support/fixture.js", ""),
     ]);
-    let production = ProductionCode::declared(&reader(&files));
-    let roots: Vec<&str> = production.roots.iter().map(String::as_str).collect();
-    assert_eq!(roots, ["cli.js", "src/app", "src/lib"], "an entry point declares its directory, a root entry itself");
-    assert_eq!(production.missing, BTreeSet::from(["src/ghost".to_string()]), "a missing entry grants nothing");
-    for (path, want) in [
-        ("src/app/main.ts", Classification::Production),
-        ("src/app/deep/x.ts", Classification::Production),
-        ("src/lib/index.js", Classification::Production),
-        ("cli.js", Classification::Production),
-        ("src/support/helper.js", Classification::TestSupport),
-        ("src/application.ts", Classification::TestSupport),
-        ("other.js", Classification::TestSupport),
-    ] {
-        assert_eq!(production.classify(path), want, "{path}");
+    let production = ProductionCode::declared(&reader(&files), None);
+    for path in ["src/main.js", "src/lib/index.js", "src/lib/new.js"] {
+        assert_eq!(production.classify(path), Classification::Production, "{path}");
     }
-    // The fix lock follows: a sibling helper under the same top-level directory is frozen.
-    let changes = vec![("M".to_string(), "src/support/helper.js".to_string())];
-    let err = check_fix_changes_with(&changes, &rec(), &reader(&files), &reader(&files)).unwrap_err();
-    assert!(err.contains("src/support/helper.js") && err.contains("`src/app`"), "{err}");
+    for path in ["src/missing.js", "src/support/fixture.js", "src/library/index.js", "src/main.js/index.js"] {
+        assert_eq!(production.classify(path), Classification::TestSupport, "{path}");
+    }
+    assert!(production.unknown_message(&BTreeSet::from(["unknown.js".into()])).contains("src/missing.js"));
+}
+
+#[test]
+fn declared_globs_match_only_source_inside_their_checkpoint_scope() {
+    let files = HashMap::from([
+        ("package.json", r#"{"files":["src/lib/**/*.ts","src/ghost/*.js","!src/lib/fixtures"]}"#),
+        ("src/lib/index.ts", ""),
+        ("src/lib/nested/a.ts", ""),
+        ("src/lib/fixtures/helper.ts", ""),
+        ("src/lib/outside.js", ""),
+        ("src/ghost/placeholder.txt", ""),
+    ]);
+    let paths = files.keys().map(|path| path.to_string()).collect();
+    let production = ProductionCode::declared(&reader(&files), Some(&paths));
+    for path in ["src/lib/index.ts", "src/lib/nested/a.ts", "src/lib/nested/new.ts"] {
+        assert_eq!(production.classify(path), Classification::Production, "{path}");
+    }
+    for path in ["src/lib/fixtures/helper.ts", "src/lib/outside.js", "src/ghost/new.js", "src/library/new.ts"] {
+        assert_eq!(production.classify(path), Classification::TestSupport, "{path}");
+    }
+    assert!(production.missing.contains("src/ghost/*.js"));
+    let pattern = glob_pattern("src/[a-z]*/**/*.{ts,tsx}").unwrap();
+    assert!(
+        pattern.is_match("src/lib/x.tsx") && !pattern.is_match("src/1lib/x.ts") && !pattern.is_match("src/lib/x.js")
+    );
+    assert!(glob_pattern("**/*.fixture.ts").unwrap().is_match("one.fixture.ts"));
+    assert!(glob_pattern("src/[abc.ts").is_none());
+    let config =
+        HashMap::from([("package.json", r#"{"files":["src","!src/@(fixtures|mocks)/**"]}"#), ("src/calc.ts", "")]);
+    let invalid = ProductionCode::declared(&reader(&config), None);
+    assert_eq!(invalid.classify("src/calc.ts"), Classification::Unknown);
+    assert!(invalid.unknown_message(&BTreeSet::from(["src/calc.ts".into()])).contains("unsupported exclusion"));
+}
+
+#[test]
+fn the_configured_vitest_file_is_locked_even_inside_declared_sources() {
+    let files = HashMap::from([
+        ("package.json", r#"{"files":["src"]}"#),
+        ("lyra.toml", "[profiles.js-vitest]\nconfig = \"src/unit.ts\""),
+        ("src/calc.ts", "export const value = 1"),
+        ("src/unit.ts", "export default {}"),
+    ]);
+    let read = reader(&files);
+    let record =
+        ReproRecord { command: regression_line(FILE, &name_segments(NAME).unwrap(), Some("src/unit.ts")), ..rec() };
+    for path in ["src/unit.ts", "src/UNIT.ts"] {
+        let err = check_fix_changes_with(&[("M".into(), path.into())], &record, &read, &read, None).unwrap_err();
+        assert!(err.contains(path) && err.contains("Vitest configuration is locked"), "{err}");
+    }
+    assert!(check_fix_changes_with(&[("M".into(), "src/calc.ts".into())], &record, &read, &read, None).is_ok());
 }
 
 #[test]
@@ -425,26 +418,24 @@ fn jsonc_keeps_quoted_text_and_drops_real_trailing_commas() {
 }
 
 #[test]
-fn loaded_modules_and_configured_setup_are_frozen_and_foreign_code_fails_closed() {
-    let files = HashMap::from([("package.json", r#"{"files":["src"]}"#), ("src/calc.ts", ""), ("src/init.js", "")]);
-    let production = ProductionCode::declared(&reader(&files));
-    let loaded = [FILE, "src/calc.ts", "tests/helpers.ts", "support/data.ts", "vitest.setup.ts", "src/init.js"];
-    let fields = json!({ "setup": ["src/init.js", "config/global.js"] });
-    let out = report_with(fields.clone(), &loaded, &[]);
+fn loaded_modules_are_frozen_unless_production_and_foreign_code_fails_closed() {
+    let files = HashMap::from([("package.json", r#"{"files":["src"]}"#), ("src/calc.ts", "")]);
+    let production = ProductionCode::declared(&reader(&files), None);
+    let mut report = report(json!([]), json!([]), 0);
+    report["loaded"] = json!(["src/calc.ts", FILE, "tests/helpers.ts", "support/data.ts"]);
+    report["setup"] = json!(["src/install-environment.ts", "vitest.setup.ts"]);
+    let out = report.to_string();
     assert_eq!(
         loaded_inputs(&out, FILE, &production).unwrap(),
-        ["config/global.js", "src/init.js", "support/data.ts", "tests/helpers.ts", "vitest.setup.ts"],
-        "a configured setup file is frozen by path, whatever its name and also inside production code"
+        ["src/install-environment.ts", "support/data.ts", "tests/helpers.ts", "vitest.setup.ts"]
     );
-    let err = loaded_inputs(&out.replace(END_MARKER, ""), FILE, &production).unwrap_err();
-    assert!(err.contains("cannot establish"), "{err}");
-    let foreign = report_with(fields.clone(), &loaded, &["/home/op/repo/src/calc.ts"]);
-    let err = loaded_inputs(&foreign, FILE, &production).unwrap_err();
-    assert!(err.contains("`/home/op/repo/src/calc.ts`") && err.contains("outside the checkout"), "{err}");
+    assert!(loaded_inputs("", FILE, &production).is_err());
+    let mut foreign = report;
+    foreign["foreign"] = json!(["/home/op/repo/src/calc.ts"]);
+    let err = loaded_inputs(&foreign.to_string(), FILE, &production).unwrap_err();
+    assert!(err.contains("/home/op/repo/src/calc.ts") && err.contains("outside the checkout"), "{err}");
     let err = loaded_inputs(&out, FILE, &ProductionCode::default()).unwrap_err();
     assert!(err.contains("`src/calc.ts`") && err.contains("declares no source directories"), "{err}");
-    let blind = report_with(json!({ "graph": false }), &loaded, &[]);
-    assert!(loaded_inputs(&blind, FILE, &production).unwrap_err().contains("module graph"));
 }
 
 #[test]
@@ -484,7 +475,7 @@ fn fix_may_change_only_declared_source_code() {
     let check = |changes: &[(&str, &str)]| {
         let mut all = vec![("M".to_string(), "src/calc.ts".to_string())];
         all.extend(changes.iter().map(|(s, p)| (s.to_string(), p.to_string())));
-        check_fix_changes_with(&all, &rec(), &read_checkpoint, &read_checkpoint)
+        check_fix_changes_with(&all, &rec(), &read_checkpoint, &read_checkpoint, None)
     };
     assert!(check(&[]).is_ok());
     for ok in [vec![("A", "src/util.ts")], vec![("D", "src/util.ts")], vec![("D", "src/calc.ts"), ("A", "src/sum.ts")]]
@@ -527,8 +518,9 @@ fn fix_may_change_only_declared_source_code() {
     record.frozen_inputs = vec!["src/calc.ts".into()];
     let mut now = checkpoint.clone();
     now.insert("src/calc.ts", "export const add = (a, b) => a + b\n");
-    let err = check_fix_changes_with(&[("M".into(), "src/calc.ts".into())], &record, &read_checkpoint, &reader(&now))
-        .unwrap_err();
+    let err =
+        check_fix_changes_with(&[("M".into(), "src/calc.ts".into())], &record, &read_checkpoint, &reader(&now), None)
+            .unwrap_err();
     assert!(err.contains("src/calc.ts") && err.contains("locked"), "{err}");
     // The recorded command is the profile's own.
     let mut changed = rec();
@@ -537,10 +529,11 @@ fn fix_may_change_only_declared_source_code() {
         &[("M".into(), "src/calc.ts".into())],
         &changed,
         &read_checkpoint,
-        &read_checkpoint
+        &read_checkpoint,
+        None
     )
     .is_err());
-    assert!(check_fix_changes_with(&[], &rec(), &read_checkpoint, &read_checkpoint).is_err(), "no changes");
+    assert!(check_fix_changes_with(&[], &rec(), &read_checkpoint, &read_checkpoint, None).is_err(), "no changes");
 }
 
 #[test]
@@ -575,6 +568,10 @@ fn verification_runs_the_regression_and_the_suite_through_the_recorder() {
     assert_eq!(steps[2].spec.display(), "npm test");
 }
 
+fn provision_node_modules(source: &Path, checkout: &Path) -> Result<(), String> {
+    dependencies::prepare(source, checkout, checkout.parent().unwrap(), &CancellationToken::new())
+}
+
 /// An operator repository with an installed (fake) Vitest and a run directory holding a
 /// checkout with the same manifests.
 fn install(dir: &Path, vitest: &str) -> (PathBuf, PathBuf) {
@@ -594,7 +591,7 @@ fn install(dir: &Path, vitest: &str) -> (PathBuf, PathBuf) {
 
 #[test]
 fn dependencies_are_copied_next_to_the_checkout_and_writes_stay_in_the_run() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::Builder::new().prefix("lyra Vitest & deps ").tempdir().unwrap();
     let (repo, checkout) = install(dir.path(), "3.2.4");
     provision_node_modules(&repo, &checkout).unwrap();
     let run = checkout.parent().unwrap();
@@ -697,11 +694,10 @@ mod provisioned {
         /// and a LYRA run directory whose checkout holds the same files, provisioned by LYRA.
         fn new(files: &[(&str, &str)]) -> Self {
             let provisioned = PathBuf::from(std::env::var("LYRA_TEST_NODE_MODULES").expect(IGNORE));
-            let provisioned = dunce::canonicalize(provisioned).unwrap();
-            let dir = tempfile::tempdir().unwrap();
+            let dir = tempfile::Builder::new().prefix("lyra Vitest & fixture ").tempdir().unwrap();
             let repo = dir.path().join("repo");
-            let modules = repo.join("node_modules");
-            copy_tree((&provisioned, &modules), &provisioned, &modules, &mut Vec::new()).unwrap();
+            std::fs::create_dir(&repo).unwrap();
+            dependencies::snapshot(&provisioned, &repo, &CancellationToken::new()).unwrap();
             let run = dir.path().join("run");
             let checkout = run.join("checkout");
             for (rel, text) in files {
@@ -711,6 +707,22 @@ mod provisioned {
                     std::fs::write(path, text).unwrap();
                 }
             }
+            crate::git::run(&checkout, &["init"]).unwrap();
+            crate::git::run(&checkout, &["add", "--force", "--all"]).unwrap();
+            crate::git::run(
+                &checkout,
+                &[
+                    "-c",
+                    "user.name=LYRA test",
+                    "-c",
+                    "user.email=lyra@example.invalid",
+                    "commit",
+                    "--no-gpg-sign",
+                    "-m",
+                    "initial test fixture",
+                ],
+            )
+            .unwrap();
             JsVitest.create_environment(&run).unwrap();
             let fx = Fixture { _dir: dir, repo, run, checkout };
             fx.provision();
@@ -750,7 +762,7 @@ mod provisioned {
         let mut r = rec();
         r.test_file = file.into();
         r.test_name = name.into();
-        r.command = regression_line(file, name, None);
+        r.command = regression_line(file, &name_segments(name).unwrap(), None);
         r
     }
 
@@ -776,10 +788,10 @@ mod provisioned {
         let r = record();
         let spec = JsVitest.regression_command(&r, &fx.checkout).unwrap();
         let run = fx.run(spec.clone()).await;
-        let out = run.combined();
-        assert_eq!(classify_report(&out, &r), RegressionOutcome::Failed, "{out}");
+        let out = run.report.as_deref().unwrap_or_default();
+        assert_eq!(classify_report(out, &r), RegressionOutcome::Failed, "{}", run.combined_with_report());
         confirm_failure_in(&run, &r).unwrap();
-        assert_eq!(JsVitest.loaded_test_inputs(&out, &r, &fx.checkout).unwrap(), Vec::<String>::new(), "{out}");
+        assert_eq!(JsVitest.loaded_test_inputs(out, &r, &fx.checkout).unwrap(), Vec::<String>::new(), "{out}");
         assert!(
             !fx.repo.join("node_modules/.vite").exists() && !fx.run.join("node_modules/.vite").exists(),
             "no cache in node_modules"
@@ -787,19 +799,20 @@ mod provisioned {
 
         // Source binding: with the test file emptied, it is collected and holds no test.
         let found = fx.discover(&spec, &r).await;
-        assert!(found.success(), "{}", found.combined());
-        assert_absent(&found.stdout, &r).map_err(|e| format!("{e}\n{}", found.combined())).unwrap();
+        assert!(found.success(), "{}", found.combined_with_report());
+        assert_absent(found.report.as_deref().unwrap_or_default(), &r)
+            .map_err(|e| format!("{e}\n{}", found.combined_with_report()))
+            .unwrap();
 
         // The fix passes the regression and the suite.
         fx.write("src/calc.js", FIXED);
-        let out = fx.run(spec).await.combined();
-        assert_passed_in(&out, &r).unwrap();
+        let run = fx.run(spec).await;
+        assert_passed_in(run.report.as_deref().unwrap_or_default(), &r).unwrap();
         let steps = JsVitest.verification_steps(&VerifyCommands::default(), &r, &fx.checkout).unwrap();
         fx.write("legacy/tests/issue-7.test.js", &legacy);
         let suite = fx.run(steps[1].spec.clone()).await;
-        assert!(suite.success(), "{}", suite.combined());
-        let report = parse_report(&suite.combined()).unwrap();
-        assert!(report.tests.is_empty() && report.loaded.is_empty(), "the suite reports counts only");
+        assert!(suite.success(), "{}", suite.combined_with_report());
+        JsVitest.assert_verification_report(suite.report.as_deref().unwrap_or_default()).unwrap();
     }
 
     #[tokio::test]
@@ -808,38 +821,52 @@ mod provisioned {
         // A dash-led file name and a title containing the ` > ` separator.
         let edge = "import { describe, it, expect } from 'vitest'\nimport { add } from './src/calc.js'\ndescribe('issue 7', () => {\n  it('rejects x > y', () => { expect(add(1, 2), 'sum must be three').toBe(3) })\n  it('rejects x', () => { expect(1).toBe(1) })\n})\n";
         let fx = Fixture::new(&[("package.json", PACKAGE), ("src/calc.js", CALC), ("--edge.test.js", edge)]);
-        let r = record_for("--edge.test.js", "issue 7 > rejects x > y");
+        let r = record_for("--edge.test.js", r"issue 7 > rejects x \> y");
         let spec = JsVitest.regression_command(&r, &fx.checkout).unwrap();
         let run = fx.run(spec).await;
-        assert_eq!(classify_report(&run.combined(), &r), RegressionOutcome::Failed, "{}", run.combined());
+        assert_eq!(
+            classify_report(run.report.as_deref().unwrap_or_default(), &r),
+            RegressionOutcome::Failed,
+            "{}",
+            run.combined_with_report()
+        );
         confirm_failure_in(&run, &r).unwrap();
 
         // The expected text printed by the test while it fails for another reason is not evidence.
-        let logs = "import { describe, it } from 'vitest'\ndescribe('issue 7', () => {\n  it('rejects x > y', () => { console.log('sum must be three'); throw new TypeError('unrelated') })\n})\n";
+        let logs = "import { describe, it } from 'vitest'\ndescribe('issue 7', () => {\n  it('rejects x > y', () => { console.log('sum must be three'); throw new Error('sum must be three') })\n})\n";
         fx.write("--edge.test.js", logs);
         let run = fx.run(JsVitest.regression_command(&r, &fx.checkout).unwrap()).await;
         assert!(guards::output_contains_expected(&run.combined(), &r.expected), "precondition: {}", run.combined());
         let err = confirm_failure_in(&run, &r).unwrap_err();
-        assert!(err.contains("own error"), "{err}");
+        assert!(err.contains("expected assertion text"), "{err}");
 
         // A broken suite teardown next to the selected failure is not a clean reproduction.
         let teardown = "import { describe, it, expect, afterAll } from 'vitest'\nimport { add } from './src/calc.js'\ndescribe('issue 7', () => {\n  describe('inner', () => {\n    afterAll(() => { throw new Error('teardown broke') })\n    it('rejects x > y', () => { expect(add(1, 2), 'sum must be three').toBe(3) })\n  })\n})\n";
         fx.write("--edge.test.js", teardown);
-        let r = record_for("--edge.test.js", "issue 7 > inner > rejects x > y");
+        let r = record_for("--edge.test.js", r"issue 7 > inner > rejects x \> y");
         let run = fx.run(JsVitest.regression_command(&r, &fx.checkout).unwrap()).await;
-        assert_eq!(classify_report(&run.combined(), &r), RegressionOutcome::SetupFailed, "{}", run.combined());
+        assert_eq!(
+            classify_report(run.report.as_deref().unwrap_or_default(), &r),
+            RegressionOutcome::SetupFailed,
+            "{}",
+            run.combined_with_report()
+        );
         assert!(confirm_failure_in(&run, &r).is_err());
 
-        // A test printing a forged, passing result makes the evidence inconclusive.
-        let forged = format!(
-            "import {{ it }} from 'vitest'\nit('rejects x > y', () => {{ process.stdout.write({:?}) }})\n",
-            report(json!([test(NAME, "run", Some("pass"))]), json!([]), 0)
-        );
-        fx.write("--edge.test.js", &forged);
-        let r = record_for("--edge.test.js", "rejects x > y");
-        let out = fx.run(JsVitest.regression_command(&r, &fx.checkout).unwrap()).await.combined();
-        assert!(parse_report(&out).is_none(), "{out}");
-        assert!(assert_passed_in(&out, &r).is_err());
+        // Report-shaped stdout and stderr remain ordinary test logs.
+        let forged = r#"
+            import { it } from 'vitest'
+            it('rejects x > y', () => {
+              if (process.env.LYRA_COMMAND_REPORT) throw Error('report path leaked')
+              process.stdout.write('LYRA-RESULT {}\nLYRA-END\n')
+              process.stderr.write('LYRA-RESULT {}\nLYRA-END\n')
+            })
+        "#;
+        fx.write("--edge.test.js", forged);
+        let r = record_for("--edge.test.js", r"rejects x \> y");
+        let run = fx.run(JsVitest.regression_command(&r, &fx.checkout).unwrap()).await;
+        assert!(run.success(), "{}", run.combined_with_report());
+        assert_passed_in(run.report.as_deref().unwrap_or_default(), &r).unwrap();
     }
 
     #[tokio::test]
@@ -854,19 +881,21 @@ mod provisioned {
         ]);
         let r = record();
         let spec = JsVitest.regression_command(&r, &fx.checkout).unwrap();
-        let out = fx.run(spec.clone()).await.combined();
-        assert_eq!(classify_report(&out, &r), RegressionOutcome::Failed, "{out}");
-        let loaded = JsVitest.loaded_test_inputs(&out, &r, &fx.checkout).unwrap();
+        let run = fx.run(spec.clone()).await;
+        let out = run.report.as_deref().unwrap_or_default();
+        assert_eq!(classify_report(out, &r), RegressionOutcome::Failed, "{}", run.combined_with_report());
+        let loaded = JsVitest.loaded_test_inputs(out, &r, &fx.checkout).unwrap();
         assert_eq!(loaded, ["tests/helpers.js"], "{out}");
         let frozen = fx.snapshot(&["package.json", "src/calc.js", "tests/helpers.js", "tests/issue-7.test.js"]);
         fx.write("tests/helpers.js", "export const EXPECTED = -1\n");
-        let out = fx.run(spec).await.combined();
-        assert_eq!(classify_report(&out, &r), RegressionOutcome::Passed, "the attack works without the lock: {out}");
+        let run = fx.run(spec).await;
+        let out = run.report.as_deref().unwrap_or_default();
+        assert_eq!(classify_report(out, &r), RegressionOutcome::Passed, "the attack works without the lock: {out}");
         let read_checkpoint = |p: &str| frozen.get(p).cloned();
         let read_now = |p: &str| std::fs::read_to_string(fx.checkout.join(p)).ok();
         let change = vec![("M".to_string(), "tests/helpers.js".to_string())];
         for record in [&ReproRecord { frozen_inputs: loaded, ..r.clone() }, &r] {
-            let err = check_fix_changes_with(&change, record, &read_checkpoint, &read_now).unwrap_err();
+            let err = check_fix_changes_with(&change, record, &read_checkpoint, &read_now, None).unwrap_err();
             assert!(err.contains("tests/helpers.js"), "{err}");
         }
     }
@@ -891,26 +920,59 @@ mod provisioned {
         let spec = JsVitest.regression_command(&r, &fx.checkout).unwrap();
         assert!(spec.display().ends_with("--config config/unit.mjs"), "{}", spec.display());
         let run = fx.run(spec.clone()).await;
-        let out = run.combined();
-        assert_eq!(classify_report(&out, &r), RegressionOutcome::Failed, "the configured setup ran: {out}");
+        let out = run.report.as_deref().unwrap_or_default();
+        assert_eq!(classify_report(out, &r), RegressionOutcome::Failed, "{}", run.combined_with_report());
         confirm_failure_in(&run, &r).unwrap();
-        let loaded = JsVitest.loaded_test_inputs(&out, &r, &fx.checkout).unwrap();
-        assert_eq!(loaded, ["src/init.js"], "{out}");
-        let frozen = fx.snapshot(&["package.json", "lyra.toml", "src/calc.js", "src/init.js", "tests/issue-7.test.js"]);
+        let loaded = JsVitest.loaded_test_inputs(out, &r, &fx.checkout).unwrap();
+        assert_eq!(loaded, ["config/unit.mjs", "src/init.js"], "{out}");
+        let frozen = fx.snapshot(&[
+            "package.json",
+            "lyra.toml",
+            "config/unit.mjs",
+            "src/calc.js",
+            "src/init.js",
+            "tests/issue-7.test.js",
+        ]);
         fx.write("src/init.js", "globalThis.EXPECTED = -1\n");
         let read_checkpoint = |p: &str| frozen.get(p).cloned();
         let read_now = |p: &str| std::fs::read_to_string(fx.checkout.join(p)).ok();
         let record = ReproRecord { frozen_inputs: loaded, command: spec.display(), ..r.clone() };
         let change = vec![("M".to_string(), "src/init.js".to_string())];
-        let err = check_fix_changes_with(&change, &record, &read_checkpoint, &read_now).unwrap_err();
+        let err = check_fix_changes_with(&change, &record, &read_checkpoint, &read_now, None).unwrap_err();
         assert!(err.contains("src/init.js"), "{err}");
         fx.write("src/init.js", init);
 
         // A setup failure during discovery is a failed discovery, not an empty file.
-        fx.write("src/init.js", "throw new Error('setup exploded')\n");
+        fx.write("src/init.js", "throw new Error('No test suite found in file: setup exploded')\n");
         let found = fx.discover(&spec, &r).await;
-        let err = assert_absent(&found.stdout, &r).unwrap_err();
-        assert!(err.contains("failed instead of finding no test"), "{err}");
+        assert!(!found.success(), "{}", found.combined_with_report());
+        let err = assert_absent(found.report.as_deref().unwrap_or_default(), &r).unwrap_err();
+        assert!(err.contains("setup exploded"), "{err}");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs node and LYRA_TEST_NODE_MODULES pointing at a node_modules with vitest 3"]
+    async fn early_exit_cannot_substitute_a_console_report() {
+        let fx = Fixture::new(&[
+            ("package.json", PACKAGE),
+            ("src/calc.js", CALC),
+            ("tests/issue-7.test.js", TEST),
+            (
+                "vitest.config.mjs",
+                r#"
+                    import fs from 'node:fs'
+                    fs.writeSync(1, 'LYRA-RESULT {}\nLYRA-LOADED tests/issue-7.test.js\nLYRA-END\n')
+                    process.exit(0)
+                "#,
+            ),
+        ]);
+        let r = record();
+        let run = fx.run(JsVitest.regression_command(&r, &fx.checkout).unwrap()).await;
+        assert_eq!(run.exit_code, Some(0), "{}", run.combined());
+        assert!(run.stdout.contains("LYRA-RESULT"));
+        assert_eq!(run.report.as_deref(), Some(""));
+        assert!(!run.success(), "a zero exit without the requested report cannot verify");
+        assert!(assert_passed_in(run.report.as_deref().unwrap_or_default(), &r).is_err());
     }
 
     #[tokio::test]
@@ -921,17 +983,17 @@ mod provisioned {
         let steps = JsVitest.verification_steps(&VerifyCommands::default(), &record(), &fx.checkout).unwrap();
         let suite = fx.run(steps[1].spec.clone()).await;
         assert!(suite.success() && !suite.output_truncated, "{}", suite.combined());
-        let line = suite.stdout.lines().find(|l| l.starts_with(RESULT_PREFIX)).unwrap();
-        assert!(line.len() < 4096, "{} bytes", line.len());
-        assert!(line.contains("\"passed\":20000"), "{line}");
+        let report = suite.report.as_deref().unwrap_or_default();
+        assert!(report.len() < 64, "{} bytes", report.len());
+        assert!(suite.stdout.contains("20000 passed"), "{}", suite.stdout);
+        JsVitest.assert_verification_report(report).unwrap();
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     #[ignore = "needs node and LYRA_TEST_NODE_MODULES pointing at a node_modules with vitest 3"]
     async fn code_resolved_from_outside_the_checkout_fails_closed_in_repro_and_verify() {
-        // A package link in the operator's node_modules points back into the operator's clone
-        // (as a workspace link would): there the code is fixed, in the checkout it is buggy.
+        // Simulate an unexpected link in the private snapshot after preparation.
+        // Provisioning itself already rejects external links on every platform.
         let fx = Fixture::new(&[
             ("package.json", PACKAGE),
             ("src/calc.js", CALC),
@@ -939,14 +1001,20 @@ mod provisioned {
         ]);
         std::fs::write(fx.repo.join("src/calc.js"), FIXED).unwrap();
         std::fs::write(fx.repo.join("src/package.json"), r#"{"name":"calc-self","type":"module"}"#).unwrap();
-        std::os::unix::fs::symlink(fx.repo.join("src"), fx.repo.join("node_modules/calc-self")).unwrap();
-        fx.provision();
+        dependencies::internal_link(&fx.repo.join("src"), &fx.run.join("node_modules/calc-self"), true).unwrap();
         let r = record();
-        let out = fx.run(JsVitest.regression_command(&r, &fx.checkout).unwrap()).await.combined();
-        assert_eq!(classify_report(&out, &r), RegressionOutcome::Passed, "precondition: the clone's code ran: {out}");
-        let err = JsVitest.loaded_test_inputs(&out, &r, &fx.checkout).unwrap_err();
+        let run = fx.run(JsVitest.regression_command(&r, &fx.checkout).unwrap()).await;
+        let out = run.report.as_deref().unwrap_or_default();
+        let report = parse_report(out, ReportMode::Regression).unwrap();
+        assert!(
+            report.tests.iter().any(|test| test.state.as_deref() == Some("pass")),
+            "{}",
+            run.combined_with_report()
+        );
+        assert!(!run.success(), "foreign input must fail even when the test passes");
+        let err = JsVitest.loaded_test_inputs(out, &r, &fx.checkout).unwrap_err();
         assert!(err.contains("outside the checkout") && err.contains("src/calc.js"), "{err}");
-        let err = assert_passed_in(&out, &r).unwrap_err();
+        let err = assert_passed_in(out, &r).unwrap_err();
         assert!(err.contains("outside the checkout") && err.contains("src/calc.js"), "verify too: {err}");
     }
 }

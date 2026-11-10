@@ -147,6 +147,7 @@ impl ExecutionProfile for RustCargo {
         rec: &ReproRecord,
         read_checkpoint: FileReader<'_>,
         read_now: FileReader<'_>,
+        _checkpoint_paths: Option<&std::collections::BTreeSet<String>>,
     ) -> Result<(), String> {
         check_fix_changes_with(changes, rec, read_checkpoint, read_now)
     }

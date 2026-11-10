@@ -83,7 +83,8 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
     git::verification_worktree(&source, &worktree, &candidate)
         .map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
     profile
-        .provision_dependencies(&ctx.state.request.repo, &worktree)
+        .provision_dependencies(&ctx.state.request.repo, &worktree, &ctx.cancel)
+        .await
         .map_err(|reason| StageError::new(ErrorKind::Config, reason))?;
     ctx.events.info(format!("verify: isolated checkout at {}", worktree.display()));
     let outcome = verify_checkout(ctx, &*profile, &rec, &candidate, &worktree, &root).await;
@@ -208,15 +209,14 @@ async fn verify_checkout(
             .await
             .map_err(|e| StageError::from_anyhow(ErrorKind::Tool, e))?;
         let output = run.combined();
-        let log = write(ctx, step.log, &output)?;
-        let mut ok = run.success();
-        let mut reason: Option<String> = None;
-        if step.regression {
-            if let Err(e) = profile.assert_passed(&output, rec) {
-                ok = false;
-                reason = Some(e);
-            }
-        }
+        let log = write(ctx, step.log, run.combined_with_report())?;
+        let evidence = if step.regression {
+            profile.assert_passed(run.report.as_deref().unwrap_or(&output), rec)
+        } else {
+            run.report.as_deref().map_or(Ok(()), |report| profile.assert_verification_report(report))
+        };
+        let ok = run.success() && evidence.is_ok();
+        let reason = evidence.err();
         result.steps.push(StepResult {
             name: step.name.to_string(),
             command: spec.display(),
@@ -488,6 +488,49 @@ mod tests {
         assert!(!git::run(&source, &["worktree", "list", "--porcelain"])
             .unwrap()
             .contains(&path.to_string_lossy().replace('\\', "/")));
+    }
+
+    #[tokio::test]
+    async fn javascript_verification_cleanup_keeps_the_operator_install_intact() {
+        use crate::profile::js_vitest::JsVitest;
+
+        let temporary = tempfile::Builder::new().prefix("lyra verify & cleanup ").tempdir().unwrap();
+        let source = temporary.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        git::run(&source, &["init", "-q"]).unwrap();
+        git::run(&source, &["config", "user.name", "LYRA test"]).unwrap();
+        git::run(&source, &["config", "user.email", "lyra-test@example.invalid"]).unwrap();
+        std::fs::write(source.join("package.json"), "{}").unwrap();
+        let candidate = git::commit_all(&source, "fixture").unwrap();
+        let package = "node_modules/vitest/package.json";
+        std::fs::create_dir_all(source.join("node_modules/vitest")).unwrap();
+        std::fs::write(source.join(package), r#"{"name":"vitest","version":"3.2.4"}"#).unwrap();
+
+        let intake = tempfile::tempdir_in(temporary.path()).unwrap();
+        let intake_checkout = intake.path().join("worktree");
+        std::fs::create_dir(&intake_checkout).unwrap();
+        std::fs::copy(source.join("package.json"), intake_checkout.join("package.json")).unwrap();
+        let cancel = CancellationToken::new();
+        JsVitest.provision_dependencies(&source, &intake_checkout, &cancel).await.unwrap();
+        std::fs::write(intake.path().join(package), "changed at Intake").unwrap();
+
+        let root = temporary.path().join("verification");
+        let path = root.join("checkout");
+        JsVitest.create_environment(&root).unwrap();
+        let cleanup = VerificationWorktree {
+            source: source.clone(),
+            root: root.clone(),
+            path: path.clone(),
+            timeout: Duration::from_secs(10),
+        };
+        git::verification_worktree(&source, &path, &candidate).unwrap();
+        JsVitest.provision_dependencies(&source, &path, &cancel).await.unwrap();
+        assert_eq!(std::fs::read_to_string(root.join(package)).unwrap(), r#"{"name":"vitest","version":"3.2.4"}"#);
+
+        drop(cleanup);
+        assert!(!root.exists(), "verification dependencies and checkout must be removed");
+        intake.close().unwrap();
+        assert_eq!(std::fs::read_to_string(source.join(package)).unwrap(), r#"{"name":"vitest","version":"3.2.4"}"#);
     }
 
     fn fixture_state(repository: &Path, id: &str, issue: &str) -> crate::state::RunState {

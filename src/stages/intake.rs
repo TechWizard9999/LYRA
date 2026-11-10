@@ -118,7 +118,8 @@ async fn intake(ctx: &mut StageCtx) -> Result<(), StageError> {
     // Retryable: installing the repository's dependencies fixes it.
     resolution
         .profile
-        .provision_dependencies(&repo, &wt)
+        .provision_dependencies(&repo, &wt, &ctx.cancel)
+        .await
         .map_err(|reason| StageError::new(ErrorKind::Config, reason))?;
     let p = ctx.run_dir.write_json("profile.json", &resolution.artifact()).map_err(io_err)?;
     ctx.events.artifact(p);

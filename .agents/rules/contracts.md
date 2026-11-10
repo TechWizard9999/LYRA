@@ -29,7 +29,7 @@ A change to one needs a **"Contract change"** note in the PR description (what c
 ## Config
 
 - New config keys have defaults so an existing `~/.lyra/config.toml` still loads. Update the default text written by `Config::ensure_default`, README's Configuration section, and PLAN §7.
-- Per-repo `lyra.toml` may override verify commands only (`[verify]` for `rust-cargo`, `[profiles.<id>.verify]` for any profile) plus the profiles' own production-code declarations (`packages` for `python-pytest`, `sources` for `js-vitest`). Don't widen that.
+- Per-repo `lyra.toml` may override verify commands only (`[verify]` for `rust-cargo`, `[profiles.<id>.verify]` for any profile) plus the profiles' own production-code declarations (`packages` for `python-pytest`, `sources` for `js-vitest`). The Vitest profile also accepts its checkout-relative `config` file. Keep this set scoped to the active profile.
 - The `ExecutionProfile` trait (`src/profile/mod.rs`) is shared by every stage: a new method needs a default so the other profiles keep compiling, and a PR note.
 
 ## Docs to update with a contract change
