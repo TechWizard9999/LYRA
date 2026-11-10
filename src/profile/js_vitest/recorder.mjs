@@ -11,10 +11,13 @@ const mode = process.env.LYRA_VITEST_MODE || 'regression'
 delete process.env.LYRA_COMMAND_REPORT
 delete process.env.LYRA_VITEST_MODE
 
-const realpath = fs.realpathSync
+// On Windows, the native resolver expands 8.3 aliases before we compare paths.
+const realpath = process.platform === 'win32' ? fs.realpathSync.native : fs.realpathSync
 const writeFile = fs.writeFileSync
 const root = realpath(process.cwd())
+if (process.platform === 'win32') process.chdir(root)
 const relative = (base, p) => path.relative(base, p).split(path.sep).join('/')
+const testPath = file => relative(root, realpath(file.filepath))
 const contains = (base, p) => {
   const rel = relative(base, p)
   return rel !== '..' && !rel.startsWith('../') && !path.isAbsolute(rel)
@@ -74,7 +77,7 @@ function summarize(files) {
     const names = task === task.file ? parents : [...parents, task.name]
     for (const child of task.tasks || []) walk(child, file, names)
   }
-  for (const file of files) walk(file, relative(root, file.filepath), [])
+  for (const file of files) walk(file, testPath(file), [])
   return { tests, suiteErrors, passed, failed, firstFailure }
 }
 
@@ -152,7 +155,7 @@ try {
     await vitest.start()
   } else {
     const selected = realpath(path.resolve(root, file))
-    const specs = (await vitest.globTestSpecifications([selected])).filter(spec => {
+    const specs = (await vitest.globTestSpecifications()).filter(spec => {
       return path.relative(selected, realpath(spec.moduleId)) === ''
     })
     if (specs.length !== 1) throw new Error('Vitest must discover exactly one specification for ' + file)
@@ -173,7 +176,7 @@ try {
   if (mode === 'suite') {
     console.log('Vitest suite: ' + summary.passed + ' passed, ' + summary.failed + ' failed, ' + unhandled + ' unhandled errors')
     if (summary.firstFailure) console.error('FAIL ' + summary.firstFailure.filter(Boolean).join(' > ').slice(0, 1000))
-    if (paths.foreign.length) console.error('FAIL Vitest resolved a module from the operator checkout: ' + paths.foreign[0])
+    if (paths.foreign.length) console.error('FAIL Vitest resolved a module outside the checkout and its isolated node_modules: ' + paths.foreign[0])
   }
   await vitest.close()
   vitest = null
@@ -181,7 +184,7 @@ try {
   if (summary.failed || unhandled || paths.foreign.length || (mode === 'suite' && !summary.passed)) exitCode = 1
   const report = mode === 'suite'
     ? { version: 1, mode }
-    : { version: 1, mode, collected: files.map(file => relative(root, file.filepath)), tests: summary.tests, suiteErrors: summary.suiteErrors, unhandled, ...paths }
+    : { version: 1, mode, collected: files.map(testPath), tests: summary.tests, suiteErrors: summary.suiteErrors, unhandled, ...paths }
   writeFile(reportPath, JSON.stringify(report), { encoding: 'utf8', flag: 'r+' })
 } catch (error) {
   console.error('LYRA-STARTUP-ERROR ' + String(error?.stack || error))
