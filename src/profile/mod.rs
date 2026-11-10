@@ -139,8 +139,9 @@ pub trait ExecutionProfile: Send + Sync {
 
     /// Profile-specific checks on the agent's record (selector syntax, test file type).
     fn validate_record(&self, rec: &ReproRecord) -> Result<(), String>;
-    /// The one command that runs exactly the selected test, as a display line.
-    fn regression_command_line(&self, rec: &ReproRecord) -> String;
+    /// The one command that runs exactly the selected test, as a display line; `worktree` holds
+    /// the repository settings it may name (the Vitest configuration file).
+    fn regression_command_line(&self, rec: &ReproRecord, worktree: &Path) -> String;
     /// The same command with validated selectors as separate arguments.
     fn regression_command(&self, rec: &ReproRecord, cwd: &Path) -> Result<CommandSpec, String>;
     /// Turns a regression command into its discovery-only form.
@@ -193,14 +194,16 @@ pub trait ExecutionProfile: Send + Sync {
 
     // --- environments --------------------------------------------------------------
 
-    /// S2: where build outputs of the agent's worktree go (outside the worktree).
-    /// Makes the repository's installed dependencies reachable from a checkout created below
-    /// `checkout_parent` without changing anything inside it (the JavaScript profile links
-    /// `node_modules` there, where Node's upward resolution finds it). Called for the run's
-    /// worktree at Intake and for each verification checkout. Default: nothing to link.
-    fn link_dependencies(&self, _source_repo: &Path, _checkout_parent: &Path) -> Result<(), String> {
+    /// Makes the repository's installed dependencies available to `checkout` without changing
+    /// anything inside it and without sharing anything the run can write with the operator's
+    /// install (the JavaScript profile copies `node_modules` next to the checkout, where Node's
+    /// upward resolution finds it). Refuses an install that does not match the checkout's
+    /// manifests. Called for the run's worktree at Intake and for each verification checkout,
+    /// after it exists. Default: nothing to provide.
+    fn provision_dependencies(&self, _source_repo: &Path, _checkout: &Path) -> Result<(), String> {
         Ok(())
     }
+    /// S2: where build outputs of the agent's worktree go (outside the worktree).
     fn reproduction_environment(&self, spec: CommandSpec, run_root: &Path) -> CommandSpec;
     /// Rejects a checkout location whose ancestors would inject toolchain configuration.
     fn check_environment_root(&self, checkout: &Path) -> Result<(), String>;

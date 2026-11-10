@@ -80,11 +80,11 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
         timeout: ctx.timeout(),
     };
     profile.create_environment(&root).map_err(|e| StageError::new(ErrorKind::Io, e.to_string()))?;
-    profile
-        .link_dependencies(&ctx.state.request.repo, &root)
-        .map_err(|reason| StageError::new(ErrorKind::Config, reason))?;
     git::verification_worktree(&source, &worktree, &candidate)
         .map_err(|e| StageError::from_anyhow(ErrorKind::Git, e))?;
+    profile
+        .provision_dependencies(&ctx.state.request.repo, &worktree)
+        .map_err(|reason| StageError::new(ErrorKind::Config, reason))?;
     ctx.events.info(format!("verify: isolated checkout at {}", worktree.display()));
     let outcome = verify_checkout(ctx, &*profile, &rec, &candidate, &worktree, &root).await;
     drop(cleanup);

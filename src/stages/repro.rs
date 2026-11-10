@@ -96,7 +96,7 @@ async fn run_inner(ctx: &mut StageCtx) -> Result<StageOutcome, StageError> {
         .map_err(|msg| StageError::new(ErrorKind::Guard, msg).with_details(&transcript))?;
     rec.test_file = guards::norm_path(&rec.test_file);
     rec.registration_file = rec.registration_file.as_deref().map(guards::norm_path);
-    rec.command = profile.regression_command_line(&rec);
+    rec.command = profile.regression_command_line(&rec, &worktree);
     // Fields supplied by the model cannot claim that a checkpoint already exists.
     rec.frozen_commit = None;
     rec.frozen_len = None;

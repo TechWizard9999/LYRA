@@ -644,7 +644,7 @@ new file mode 100644
             } else {
                 "issue_123_rejects_short_frame".into()
             };
-            record.command = profile.regression_command_line(&record);
+            record.command = profile.regression_command_line(&record, wt);
             record.frozen_inputs = vec![fixture.into()];
             let checkpoint = git::commit_all(wt, "test: failing repro for #123").unwrap();
 

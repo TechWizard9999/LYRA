@@ -293,7 +293,7 @@ mod tests {
             profile: Some("python-pytest".into()),
             frozen_inputs: Vec::new(),
         };
-        let command = PythonPytest.regression_command_line(&rec);
+        let command = PythonPytest.regression_command_line(&rec, Path::new("/w"));
         let executed = PythonPytest.regression_command(&rec, Path::new("/w")).unwrap();
         assert!(executed.args.iter().any(|a| a.contains('\n')), "the recorder really is multi-line");
         assert_eq!(executed.display(), command);

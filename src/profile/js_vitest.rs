@@ -21,7 +21,7 @@ use crate::proc::{self, CommandOutput, CommandSpec};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -48,63 +48,120 @@ const BUILD_OUTPUT: [&str; 4] = ["dist", "build", "out", "coverage"];
 const TEST_DIRS: [&str; 9] =
     ["test", "tests", "__tests__", "__mocks__", "__snapshots__", "__fixtures__", "fixtures", "testdata", "test_data"];
 
-/// The recorder: runs Vitest in-process and reports, after the run, a JSON summary of every
-/// test (its full name below the file, mode, state and error messages), file-level errors
-/// and unhandled errors, then every module the run loaded from inside the checkout
-/// (`LYRA-LOADED`) and every one loaded from the operator's clone outside its `node_modules`
-/// (`LYRA-FOREIGN`), then `LYRA-END`. Arguments: test file filter, name pattern (both may be
-/// empty). `LYRA_VITEST_CACHE` moves Vite's cache out of the shared `node_modules`;
-/// `LYRA_VITEST_MODE=discover` exits 0 once the report is printed (an empty run is evidence).
-/// The exit status is otherwise Vitest's.
-const RECORDER: &str = r#"import { startVitest } from 'vitest/node'
-import fs from 'node:fs'
+/// The recorder: runs Vitest 3 in-process through its Node API and, after the run, prints its
+/// evidence in one write: one `LYRA-RESULT` JSON line, then every module the run loaded from
+/// inside the checkout (`LYRA-LOADED`) and every one loaded from anywhere other than the
+/// checkout and the run's own `node_modules` (`LYRA-FOREIGN`), then `LYRA-END`. The parser
+/// accepts exactly one result line and one end marker, so a test printing a result-shaped line
+/// makes the run inconclusive rather than forging it.
+///
+/// Arguments after `--`: test file, name pattern, config file (each may be empty). The test
+/// file is selected exactly (Vitest's own file filter matches substrings). With a test file,
+/// the result lists every executed test and every test the pattern matches (discovery: every
+/// test in the file); without one (the suite) it holds only counts, so a large suite stays a
+/// short line. Errors are capped. `LYRA_VITEST_CACHE` moves Vite's cache into the run;
+/// `LYRA_VITEST_MODE=discover` exits 0 once the report is complete. Otherwise the exit status
+/// is 1 when any test failed, any file, suite hook or unhandled error was reported or nothing
+/// ran, 2 when Vitest did not start, else 0.
+const RECORDER: &str = r#"import fs from 'node:fs'
 import path from 'node:path'
-const [file, pattern] = process.argv.slice(1)
+import { createRequire } from 'node:module'
+const [file, pattern, config] = process.argv.slice(1)
+const mode = process.env.LYRA_VITEST_MODE
 const root = fs.realpathSync(process.cwd())
-let operator = null
-try { operator = path.dirname(fs.realpathSync(path.join(root, '..', 'node_modules'))) } catch {}
+const win = process.platform === 'win32'
+const key = p => win ? p.toLowerCase() : p
+const inside = (p, dir) => key(p) === key(dir) || key(p).startsWith(key(dir) + path.sep)
 const rel = p => path.relative(root, p).split(path.sep).join('/')
-const inside = (p, dir) => p === dir || p.startsWith(dir + path.sep)
-let vitest
+const real = p => { try { return fs.realpathSync(p) } catch { return null } }
+const deps = real(path.join(path.dirname(root), 'node_modules'))
+const text = e => String(e && (e.message || e.stack) || e).slice(0, 2000)
+const errs = r => (r && r.errors || []).slice(0, 10).map(text)
+let vitest = null
+let startup = null
+let version = null
 try {
-  vitest = await startVitest('test', file ? [file] : [], {
-    run: true, watch: false, color: false, passWithNoTests: false,
-    testNamePattern: pattern || undefined,
-    reporters: ['default'],
-  }, { cacheDir: process.env.LYRA_VITEST_CACHE || undefined, logLevel: 'error' })
-} catch (error) {
-  console.error('LYRA-STARTUP-ERROR ' + String(error && error.stack || error))
+  version = JSON.parse(fs.readFileSync(createRequire(path.join(root, 'package.json')).resolve('vitest/package.json'), 'utf8')).version
+  if (!/^3\./.test(version)) startup = 'Vitest ' + version + ' is installed; the js-vitest profile supports Vitest 3.x'
+} catch (error) { startup = 'cannot resolve vitest: ' + text(error) }
+if (!startup) {
+  try {
+    const { createVitest } = await import('vitest/node')
+    process.env.TEST = 'true'
+    process.env.VITEST = 'true'
+    process.env.NODE_ENV ??= 'test'
+    vitest = await createVitest('test', {
+      run: true, watch: false, color: false, passWithNoTests: true,
+      testNamePattern: pattern || undefined, config: config || undefined, reporters: ['default'],
+    }, { cacheDir: process.env.LYRA_VITEST_CACHE || undefined, logLevel: 'error' })
+    await vitest.init()
+    let specs = await vitest.globTestSpecifications(file ? [file] : [])
+    if (file) {
+      const wanted = real(path.join(root, file))
+      specs = specs.filter(s => wanted && real(s.moduleId) && key(real(s.moduleId)) === key(wanted))
+    }
+    if (specs.length) await vitest.runTestSpecifications(specs, !file)
+  } catch (error) {
+    startup = text(error && error.stack || error)
+  }
 }
+const started = !!vitest && !startup
 const files = vitest ? vitest.state.getFiles() : []
+let matcher = null
+try { matcher = pattern ? new RegExp(pattern) : null } catch {}
 const tests = []
+const suiteErrors = []
+const counts = { passed: 0, failed: 0, other: 0 }
 const walk = (task, names) => {
   if (task.type === 'test') {
-    tests.push({ file: rel(task.file ? task.file.filepath : ''), name: [...names, task.name].join(' > '), mode: task.mode, state: task.result ? task.result.state : null, errors: (task.result && task.result.errors || []).map(e => String(e && e.message || e)) })
+    const state = task.result ? task.result.state : null
+    if (state === 'pass') counts.passed++
+    else if (state === 'fail') counts.failed++
+    else counts.other++
+    const full = [...names, task.name]
+    if (file && (mode === 'discover' || state === 'pass' || state === 'fail' || (matcher && matcher.test(full.join(' ')))))
+      tests.push({ file: rel(task.file ? task.file.filepath : ''), name: full.join(' > '), mode: task.mode, state, errors: errs(task.result) })
     return
   }
-  for (const child of task.tasks || []) walk(child, task.type === 'suite' && task.file !== task ? [...names, task.name] : names)
+  const suite = task.type === 'suite' && task.file !== task
+  if (suite && errs(task.result).length)
+    suiteErrors.push({ file: rel(task.file ? task.file.filepath : ''), name: [...names, task.name].join(' > '), errors: errs(task.result) })
+  for (const child of task.tasks || []) walk(child, suite ? [...names, task.name] : names)
 }
 for (const f of files) walk(f, [])
-const fileErrors = files.filter(f => (f.result && f.result.errors || []).length).map(f => ({ file: rel(f.filepath), errors: f.result.errors.map(e => String(e && e.message || e)) }))
-const unhandled = vitest && vitest.state.getUnhandledErrors ? vitest.state.getUnhandledErrors().length : 0
-console.log('LYRA-RESULT ' + JSON.stringify({ tests, fileErrors, unhandled, started: !!vitest }))
+const fileErrors = files.filter(f => errs(f.result).length).map(f => ({ file: rel(f.filepath), errors: errs(f.result) }))
+const unhandled = vitest ? vitest.state.getUnhandledErrors().length : 0
 const loaded = new Set()
+const setup = new Set()
+let graph = started
 for (const project of vitest ? vitest.projects : []) {
-  const graph = project.vite && project.vite.moduleGraph
-  for (const id of graph ? graph.idToModuleMap.keys() : []) loaded.add(id)
+  for (const p of [].concat(project.config.setupFiles || [], project.config.globalSetup || [])) {
+    const r = typeof p === 'string' ? real(path.resolve(project.config.root, p)) : null
+    if (r && inside(r, root)) setup.add(rel(r))
+  }
+  const modules = project.vite && project.vite.moduleGraph && project.vite.moduleGraph.idToModuleMap
+  if (!modules) graph = false
+  else for (const id of modules.keys()) loaded.add(id)
 }
-for (const id of loaded) {
-  if (typeof id !== 'string' || id.startsWith('\0')) continue
-  let real = id.split('?')[0]
-  if (!path.isAbsolute(real)) continue
-  try { real = fs.realpathSync(real) } catch { continue }
-  if (inside(real, root)) console.log('LYRA-LOADED ' + rel(real))
-  else if (operator && inside(real, operator) && !inside(real, path.join(operator, 'node_modules'))) console.log('LYRA-FOREIGN ' + real)
+const lines = ['LYRA-RESULT ' + JSON.stringify({
+  started, version, graph, suite: !file, collected: file ? files.map(f => rel(f.filepath)) : [], tests, counts,
+  fileErrors, suiteErrors, unhandled, setup: [...setup],
+})]
+if (file) {
+  for (const id of loaded) {
+    if (typeof id !== 'string' || id.startsWith('\0') || !path.isAbsolute(id.split('?')[0])) continue
+    const r = real(id.split('?')[0])
+    if (!r) continue
+    if (inside(r, root)) lines.push('LYRA-LOADED ' + rel(r))
+    else if (!(deps && inside(r, deps))) lines.push('LYRA-FOREIGN ' + r)
+  }
 }
-console.log('LYRA-END')
-if (vitest) await vitest.close()
-if (process.env.LYRA_VITEST_MODE === 'discover' && vitest) process.exit(0)
-process.exit(vitest ? (process.exitCode ?? 0) : 2)"#;
+lines.push('LYRA-END')
+if (vitest) await vitest.close().catch(() => {})
+if (startup) console.error('LYRA-STARTUP-ERROR ' + startup.split('\n')[0])
+const failed = counts.failed || fileErrors.length || suiteErrors.length || unhandled || !(counts.passed + counts.failed)
+const code = !started ? 2 : mode === 'discover' ? 0 : failed ? 1 : 0
+process.stdout.write(lines.join('\n') + '\n', () => process.exit(code))"#;
 const RESULT_PREFIX: &str = "LYRA-RESULT ";
 const LOADED_PREFIX: &str = "LYRA-LOADED ";
 const FOREIGN_PREFIX: &str = "LYRA-FOREIGN ";
@@ -165,18 +222,29 @@ fn workspaces(worktree: &Path) -> Option<&'static str> {
         .map(|_| "package.json workspaces")
 }
 
-fn extension(path: &str) -> Option<&str> {
+/// Path components compare case-insensitively: on the default Windows and macOS filesystems
+/// `Node_Modules` or `Tests` is the same directory as `node_modules` or `tests`, so every rule
+/// that names a file or directory matches any case, on every platform (stricter, never looser).
+fn lower(path: &str) -> String {
+    path.to_ascii_lowercase()
+}
+
+fn has_component(path: &str, names: &[&str]) -> bool {
+    lower(path).split('/').any(|c| names.contains(&c))
+}
+
+fn extension(path: &str) -> Option<String> {
     let name = guards::base_name(path);
-    name.rsplit_once('.').map(|(_, ext)| ext)
+    name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase())
 }
 
 fn is_source_code(path: &str) -> bool {
-    extension(path).is_some_and(|ext| SOURCE_EXTENSIONS.contains(&ext))
+    extension(path).is_some_and(|ext| SOURCE_EXTENSIONS.contains(&ext.as_str()))
 }
 
 /// A test-named module: `*.test.*` / `*.spec.*` with a source extension.
 fn is_test_module(path: &str) -> bool {
-    let name = guards::base_name(path);
+    let name = lower(guards::base_name(path));
     is_source_code(path) && (name.contains(".test.") || name.contains(".spec."))
 }
 
@@ -203,9 +271,10 @@ fn is_setup_file(path: &str) -> bool {
 /// Test infrastructure anywhere: test modules, setup files, snapshots, and every file below a
 /// test, mock, snapshot or fixture directory, also inside declared production code.
 fn is_test_infrastructure(path: &str) -> bool {
-    is_test_module(path)
-        || is_setup_file(path)
-        || guards::base_name(path).ends_with(".snap")
+    let path = lower(path);
+    is_test_module(&path)
+        || is_setup_file(&path)
+        || guards::base_name(&path).ends_with(".snap")
         || path.split('/').rev().skip(1).any(|dir| TEST_DIRS.contains(&dir))
 }
 
@@ -217,9 +286,10 @@ pub fn is_test_path(path: &str) -> bool {
 /// `package.json`, lockfiles, package-manager settings, TypeScript/Babel/SWC settings and
 /// every Vitest or Vite configuration; at the root also any `*.config.*` file.
 fn configuration_violation(path: &str) -> Option<&'static str> {
-    let name = guards::base_name(path);
+    let path = lower(path);
+    let name = guards::base_name(&path);
     let root = !path.contains('/');
-    if path.split('/').any(|c| c == "node_modules") {
+    if has_component(&path, &["node_modules"]) {
         return Some("dependencies cannot be added or changed inside the checkout");
     }
     if matches!(
@@ -269,24 +339,47 @@ enum Classification {
     Unknown,
 }
 
-/// What the repository declares as its production code, as top-level paths (directories or
-/// root files) that exist in the frozen checkout: the targets of `package.json` `main`,
-/// `module`, `browser`, `types`, `typings`, `bin` and `exports` and its `files` entries, the
-/// `rootDir` and `include` entries of `tsconfig.json`, and `sources = [...]` under
-/// `[profiles.js-vitest]` in the repository's `lyra.toml`. Build output named by the package
-/// entry points (`dist/`, `build/`, `out/`) is not code to edit; wildcard-only entries declare
-/// nothing.
+/// What the repository declares as its production code, each declaration at its own scope
+/// (a file, or a directory and everything below it) and only when it exists in the frozen
+/// checkout: the `package.json` `files` entries, the `rootDir` and `include` entries of
+/// `tsconfig.json`, and `sources = [...]` under `[profiles.js-vitest]` in the repository's
+/// `lyra.toml`, each exactly as written (a glob declares its literal directory prefix,
+/// `src/app/**/*.ts` declares `src/app`); and the directory holding each target of `main`,
+/// `module`, `browser`, `types`, `typings`, `bin` and `exports` (an entry point at the root
+/// declares only that file). Build output named by an entry point (`dist/`, `build/`, `out/`)
+/// is not code to edit; wildcard-only entries declare nothing; a declaration under a test,
+/// fixture or dependency directory declares nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProductionCode {
     roots: BTreeSet<String>,
     missing: BTreeSet<String>,
 }
 
-fn top_component(raw: &str) -> Option<String> {
-    let raw = raw.trim().trim_start_matches("./").trim_start_matches('/');
-    let top = raw.split('/').next()?.trim();
-    let literal: String = top.chars().take_while(|c| !matches!(c, '*' | '?' | '{' | '[' | '!')).collect();
-    (!literal.is_empty() && literal == top && top != "." && top != "..").then(|| top.to_string())
+/// The literal path a declaration names: normalized, cut before its first glob segment.
+fn declared_path(raw: &str) -> Option<String> {
+    let raw = raw.trim().replace('\\', "/");
+    let raw = raw.trim_start_matches("./").trim_start_matches('/');
+    let mut kept = Vec::new();
+    for segment in raw.split('/') {
+        if segment.contains(['*', '?', '{', '[', '!']) {
+            break;
+        }
+        match segment {
+            "" | "." => continue,
+            ".." => return None,
+            s => kept.push(s),
+        }
+    }
+    (!kept.is_empty()).then(|| kept.join("/"))
+}
+
+/// The scope an entry point declares: its directory, or the file itself at the root.
+fn entry_scope(raw: &str, read: FileReader<'_>) -> Option<String> {
+    let path = declared_path(raw)?;
+    if read(&format!("{path}/")).is_some() {
+        return Some(path);
+    }
+    Some(path.rsplit_once('/').map_or(path.clone(), |(dir, _)| dir.to_string()))
 }
 
 fn strings_in(value: &Value, out: &mut Vec<String>) {
@@ -341,8 +434,39 @@ fn strip_jsonc(text: &str) -> String {
             _ => out.push(c),
         }
     }
-    let trailing = regex::Regex::new(r",(\s*[}\]])").unwrap();
-    trailing.replace_all(&out, "$1").into_owned()
+    without_trailing_commas(&out)
+}
+
+/// Drops a comma followed (after whitespace) by `}` or `]`, outside strings only.
+fn without_trailing_commas(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            out.push(c);
+            if c == '\\' {
+                if let Some(&next) = chars.get(i + 1) {
+                    out.push(next);
+                    i += 1;
+                }
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+            out.push(c);
+        } else if c == ',' && chars[i + 1..].iter().find(|c| !c.is_whitespace()).is_some_and(|c| matches!(c, '}' | ']'))
+        {
+            // a trailing comma: dropped
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
+    out
 }
 
 impl ProductionCode {
@@ -369,34 +493,34 @@ impl ProductionCode {
                 strings_in(include, &mut explicit);
             }
         }
-        if let Some(doc) = read("lyra.toml").and_then(|t| t.parse::<toml::Value>().ok()) {
-            if let Some(sources) = doc.get("profiles").and_then(|p| p.get(ID)).and_then(|p| p.get("sources")) {
-                for s in sources.as_array().into_iter().flatten().filter_map(toml::Value::as_str) {
-                    explicit.push(s.to_string());
+        explicit.extend(repository_profile_list(read, "sources"));
+        for raw in entry_points {
+            if let Some(scope) = entry_scope(&raw, read) {
+                let top = scope.split('/').next().unwrap_or_default().to_ascii_lowercase();
+                if !BUILD_OUTPUT.contains(&top.as_str()) {
+                    code.add(&scope, read);
                 }
             }
         }
-        for raw in entry_points {
-            if let Some(top) = top_component(&raw).filter(|t| !BUILD_OUTPUT.contains(&t.as_str())) {
-                code.add(&top, read);
-            }
-        }
         for raw in explicit {
-            if let Some(top) = top_component(&raw) {
-                code.add(&top, read);
+            if let Some(path) = declared_path(&raw) {
+                code.add(&path, read);
             }
         }
         code
     }
 
-    fn add(&mut self, top: &str, read: FileReader<'_>) {
-        if TEST_DIRS.contains(&top) || GENERATED_DIRS.contains(&top) || configuration_violation(top).is_some() {
+    fn add(&mut self, path: &str, read: FileReader<'_>) {
+        if has_component(path, &TEST_DIRS)
+            || has_component(path, &GENERATED_DIRS)
+            || configuration_violation(path).is_some()
+        {
             return;
         }
-        if read(top).is_some() || read(&format!("{top}/")).is_some() {
-            self.roots.insert(top.to_string());
+        if read(path).is_some() || read(&format!("{path}/")).is_some() {
+            self.roots.insert(path.to_string());
         } else {
-            self.missing.insert(top.to_string());
+            self.missing.insert(path.to_string());
         }
     }
 
@@ -405,7 +529,9 @@ impl ProductionCode {
     }
 
     fn declares(&self, path: &str) -> bool {
-        self.roots.contains(path) || path.split_once('/').is_some_and(|(top, _)| self.roots.contains(top))
+        self.roots
+            .iter()
+            .any(|root| path == root || path.strip_prefix(root.as_str()).is_some_and(|r| r.starts_with('/')))
     }
 
     fn classify(&self, path: &str) -> Classification {
@@ -485,7 +611,8 @@ fn validate_test_file(test_file: &str) -> Result<String, String> {
         return Err(format!("test_file `{test_file}` must be a repository-relative path"));
     }
     let path = guards::norm_path(raw);
-    if path.is_empty() || path.split('/').any(|c| c == ".." || c.is_empty() || c == "node_modules") {
+    if path.is_empty() || path.split('/').any(|c| c == ".." || c.is_empty()) || has_component(&path, &["node_modules"])
+    {
         return Err(format!("test_file `{test_file}` must be a repository-relative path"));
     }
     if !is_test_module(&path) {
@@ -494,19 +621,109 @@ fn validate_test_file(test_file: &str) -> Result<String, String> {
     Ok(path)
 }
 
-/// Vitest's `-t` pattern for the full name: suite and test names are joined by a space; the
-/// pattern is anchored and every segment escaped, so only this exact name matches.
-fn name_pattern(segments: &[String]) -> String {
-    format!("^{}$", segments.iter().map(|s| regex::escape(s)).collect::<Vec<_>>().join(" "))
+/// Vitest's `-t` pattern for the full name. Vitest matches the suite and test names joined by
+/// a space; a title may itself contain ` > `, so each ` > ` in the recorded name matches either
+/// a separator or itself. The pattern is anchored and escaped; if it still selects another test
+/// as well, more than one test executes and the run is rejected.
+fn name_pattern(name: &str) -> String {
+    format!("^{}$", regex::escape(name).replace(" > ", "(?: | > )"))
 }
 
-/// The one-line, copyable command shown in `repro.json` and the pull request.
-fn regression_line(test_file: &str, segments: &[String]) -> String {
-    format!("npx vitest run {test_file} -t \"{}\"", name_pattern(segments).replace('"', "\\\""))
+/// The full name in its recorded form, segments trimmed and joined by ` > `.
+fn full_name(segments: &[String]) -> String {
+    segments.join(" > ")
 }
 
-fn recorder_spec(cwd: &Path, file: &str, pattern: &str) -> CommandSpec {
-    CommandSpec::new(NODE, cwd).args(["--input-type=module", "-e", RECORDER]).arg(file).arg(pattern)
+/// POSIX shell quoting for the displayed command: plain words stay as they are.
+fn sh_quote(word: &str) -> String {
+    if !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || "_./=:@%+,-".contains(c)) {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
+/// The one-line, copyable command shown in `repro.json` and the pull request, quoted for a
+/// POSIX shell (`sh`, `bash`, `zsh`). LYRA itself runs the recorder, which selects the test file
+/// exactly; Vitest's own file filter also matches longer paths that contain it.
+fn regression_line(test_file: &str, name: &str, config: Option<&str>) -> String {
+    let mut line = format!("npx vitest run {} -t {}", sh_quote(test_file), sh_quote(&name_pattern(name)));
+    if let Some(config) = config {
+        line.push_str(&format!(" --config {}", sh_quote(config)));
+    }
+    line
+}
+
+fn suite_line(test_file: Option<&str>, config: Option<&str>) -> String {
+    let mut line = "npx vitest run".to_string();
+    if let Some(file) = test_file {
+        line.push_str(&format!(" {}", sh_quote(file)));
+    }
+    if let Some(config) = config {
+        line.push_str(&format!(" --config {}", sh_quote(config)));
+    }
+    line
+}
+
+/// `node --input-type=module -e <recorder> -- <file> <pattern> <config>`: `--` ends Node's
+/// options, so a selector such as `--sample.test.js` stays an argument.
+fn recorder_spec(cwd: &Path, file: &str, pattern: &str, config: Option<&str>) -> CommandSpec {
+    CommandSpec::new(NODE, cwd)
+        .args(["--input-type=module", "-e", RECORDER, "--"])
+        .arg(file)
+        .arg(pattern)
+        .arg(config.unwrap_or_default())
+}
+
+/// `key` under `[profiles.js-vitest]` in the repository's `lyra.toml`.
+fn repository_profile_value(read: FileReader<'_>, key: &str) -> Option<toml::Value> {
+    let doc = read("lyra.toml")?.parse::<toml::Value>().ok()?;
+    doc.get("profiles")?.get(ID)?.get(key).cloned()
+}
+
+fn repository_profile_list(read: FileReader<'_>, key: &str) -> Vec<String> {
+    repository_profile_value(read, key)
+        .and_then(|v| v.as_array().cloned())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect()
+}
+
+/// The Vitest configuration file both the reproduction and verification use: `config = "..."`
+/// under `[profiles.js-vitest]` in the repository's `lyra.toml`, or Vitest's own default lookup.
+/// A `test` script that selects another configuration (`--config` / `-c`) without that setting
+/// is an error: the recorder would otherwise run with a different configuration than the suite.
+fn vitest_config(read: FileReader<'_>) -> Result<Option<String>, String> {
+    if let Some(value) = repository_profile_value(read, "config") {
+        let raw = value.as_str().unwrap_or_default();
+        let path = guards::norm_path(raw);
+        if raw.trim().starts_with(['/', '\\'])
+            || raw.chars().nth(1) == Some(':')
+            || path.is_empty()
+            || path.split('/').any(|c| c == "..")
+            || read(&path).is_none()
+        {
+            return Err(format!(
+                "`config = {value}` under [profiles.{ID}] in lyra.toml must name an existing configuration file, \
+                 relative to the repository root"
+            ));
+        }
+        return Ok(Some(path));
+    }
+    let script = read("package.json")
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|m| m.get("scripts")?.get("test")?.as_str().map(String::from))
+        .unwrap_or_default();
+    let words: Vec<&str> = script.split_whitespace().collect();
+    if words.iter().any(|w| *w == "--config" || *w == "-c" || w.starts_with("--config=")) {
+        return Err(format!(
+            "the package's test script (`{script}`) selects a Vitest configuration file; LYRA runs Vitest with the \
+             same file only when it is declared: add `config = \"<path>\"` under [profiles.{ID}] in the \
+             repository's lyra.toml"
+        ));
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -524,18 +741,38 @@ struct TestResult {
 
 #[derive(Debug, Clone, PartialEq, Default)]
 struct Report {
-    tests: Vec<TestResult>,
-    file_errors: Vec<(String, Vec<String>)>,
-    unhandled: u64,
     started: bool,
+    /// Every project exposed the module graph the run used.
+    graph: bool,
+    /// The test files Vitest collected (only when a test file was selected).
+    collected: Vec<String>,
+    tests: Vec<TestResult>,
+    /// `(file, errors)` for file-level errors (collection, setup files, an empty file).
+    file_errors: Vec<(String, Vec<String>)>,
+    /// `(file, errors)` for errors thrown by a suite's own hooks (`beforeAll`, `afterAll`).
+    suite_errors: Vec<(String, Vec<String>)>,
+    unhandled: u64,
+    /// Setup files and global setup modules the resolved configuration names, inside the checkout.
+    setup: Vec<String>,
+    loaded: Vec<String>,
+    foreign: Vec<String>,
 }
 
+/// The recorder's evidence. It is complete only with exactly one result line and exactly one
+/// end marker after it; module records count only between the two. A second result-shaped
+/// line or end marker anywhere in the output (a test printing one, on either stream) makes the
+/// evidence inconclusive instead of replacing it.
 fn parse_report(output: &str) -> Option<Report> {
-    if !output.lines().any(|l| l.trim() == END_MARKER) {
+    let lines: Vec<&str> = output.lines().map(str::trim).collect();
+    let results: Vec<usize> = (0..lines.len()).filter(|&i| lines[i].starts_with(RESULT_PREFIX)).collect();
+    let ends: Vec<usize> = (0..lines.len()).filter(|&i| lines[i] == END_MARKER).collect();
+    let ([result], [end]) = (results.as_slice(), ends.as_slice()) else {
+        return None;
+    };
+    if result >= end {
         return None;
     }
-    let line = output.lines().rev().find_map(|l| l.trim().strip_prefix(RESULT_PREFIX))?;
-    let value: Value = serde_json::from_str(line).ok()?;
+    let value: Value = serde_json::from_str(lines[*result].strip_prefix(RESULT_PREFIX)?).ok()?;
     let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
     let strings = |v: Option<&Value>| -> Vec<String> {
         v.and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(String::from).collect()
@@ -552,18 +789,30 @@ fn parse_report(output: &str) -> Option<Report> {
             errors: strings(t.get("errors")),
         })
         .collect();
-    let file_errors = value
-        .get("fileErrors")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(|f| (text(f, "file"), strings(f.get("errors"))))
-        .collect();
+    let errors = |key: &str| -> Vec<(String, Vec<String>)> {
+        value
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|f| (text(f, "file"), strings(f.get("errors"))))
+            .collect()
+    };
+    let block = &lines[result + 1..*end];
+    let records = |prefix: &str| -> Vec<String> {
+        block.iter().filter_map(|l| l.strip_prefix(prefix)).map(|p| p.trim().to_string()).collect()
+    };
     Some(Report {
-        tests,
-        file_errors,
-        unhandled: value.get("unhandled").and_then(Value::as_u64).unwrap_or(0),
         started: value.get("started").and_then(Value::as_bool).unwrap_or(false),
+        graph: value.get("graph").and_then(Value::as_bool).unwrap_or(false),
+        collected: strings(value.get("collected")).iter().map(|p| guards::norm_path(p)).collect(),
+        tests,
+        file_errors: errors("fileErrors"),
+        suite_errors: errors("suiteErrors"),
+        unhandled: value.get("unhandled").and_then(Value::as_u64).unwrap_or(0),
+        setup: strings(value.get("setup")).iter().map(|p| guards::norm_path(p)).collect(),
+        loaded: records(LOADED_PREFIX).iter().map(|p| guards::norm_path(p)).collect(),
+        foreign: records(FOREIGN_PREFIX),
     })
 }
 
@@ -573,13 +822,38 @@ fn executed(t: &TestResult) -> bool {
 
 fn identity(rec: &ReproRecord) -> Option<(String, String)> {
     let file = validate_test_file(&rec.test_file).ok()?;
-    let name = name_segments(&rec.test_name).ok()?.join(" > ");
+    let name = full_name(&name_segments(&rec.test_name).ok()?);
     Some((file, name))
+}
+
+impl Report {
+    fn selected(&self, file: &str, name: &str) -> Option<&TestResult> {
+        self.tests.iter().find(|t| t.file == file && t.name == name)
+    }
+
+    /// The run observed the modules it used and none came from outside the checkout and the
+    /// run's own dependencies.
+    fn provenance(&self, file: &str) -> Result<(), String> {
+        if !self.graph || !self.loaded.iter().any(|p| p == file) {
+            return Err(format!(
+                "the Vitest recorder could not observe the modules the run loaded (the module graph is missing or \
+                 does not contain {file}); LYRA supports Vitest 3.x"
+            ));
+        }
+        if !self.foreign.is_empty() {
+            return Err(format!(
+                "the run loaded code from outside the checkout under test and its own node_modules ({}); a workspace \
+                 or a link in node_modules points into another directory, so the run did not test the candidate's code",
+                self.foreign.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub fn classify_report(output: &str, rec: &ReproRecord) -> RegressionOutcome {
     let Some(report) = parse_report(output) else {
-        return RegressionOutcome::Other("the Vitest recorder did not report a complete result".into());
+        return RegressionOutcome::Other("the Vitest recorder did not report exactly one complete result".into());
     };
     let Some((file, name)) = identity(rec) else {
         return RegressionOutcome::Other("the reproduction record does not name a valid test".into());
@@ -587,10 +861,13 @@ pub fn classify_report(output: &str, rec: &ReproRecord) -> RegressionOutcome {
     if !report.started {
         return RegressionOutcome::SetupFailed;
     }
-    if report.unhandled > 0 || report.file_errors.iter().any(|(f, _)| *f == file) {
+    if report.unhandled > 0
+        || report.file_errors.iter().any(|(f, _)| *f == file)
+        || report.suite_errors.iter().any(|(f, _)| *f == file)
+    {
         return RegressionOutcome::SetupFailed;
     }
-    let Some(test) = report.tests.iter().find(|t| t.file == file && t.name == name) else {
+    let Some(test) = report.selected(&file, &name) else {
         return RegressionOutcome::NotDiscovered;
     };
     match test.state.as_deref() {
@@ -612,6 +889,7 @@ fn describe_run(outcome: &RegressionOutcome, rec: &ReproRecord) -> String {
     }
 }
 
+/// Exactly the selected test executed, nothing else went wrong, and the run's provenance holds.
 fn exactly_ours(report: &Report, file: &str, name: &str) -> Result<(), String> {
     let ran: Vec<&TestResult> = report.tests.iter().filter(|t| executed(t)).collect();
     if ran.len() != 1 || ran[0].file != file || ran[0].name != name {
@@ -621,93 +899,125 @@ fn exactly_ours(report: &Report, file: &str, name: &str) -> Result<(), String> {
             ran.iter().map(|t| format!("`{} > {}`", t.file, t.name)).collect::<Vec<_>>().join(", ")
         ));
     }
-    if report.unhandled > 0 || !report.file_errors.is_empty() {
-        return Err("the run reported file-level or unhandled errors".into());
+    if report.unhandled > 0 || !report.file_errors.is_empty() || !report.suite_errors.is_empty() {
+        return Err("the run reported file-level, suite hook or unhandled errors".into());
     }
-    Ok(())
+    report.provenance(file)
 }
 
+/// S2: exactly the selected test failed, with Vitest's test-failure status, and its own
+/// assertion error (not merely the output) carries the expected text.
 pub fn confirm_failure_in(run: &CommandOutput, rec: &ReproRecord) -> Result<(), String> {
     let output = run.combined();
     let (file, name) = identity(rec).ok_or("the reproduction record does not name a valid test")?;
-    let report = parse_report(&output).ok_or("the Vitest recorder did not report a complete result")?;
+    let report = parse_report(&output).ok_or("the Vitest recorder did not report exactly one complete result")?;
     exactly_ours(&report, &file, &name)?;
-    if report.tests.iter().find(|t| t.file == file && t.name == name).and_then(|t| t.state.as_deref()) != Some("fail") {
+    let test = report.selected(&file, &name).filter(|t| t.state.as_deref() == Some("fail"));
+    let Some(test) = test else {
         return Err("the selected test did not fail".into());
-    }
+    };
     if run.exit_code != Some(1) {
         return Err("reproduction must exit with Vitest's test-failure status (1)".into());
+    }
+    if !guards::output_contains_expected(&test.errors.join("\n"), &rec.expected) {
+        return Err(format!(
+            "the selected test failed, but its own error does not contain the expected text {:?} (text printed by the \
+             test is not evidence): {}",
+            rec.expected.trim(),
+            test.errors.first().map(String::as_str).unwrap_or("no error recorded")
+        ));
     }
     Ok(())
 }
 
+/// S5: exactly the selected test passed, and the run used the candidate's own code.
 pub fn assert_passed_in(output: &str, rec: &ReproRecord) -> Result<(), String> {
     let (file, name) = identity(rec).ok_or("the reproduction record does not name a valid test")?;
-    let report = parse_report(output).ok_or("the Vitest recorder did not report a complete result")?;
+    let report = parse_report(output).ok_or("the Vitest recorder did not report exactly one complete result")?;
     exactly_ours(&report, &file, &name)?;
-    match report.tests.iter().find(|t| t.file == file && t.name == name).and_then(|t| t.state.as_deref()) {
+    match report.selected(&file, &name).and_then(|t| t.state.as_deref()) {
         Some("pass") => Ok(()),
         other => Err(format!("the selected test did not pass ({})", other.unwrap_or("not run"))),
     }
 }
 
-/// With the test file emptied, the recorder's report must be complete and list no test from
-/// that file: the selected test cannot come from another file or a setup hook.
+/// The error Vitest may report for a test module that defines no test (the emptied file).
+const NO_SUITE: &str = "No test suite found in file";
+
+/// With the test file emptied, the recorder's report must be complete, show that Vitest
+/// collected that file, list no test from it, and report no error other than the file being
+/// empty: a collection, setup or hook error is a failed discovery, not evidence of absence.
 pub fn assert_absent(output: &str, rec: &ReproRecord) -> Result<(), String> {
     let (file, _) = identity(rec).ok_or("the reproduction record does not name a valid test")?;
-    let report = parse_report(output).ok_or("discovery did not report a complete result")?;
+    let report = parse_report(output).ok_or("discovery did not report exactly one complete result")?;
     if !report.started {
         return Err("Vitest did not start for discovery".into());
     }
     let found: Vec<&TestResult> = report.tests.iter().filter(|t| t.file == file).collect();
-    if found.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
+    if !found.is_empty() {
+        return Err(format!(
             "with {file} emptied, Vitest still found {} test(s) in it: the selected test is not bound to this source",
             found.len()
-        ))
-    }
-}
-
-/// The modules the failing run loaded that are not production code, to freeze with the test;
-/// a module loaded from the operator's clone outside its `node_modules` is an error (the
-/// regression did not run the candidate's code), and so is a module the repository's
-/// declarations cannot classify.
-pub fn loaded_inputs(output: &str, test_file: &str, production: &ProductionCode) -> Result<Vec<String>, String> {
-    if !output.lines().any(|l| l.trim() == END_MARKER) {
-        return Err("the regression run did not report the modules it loaded, so LYRA cannot establish which test \
-                    inputs to lock"
-            .into());
-    }
-    let foreign: Vec<&str> = output.lines().filter_map(|l| l.trim().strip_prefix(FOREIGN_PREFIX)).collect();
-    if !foreign.is_empty() {
-        return Err(format!(
-            "the regression loaded code from the repository LYRA was started on instead of the checkout under test \
-             ({}); a workspace or a link in node_modules points back into the repository",
-            foreign.iter().map(|p| format!("`{}`", p.trim())).collect::<Vec<_>>().join(", ")
         ));
     }
-    let mut loaded = BTreeSet::new();
+    let empty = |(f, errors): &(String, Vec<String>)| *f == file && errors.iter().all(|e| e.contains(NO_SUITE));
+    let other: Vec<String> = report
+        .file_errors
+        .iter()
+        .filter(|e| !empty(e))
+        .chain(&report.suite_errors)
+        .map(|(f, errors)| format!("{f}: {}", errors.first().map(String::as_str).unwrap_or_default()))
+        .collect();
+    if !other.is_empty() || report.unhandled > 0 {
+        return Err(format!(
+            "discovery with {file} emptied failed instead of finding no test ({}{})",
+            other.join("; "),
+            if report.unhandled > 0 { format!("; {} unhandled error(s)", report.unhandled) } else { String::new() }
+        ));
+    }
+    if !report.collected.contains(&file) {
+        return Err(format!("discovery did not collect {file}: Vitest's configuration does not include it"));
+    }
+    Ok(())
+}
+
+/// The inputs to freeze with the test: every non-production module the failing run loaded and
+/// every setup file the resolved configuration names (frozen by path, whatever its name, also
+/// inside production code). A module from outside the checkout and the run's dependencies is
+/// an error (the regression did not run the candidate's code), and so is a module the
+/// repository's declarations cannot classify.
+pub fn loaded_inputs(output: &str, test_file: &str, production: &ProductionCode) -> Result<Vec<String>, String> {
+    let report = parse_report(output).ok_or(
+        "the regression run did not report the modules it loaded, so LYRA cannot establish which test inputs to lock",
+    )?;
+    report.provenance(test_file)?;
+    let mut frozen = BTreeSet::new();
     let mut unknown = BTreeSet::new();
-    for path in output.lines().filter_map(|l| l.trim().strip_prefix(LOADED_PREFIX)).map(guards::norm_path) {
-        if path.is_empty() || path == test_file || path.split('/').any(|c| c == ".." || c == "node_modules") {
+    let usable = |path: &String| !path.is_empty() && path != test_file && !path.split('/').any(|c| c == "..");
+    for path in report.setup.iter().filter(|p| usable(p)) {
+        if !has_component(path, &["node_modules"]) {
+            frozen.insert(path.clone());
+        }
+    }
+    for path in report.loaded.iter().filter(|p| usable(p)) {
+        if has_component(path, &["node_modules"]) {
             continue;
         }
-        match production.classify(&path) {
+        match production.classify(path) {
             Classification::Production => {}
             Classification::TestSupport => {
-                loaded.insert(path);
+                frozen.insert(path.clone());
             }
-            Classification::Unknown => {
-                unknown.insert(path);
+            Classification::Unknown if !frozen.contains(path) => {
+                unknown.insert(path.clone());
             }
+            Classification::Unknown => {}
         }
     }
     if !unknown.is_empty() {
         return Err(production.unknown_message(&unknown));
     }
-    Ok(loaded.into_iter().collect())
+    Ok(frozen.into_iter().collect())
 }
 
 // ---------------------------------------------------------------------------------------
@@ -781,10 +1091,17 @@ pub fn check_fix_changes_with(
         }
     }
     if let Some((file, name)) = identity(rec) {
-        let segments: Vec<String> = name.split(" > ").map(String::from).collect();
-        let expected = regression_line(&file, &segments);
-        if rec.command.trim() != expected {
-            violations.push(format!("recorded test command changed: {:?} (expected {expected:?})", rec.command.trim()));
+        match vitest_config(read_checkpoint) {
+            Ok(config) => {
+                let expected = regression_line(&file, &name, config.as_deref());
+                if rec.command.trim() != expected {
+                    violations.push(format!(
+                        "recorded test command changed: {:?} (expected {expected:?})",
+                        rec.command.trim()
+                    ));
+                }
+            }
+            Err(reason) => violations.push(reason),
         }
     }
     if violations.is_empty() {
@@ -836,41 +1153,156 @@ fn controlled_environment(spec: CommandSpec, caches: &Path) -> CommandSpec {
     spec
 }
 
-/// Links `source_repo/node_modules` at `parent/node_modules`, so a checkout below `parent`
-/// resolves the operator's installed packages without anything inside it changing.
-pub fn link_node_modules(source_repo: &Path, parent: &Path) -> Result<(), String> {
-    if let Some(kind) = workspaces(source_repo) {
-        return Err(format!(
-            "this repository is a JavaScript workspace ({kind}); LYRA supports one package at a time and \
-             workspaces are not supported yet"
-        ));
+/// The Vitest major version the recorder supports: it reads Vitest 3's module graph
+/// (`project.vite.moduleGraph`); Vitest 2 and 4 keep the runner's modules elsewhere.
+const SUPPORTED_VITEST_MAJOR: &str = "3";
+
+/// Files whose content decides what is installed in `node_modules`.
+const INSTALL_INPUTS: [&str; 8] = [
+    "package.json",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lock",
+    "bun.lockb",
+    ".npmrc",
+];
+
+/// Gives the checkout its own copy of the operator's installed dependencies, at
+/// `checkout/../node_modules` where Node's upward resolution finds it. Nothing inside the
+/// checkout changes, and nothing the run writes there reaches the operator's install: tests
+/// and verification commands may write to `node_modules`, so a link would let them change the
+/// operator's packages behind the guards, which see only the checkout.
+///
+/// Fails closed, with the step that fixes it, when the checkout is a workspace, Vitest is not
+/// installed or is not 3.x, or the install was made for a different `package.json` / lockfile
+/// than the checkout's (the operator's clone is on another branch): verification would run the
+/// candidate against dependencies its own manifests do not describe.
+pub fn provision_node_modules(source_repo: &Path, checkout: &Path) -> Result<(), String> {
+    for (dir, which) in [(checkout, "the checkout"), (source_repo, "the repository")] {
+        if let Some(kind) = workspaces(dir) {
+            return Err(format!(
+                "{which} is a JavaScript workspace ({kind}); LYRA supports one package at a time and workspaces are \
+                 not supported yet"
+            ));
+        }
     }
-    let target = source_repo.join("node_modules");
-    if !target.join("vitest").is_dir() {
+    let source = source_repo.join("node_modules");
+    let installed = std::fs::read_to_string(source.join("vitest").join("package.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|m| m.get("version").and_then(Value::as_str).map(String::from));
+    let Some(version) = installed else {
         return Err(format!(
             "{} has no installed Vitest; install the repository's dependencies first (`npm ci`, \
              `pnpm install --frozen-lockfile` or `yarn install --frozen-lockfile`) and retry",
-            target.display()
+            source.display()
+        ));
+    };
+    if version.split('.').next() != Some(SUPPORTED_VITEST_MAJOR) {
+        return Err(format!(
+            "the repository has Vitest {version} installed; the js-vitest profile supports Vitest \
+             {SUPPORTED_VITEST_MAJOR}.x, whose module graph it reads to establish which code the test ran"
         ));
     }
-    let link = parent.join("node_modules");
-    if let (Ok(existing), Ok(wanted)) = (dunce::canonicalize(&link), dunce::canonicalize(&target)) {
-        if existing == wanted {
-            return Ok(());
-        }
-        return Err(format!("{} exists and does not point to {}", link.display(), target.display()));
+    let differing: Vec<&str> = INSTALL_INPUTS
+        .into_iter()
+        .filter(|name| std::fs::read(source_repo.join(name)).ok() != std::fs::read(checkout.join(name)).ok())
+        .collect();
+    if !differing.is_empty() {
+        return Err(format!(
+            "the installed dependencies in {} were installed for a different {} than the commit under test; check \
+             out the default branch in {} (or a branch with the same manifests), reinstall, and retry",
+            source.display(),
+            differing.join(", "),
+            source_repo.display()
+        ));
     }
-    #[cfg(unix)]
-    let made = std::os::unix::fs::symlink(&target, &link).map_err(|e| e.to_string());
-    #[cfg(windows)]
-    let made = std::process::Command::new("cmd")
-        .args(["/C", "mklink", "/J"])
-        .arg(&link)
-        .arg(&target)
-        .output()
-        .map_err(|e| e.to_string())
-        .and_then(|o| if o.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&o.stderr).into_owned()) });
-    made.map_err(|e| format!("linking {} to {}: {e}", link.display(), target.display()))
+    let parent = checkout.parent().ok_or("the checkout has no parent directory")?;
+    let target = parent.join("node_modules");
+    if std::fs::symlink_metadata(&target).is_ok() {
+        remove_tree(&target).map_err(|e| format!("removing {}: {e}", target.display()))?;
+    }
+    let source = dunce::canonicalize(&source).map_err(|e| format!("{}: {e}", source.display()))?;
+    copy_tree((&source, &target), &source, &target, &mut Vec::new())
+        .map_err(|e| format!("copying {} to {}: {e}", source.display(), target.display()))
+}
+
+fn remove_tree(path: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.is_dir() && !meta.file_type().is_symlink() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path))
+    }
+}
+
+/// Copies the tree `from` (inside `roots.0`, the canonical source `node_modules`) to `to`
+/// (inside `roots.1`, its copy). `std::fs::copy` clones files where the filesystem supports
+/// it (APFS, Btrfs, XFS, ReFS), so the copy is cheap there. A link that resolves inside the
+/// source is recreated against the copy on Unix; on Windows, where creating links needs
+/// privileges, its target is copied instead (`stack` guards against cycles). A link that
+/// resolves elsewhere (a workspace or `npm link` package) keeps pointing there, and the
+/// recorder reports any module loaded through it as foreign.
+fn copy_tree(roots: (&Path, &Path), from: &Path, to: &Path, stack: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    let (source_root, copy_root) = roots;
+    std::fs::create_dir_all(to)?;
+    stack.push(dunce::canonicalize(from)?);
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let path = entry.path();
+        let dest = to.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if !kind.is_symlink() {
+            if kind.is_dir() {
+                copy_tree(roots, &path, &dest, stack)?;
+            } else {
+                std::fs::copy(&path, &dest)?;
+            }
+            continue;
+        }
+        let Ok(resolved) = dunce::canonicalize(&path) else {
+            continue; // a dangling link resolves nothing
+        };
+        let inside = resolved.strip_prefix(source_root).ok().map(|r| copy_root.join(r));
+        match inside {
+            None => make_link(&resolved, &dest)?,
+            Some(mapped) if cfg!(unix) => make_link(&mapped, &dest)?,
+            Some(_) if resolved.is_dir() => {
+                if !stack.contains(&resolved) {
+                    copy_tree(roots, &resolved, &dest, stack)?;
+                }
+            }
+            Some(_) => {
+                std::fs::copy(&resolved, &dest)?;
+            }
+        }
+    }
+    stack.pop();
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_link(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+/// Windows: links need privileges (symbolic links) or a raw reparse-point API (junctions), and
+/// a shell such as `cmd /C mklink` would parse the paths, so a link out of `node_modules` is
+/// refused: copying it would hide that the run used code from outside the checkout.
+#[cfg(windows)]
+fn make_link(target: &Path, link: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::other(format!(
+        "{} links to {}, outside node_modules (a workspace or `npm link` package); LYRA cannot isolate it",
+        link.display(),
+        target.display()
+    )))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn make_link(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::fs::copy(target, link).map(|_| ())
 }
 
 // ---------------------------------------------------------------------------------------
@@ -957,26 +1389,33 @@ impl ExecutionProfile for JsVitest {
         validate_test_file(&rec.test_file)?;
         name_segments(&rec.test_name).map(|_| ())
     }
-    fn regression_command_line(&self, rec: &ReproRecord) -> String {
-        match (validate_test_file(&rec.test_file), name_segments(&rec.test_name)) {
-            (Ok(file), Ok(segments)) => regression_line(&file, &segments),
+    fn regression_command_line(&self, rec: &ReproRecord, worktree: &Path) -> String {
+        match (identity(rec), vitest_config(&worktree_reader(worktree))) {
+            (Some((file, name)), Ok(config)) => regression_line(&file, &name, config.as_deref()),
             _ => String::new(),
         }
     }
     fn regression_command(&self, rec: &ReproRecord, cwd: &Path) -> Result<CommandSpec, String> {
         let file = validate_test_file(&rec.test_file)?;
-        let segments = name_segments(&rec.test_name)?;
-        Ok(recorder_spec(cwd, &file, &name_pattern(&segments)).shown(regression_line(&file, &segments)))
+        let name = full_name(&name_segments(&rec.test_name)?);
+        let config = vitest_config(&worktree_reader(cwd))?;
+        Ok(recorder_spec(cwd, &file, &name_pattern(&name), config.as_deref()).shown(regression_line(
+            &file,
+            &name,
+            config.as_deref(),
+        )))
     }
     fn discovery(&self, spec: &CommandSpec) -> Discovery {
-        let file = spec.args.get(3).cloned().unwrap_or_default();
-        let mut discovery = recorder_spec(&spec.cwd, &file, "");
+        let selectors = spec.args.iter().position(|a| a == "--").map_or(&[][..], |i| &spec.args[i + 1..]);
+        let file = selectors.first().cloned().unwrap_or_default();
+        let config = selectors.get(2).filter(|c| !c.is_empty()).cloned();
+        let mut discovery = recorder_spec(&spec.cwd, &file, "", config.as_deref());
         discovery.env = spec.env.clone();
         discovery.clear_env = spec.clear_env;
         discovery.env.push(("LYRA_VITEST_MODE".into(), "discover".into()));
         Discovery {
-            spec: discovery.shown(format!("npx vitest run {file}")),
-            note: "Discovery runs the whole recorded test file through the recorder with no name filter; once the report is complete it exits 0, so an empty file is evidence rather than a failure.",
+            spec: discovery.shown(suite_line(Some(&file), config.as_deref())),
+            note: "Discovery runs exactly the recorded test file through the recorder with no name filter; once the report is complete it exits 0. It must report the emptied file as having no test suite, and no other error.",
         }
     }
     fn format_test(&self, _worktree: &Path, _test_file: &Path) -> Option<CommandSpec> {
@@ -1019,8 +1458,8 @@ impl ExecutionProfile for JsVitest {
     ) -> Result<(), String> {
         check_fix_changes_with(changes, rec, read_checkpoint, read_now)
     }
-    fn link_dependencies(&self, source_repo: &Path, checkout_parent: &Path) -> Result<(), String> {
-        link_node_modules(source_repo, checkout_parent)
+    fn provision_dependencies(&self, source_repo: &Path, checkout: &Path) -> Result<(), String> {
+        provision_node_modules(source_repo, checkout)
     }
     fn reproduction_environment(&self, spec: CommandSpec, run_root: &Path) -> CommandSpec {
         controlled_environment(spec, &run_root.join("caches"))
@@ -1036,7 +1475,7 @@ impl ExecutionProfile for JsVitest {
             Ok(())
         } else {
             Err(format!(
-                "{} does not link the repository's installed dependencies",
+                "{} does not hold a copy of the repository's installed dependencies",
                 env_root.join("node_modules").display()
             ))
         }
@@ -1077,7 +1516,10 @@ impl ExecutionProfile for JsVitest {
         // default the recorder runs every test file, so Vite's cache stays in the run.
         let tests = match &verify.test {
             Some(command) => line("tests", command)?,
-            None => recorder_spec(worktree, "", "").shown("npx vitest run".to_string()),
+            None => {
+                let config = vitest_config(&worktree_reader(worktree))?;
+                recorder_spec(worktree, "", "", config.as_deref()).shown(suite_line(None, config.as_deref()))
+            }
         };
         steps.push(VerifyStep { name: "tests", spec: tests, log: "50-verify/tests.txt", regression: false });
         if let Some(fmt) = optional(&verify.fmt) {

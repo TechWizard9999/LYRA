@@ -444,7 +444,7 @@ impl ExecutionProfile for PythonPytest {
         }
         node_id(&rec.test_file, &rec.test_name).map(|_| ())
     }
-    fn regression_command_line(&self, rec: &ReproRecord) -> String {
+    fn regression_command_line(&self, rec: &ReproRecord, _worktree: &Path) -> String {
         regression_line(rec.test_name.trim())
     }
     fn regression_command(&self, rec: &ReproRecord, cwd: &Path) -> Result<CommandSpec, String> {
@@ -2231,7 +2231,7 @@ FAILED tests/test_issue_7.py::test_other - AssertionError: x
         for flag in ["no:cacheprovider", "addopts=", "--rootdir=.", "--confcutdir=.", "-rA"] {
             assert!(spec.args.iter().any(|a| a == flag), "{flag}");
         }
-        assert_eq!(PythonPytest.regression_command_line(&rec()), spec.display());
+        assert_eq!(PythonPytest.regression_command_line(&rec(), Path::new("/w")), spec.display());
     }
 
     #[test]
