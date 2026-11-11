@@ -659,6 +659,24 @@ fn provisioning_refuses_what_it_cannot_verify() {
     assert!(err.contains("npm ci") && err.contains("no installed Vitest"), "{err}");
 }
 
+#[tokio::test]
+async fn intake_refuses_an_undeclared_vitest_config_before_copying_dependencies() {
+    let dir = tempfile::tempdir().unwrap();
+    let (repo, checkout) = install(dir.path(), "3.2.4");
+    let manifest = r#"{"scripts":{"test":"vitest run -c config/unit.ts"}}"#;
+    for base in [&repo, &checkout] {
+        std::fs::write(base.join("package.json"), manifest).unwrap();
+    }
+    let cancel = CancellationToken::new();
+    let err = JsVitest.provision_dependencies(&repo, &checkout, &cancel).await.unwrap_err();
+    assert!(err.contains("config = ") && err.contains("lyra.toml"), "{err}");
+    assert!(!dir.path().join("run/node_modules").exists(), "refused before the copy");
+    std::fs::create_dir_all(checkout.join("config")).unwrap();
+    std::fs::write(checkout.join("config/unit.ts"), "export default {}\n").unwrap();
+    std::fs::write(checkout.join("lyra.toml"), "[profiles.js-vitest]\nconfig = \"config/unit.ts\"\n").unwrap();
+    JsVitest.provision_dependencies(&repo, &checkout, &cancel).await.unwrap();
+}
+
 #[test]
 fn profile_surface() {
     let p = JsVitest;

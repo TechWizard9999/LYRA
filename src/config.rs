@@ -151,8 +151,9 @@ impl Default for Config {
 }
 
 /// Only verify commands may be overridden per repository here: `[verify]` (`rust-cargo`) and
-/// `[profiles.<id>.verify]`; the python-pytest profile additionally reads `packages` under
-/// `[profiles.python-pytest]` from the same file itself.
+/// `[profiles.<id>.verify]`. Profile-specific keys are read by the profile itself from the same
+/// file, not here: `packages` under `[profiles.python-pytest]`, and `sources` and `config` under
+/// `[profiles.js-vitest]`. Unknown keys are ignored by this struct.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RepoOverrides {

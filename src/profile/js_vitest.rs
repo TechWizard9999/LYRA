@@ -1302,6 +1302,8 @@ impl ExecutionProfile for JsVitest {
         checkout: &Path,
         cancel: &CancellationToken,
     ) -> Result<(), String> {
+        // Intake reports an undeclared or invalid Vitest config here, before any agent runs.
+        vitest_config(&worktree_reader(checkout))?;
         let (source_repo, checkout, cancel) = (source_repo.to_owned(), checkout.to_owned(), cancel.clone());
         tokio::task::spawn_blocking(move || {
             let parent = checkout.parent().ok_or("the checkout has no parent directory")?;
