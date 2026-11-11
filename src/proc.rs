@@ -24,6 +24,8 @@ pub struct CommandSpec {
     /// harness program (`python -c <script>`), which would not fit a line of a log or a
     /// pull-request table. It never changes what runs.
     pub shown: Option<String>,
+    /// The command writes a separate, bounded report to LYRA_COMMAND_REPORT.
+    pub separate_report: bool,
 }
 
 impl CommandSpec {
@@ -36,6 +38,7 @@ impl CommandSpec {
             clear_env: false,
             stdin: None,
             shown: None,
+            separate_report: false,
         }
     }
     pub fn arg(mut self, a: impl Into<String>) -> Self {
@@ -61,6 +64,10 @@ impl CommandSpec {
     /// The single line [`display`](Self::display) shows for this command instead of its argv.
     pub fn shown(mut self, line: impl Into<String>) -> Self {
         self.shown = Some(line.into());
+        self
+    }
+    pub fn with_separate_report(mut self) -> Self {
+        self.separate_report = true;
         self
     }
     /// Untrusted command (repro, verify): minimal environment, no provider keys.
@@ -103,6 +110,8 @@ pub struct CommandOutput {
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+    /// None for ordinary commands, Some("") if a requested report was not written.
+    pub report: Option<String>,
     pub timed_out: bool,
     pub cancelled: bool,
     /// Output was too large to retain safely; never use partial output as test evidence.
@@ -119,6 +128,17 @@ impl CommandOutput {
             && !self.cancelled
             && !self.output_truncated
             && !self.drain_timed_out
+            && self.report.as_deref() != Some("")
+    }
+    /// Preserve structured evidence alongside diagnostics when writing a command log.
+    pub fn combined_with_report(&self) -> String {
+        let mut log = self.combined();
+        if let Some(report) = self.report.as_deref().filter(|report| !report.is_empty()) {
+            log.push_str("\n--- structured report ---\n");
+            log.push_str(report);
+            log.push('\n');
+        }
+        log
     }
     /// stdout followed by stderr, for logs.
     pub fn combined(&self) -> String {
@@ -412,6 +432,14 @@ impl Drop for IoTasks {
 
 /// Runs to completion, collecting stdout/stderr.
 pub async fn run(spec: &CommandSpec, timeout: Duration, cancel: &CancellationToken) -> Result<CommandOutput> {
+    let report_file = spec.separate_report.then(tempfile::NamedTempFile::new).transpose()?;
+    let configured;
+    let spec = if let Some(file) = &report_file {
+        configured = spec.clone().env("LYRA_COMMAND_REPORT", file.path().to_string_lossy());
+        &configured
+    } else {
+        spec
+    };
     let mut stdout = String::new();
     let mut stderr = String::new();
     let mut truncated = false;
@@ -425,7 +453,19 @@ pub async fn run(spec: &CommandSpec, timeout: Duration, cancel: &CancellationTok
     })
     .await?;
     out.output_truncated |= truncated;
-    Ok(CommandOutput { stdout, stderr, ..out })
+    let report = report_file
+        .map(|file| -> Result<String> {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            file.as_file().take((MAX_CAPTURE_BYTES + 1) as u64).read_to_end(&mut bytes)?;
+            if bytes.len() > MAX_CAPTURE_BYTES {
+                out.output_truncated = true;
+                return Ok(String::new());
+            }
+            String::from_utf8(bytes).context("subprocess report is not valid UTF-8")
+        })
+        .transpose()?;
+    Ok(CommandOutput { stdout, stderr, report, ..out })
 }
 
 /// Bridge for synchronous git/gh call sites. A dedicated thread avoids nesting or
@@ -540,6 +580,7 @@ where
         exit_code,
         stdout: String::new(),
         stderr: String::new(),
+        report: None,
         timed_out,
         cancelled,
         output_truncated,
@@ -645,12 +686,35 @@ mod tests {
             .env("LYRA_PROCESS_FIXTURE", mode)
     }
 
+    #[tokio::test]
+    async fn separates_requested_report_from_subprocess_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = fixture_spec("separate-report", dir.path()).with_separate_report();
+        let report = run(&spec, Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+        assert!(report.success());
+        assert_eq!(report.report.as_deref(), Some("trusted report"));
+        assert!(report.stdout.contains("stdout diagnostics"));
+        assert!(report.stderr.contains("stderr diagnostics"));
+        assert!(!report.combined().contains("trusted report"));
+
+        let spec = fixture_spec("invalid-utf8", dir.path()).with_separate_report();
+        let missing = run(&spec, Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+        assert_eq!(missing.exit_code, Some(0));
+        assert_eq!(missing.report.as_deref(), Some(""));
+        assert!(!missing.success(), "a fresh command cannot reuse the previous report");
+    }
+
     // An inert, offline subprocess fixture. The ordinary test suite never executes it.
     #[test]
     #[ignore]
     fn subprocess_fixture() {
         use std::io::Write;
         match std::env::var("LYRA_PROCESS_FIXTURE").as_deref() {
+            Ok("separate-report") => {
+                std::fs::write(std::env::var_os("LYRA_COMMAND_REPORT").unwrap(), "trusted report").unwrap();
+                println!("stdout diagnostics");
+                eprintln!("stderr diagnostics");
+            }
             Ok("invalid-utf8") => {
                 std::io::stdout().write_all(b"invalid: \xff\nvalid again\n").unwrap();
             }

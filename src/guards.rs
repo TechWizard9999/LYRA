@@ -176,27 +176,38 @@ pub fn check_fix_changes(
     checkpoint: &str,
     profile: &dyn ExecutionProfile,
 ) -> Result<(), String> {
-    let read_checkpoint = checkpoint_reader(worktree, checkpoint);
+    let listing = checkpoint_paths(worktree, checkpoint).ok();
+    let read_checkpoint = checkpoint_reader(worktree, checkpoint, listing.as_ref());
     let read_now = |p: &str| std::fs::read_to_string(worktree.join(p)).ok();
-    profile.check_fix_changes(changes, rec, &read_checkpoint, &read_now)
+    profile.check_fix_changes(changes, rec, &read_checkpoint, &read_now, listing.as_ref())
+}
+
+pub(crate) fn checkpoint_paths(
+    worktree: &Path,
+    checkpoint: &str,
+) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    crate::git::run(worktree, &["ls-tree", "-r", "-z", "--name-only", checkpoint])
+        .map(|out| out.split('\0').filter(|p| !p.is_empty()).map(norm_path).collect())
 }
 
 /// Reads files at `checkpoint`. Profiles probe many candidate paths (every place an import
 /// could resolve), so the commit's file list is taken once with `git ls-tree` and a path that
 /// is not in it returns `None` without starting a process; contents are cached. If the
 /// listing fails, every read falls back to `git show`.
-fn checkpoint_reader<'a>(worktree: &'a Path, checkpoint: &'a str) -> impl Fn(&str) -> Option<String> + 'a {
-    let listing: Option<std::collections::HashSet<String>> =
-        crate::git::run(worktree, &["ls-tree", "-r", "-z", "--name-only", checkpoint])
-            .ok()
-            .map(|out| out.split('\0').filter(|p| !p.is_empty()).map(norm_path).collect());
+fn checkpoint_reader<'a>(
+    worktree: &'a Path,
+    checkpoint: &'a str,
+    listing: Option<&'a std::collections::BTreeSet<String>>,
+) -> impl Fn(&str) -> Option<String> + 'a {
     let cache = std::cell::RefCell::new(std::collections::HashMap::<String, Option<String>>::new());
     move |p: &str| {
         // `dir/` asks whether a directory exists at the checkpoint (`Some("")`).
         if let Some(dir) = p.strip_suffix('/') {
             let prefix = format!("{}/", norm_path(dir));
             return match &listing {
-                Some(files) => files.iter().any(|f| f.starts_with(&prefix)).then(String::new),
+                Some(files) => {
+                    files.range(prefix.clone()..).next().filter(|f| f.starts_with(&prefix)).map(|_| String::new())
+                }
                 None => crate::git::run(worktree, &["ls-tree", "-d", checkpoint, norm_path(dir).as_str()])
                     .ok()
                     .filter(|out| !out.trim().is_empty())
@@ -204,7 +215,7 @@ fn checkpoint_reader<'a>(worktree: &'a Path, checkpoint: &'a str) -> impl Fn(&st
             };
         }
         let path = norm_path(p);
-        if listing.as_ref().is_some_and(|files| !files.contains(&path)) {
+        if listing.is_some_and(|files| !files.contains(&path)) {
             return None;
         }
         if let Some(hit) = cache.borrow().get(&path) {
@@ -592,7 +603,8 @@ new file mode 100644
         let sha = git::commit_all(wt, "init").unwrap();
         std::fs::write(wt.join("pkg/core.py"), "x = 2\n").unwrap();
         std::fs::write(wt.join("pkg/new.py"), "y = 1\n").unwrap();
-        let read = checkpoint_reader(wt, &sha);
+        let paths = checkpoint_paths(wt, &sha).unwrap();
+        let read = checkpoint_reader(wt, &sha, Some(&paths));
         assert_eq!(read("pkg/core.py").as_deref().map(str::trim), Some("x = 1"));
         assert_eq!(read("pkg\\core.py").as_deref().map(str::trim), Some("x = 1"), "normalised path, cached");
         assert_eq!(read("pkg/new.py"), None, "not in the commit");
@@ -644,7 +656,7 @@ new file mode 100644
             } else {
                 "issue_123_rejects_short_frame".into()
             };
-            record.command = profile.regression_command_line(&record);
+            record.command = profile.regression_command_line(&record, wt);
             record.frozen_inputs = vec![fixture.into()];
             let checkpoint = git::commit_all(wt, "test: failing repro for #123").unwrap();
 

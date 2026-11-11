@@ -11,7 +11,7 @@ Guards are the harness's trust. They exist to stop an agent from "passing" witho
 - `docs/PLAN.md` §3.1 (repro), §3.3 (fix), §3.4 (verify) and §13 (execution profiles).
 - `.agents/rules/security.md` (untrusted agent output).
 - `src/guards.rs`: the **universal** rules, true for any language or test runner.
-- `src/profile/mod.rs`: the runner-neutral `ExecutionProfile` contract; `src/profile/rust_cargo.rs`: the only built-in profile and where every Cargo/libtest rule lives.
+- `src/profile/mod.rs`: the runner-neutral `ExecutionProfile` contract; the built-in profiles `src/profile/rust_cargo.rs` (every Cargo/libtest rule), `src/profile/python_pytest.rs` and `src/profile/js_vitest.rs`.
 
 ## Decide where the rule belongs
 Ask: would this rule still be correct for a repository that is not Cargo, with a different test runner?

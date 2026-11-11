@@ -87,7 +87,7 @@ impl ExecutionProfile for RustCargo {
         }
         Ok(())
     }
-    fn regression_command_line(&self, rec: &ReproRecord) -> String {
+    fn regression_command_line(&self, rec: &ReproRecord, _worktree: &Path) -> String {
         repro_test_command(&rec.krate, &rec.test_name)
     }
     fn regression_command(&self, rec: &ReproRecord, cwd: &Path) -> Result<CommandSpec, String> {
@@ -147,6 +147,7 @@ impl ExecutionProfile for RustCargo {
         rec: &ReproRecord,
         read_checkpoint: FileReader<'_>,
         read_now: FileReader<'_>,
+        _checkpoint_paths: Option<&std::collections::BTreeSet<String>>,
     ) -> Result<(), String> {
         check_fix_changes_with(changes, rec, read_checkpoint, read_now)
     }
@@ -1150,7 +1151,7 @@ test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; fini
         assert!(!p.is_source_file(Path::new("README.md")));
         assert!(p.generated_dirs().contains(&"target"));
         let r = rec();
-        assert_eq!(p.regression_command_line(&r), format!("cargo test -p foo {NAME} -- --exact"));
+        assert_eq!(p.regression_command_line(&r, Path::new("wt")), format!("cargo test -p foo {NAME} -- --exact"));
         let spec = p.regression_command(&r, Path::new("wt")).unwrap();
         assert_eq!(spec.program, "cargo");
         assert_eq!(spec.args, vec!["test", "-p", "foo", NAME, "--", "--exact"]);

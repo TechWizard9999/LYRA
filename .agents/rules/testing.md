@@ -41,6 +41,9 @@
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+# provisioned runner tests (need the runner installed):
+cargo test --lib python_pytest -- --ignored                                   # pytest on PATH
+LYRA_TEST_NODE_MODULES=<node_modules with vitest> cargo test --lib js_vitest -- --ignored
 node --test src/web/static/app.test.js
 ```
 

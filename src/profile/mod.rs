@@ -14,6 +14,7 @@
 //! and is frozen for the run. Saved runs from before this contract carry no profile;
 //! [`for_state`] maps them explicitly to `rust-cargo`, the only profile that existed then.
 
+pub mod js_vitest;
 pub mod python_pytest;
 pub mod rust_cargo;
 
@@ -138,8 +139,9 @@ pub trait ExecutionProfile: Send + Sync {
 
     /// Profile-specific checks on the agent's record (selector syntax, test file type).
     fn validate_record(&self, rec: &ReproRecord) -> Result<(), String>;
-    /// The one command that runs exactly the selected test, as a display line.
-    fn regression_command_line(&self, rec: &ReproRecord) -> String;
+    /// The one command that runs exactly the selected test, as a display line; `worktree` holds
+    /// the repository settings it may name (the Vitest configuration file).
+    fn regression_command_line(&self, rec: &ReproRecord, worktree: &Path) -> String;
     /// The same command with validated selectors as separate arguments.
     fn regression_command(&self, rec: &ReproRecord, cwd: &Path) -> Result<CommandSpec, String>;
     /// Turns a regression command into its discovery-only form.
@@ -150,9 +152,14 @@ pub trait ExecutionProfile: Send + Sync {
     fn describe_outcome(&self, outcome: &RegressionOutcome, rec: &ReproRecord) -> String;
     /// S2: a `Failed` classification must also be exactly one failing case and the
     /// runner's test-failure exit status, so a crashed or partial run is not a reproduction.
+    /// Profiles with a separate report also confirm the expected assertion text in the report.
     fn confirm_failure(&self, run: &CommandOutput, rec: &ReproRecord) -> Result<(), String>;
     /// S5: the selected test passed and exactly one test ran.
     fn assert_passed(&self, output: &str, rec: &ReproRecord) -> Result<(), String>;
+    /// Validate separate evidence from a built-in non-regression verification command.
+    fn assert_verification_report(&self, _report: &str) -> Result<(), String> {
+        Ok(())
+    }
     /// Source binding: the selected test is absent from a discovery run with its source emptied.
     fn assert_absent_from_discovery(&self, output: &str, rec: &ReproRecord) -> Result<(), String>;
     /// S2: files the failing regression run actually loaded that are not production code
@@ -188,10 +195,25 @@ pub trait ExecutionProfile: Send + Sync {
         rec: &ReproRecord,
         read_checkpoint: FileReader<'_>,
         read_now: FileReader<'_>,
+        checkpoint_paths: Option<&std::collections::BTreeSet<String>>,
     ) -> Result<(), String>;
 
     // --- environments --------------------------------------------------------------
 
+    /// Makes the repository's installed dependencies available to `checkout` without changing
+    /// anything inside it and without sharing anything the run can write with the operator's
+    /// install (the JavaScript profile copies `node_modules` next to the checkout, where Node's
+    /// upward resolution finds it). Refuses an install that does not match the checkout's
+    /// manifests. Called for the run's worktree at Intake and for each verification checkout,
+    /// after it exists. Default: nothing to provide.
+    async fn provision_dependencies(
+        &self,
+        _source_repo: &Path,
+        _checkout: &Path,
+        _cancel: &CancellationToken,
+    ) -> Result<(), String> {
+        Ok(())
+    }
     /// S2: where build outputs of the agent's worktree go (outside the worktree).
     fn reproduction_environment(&self, spec: CommandSpec, run_root: &Path) -> CommandSpec;
     /// Rejects a checkout location whose ancestors would inject toolchain configuration.
@@ -219,7 +241,7 @@ pub trait ExecutionProfile: Send + Sync {
 
 /// All built-in profiles, in detection order.
 pub fn builtin() -> Vec<Box<dyn ExecutionProfile>> {
-    vec![Box::new(rust_cargo::RustCargo), Box::new(python_pytest::PythonPytest)]
+    vec![Box::new(rust_cargo::RustCargo), Box::new(python_pytest::PythonPytest), Box::new(js_vitest::JsVitest)]
 }
 
 /// The built-in profile with this id.
